@@ -1,6 +1,8 @@
-### Playing Atari with Deep Reinforcement Learning
+**Playing Atari with Deep Reinforcement Learning**
 
 #### Abstract
+
+bison:这居然是 2013年的论文。
 
 提出了第一个深度学习模型，成功地使用强化学习从高维感官的原始数据中中直接学习控制策略。
 
