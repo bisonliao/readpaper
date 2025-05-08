@@ -101,202 +101,35 @@ RND方法适合局部探索，例如短期决策带来的后果，它不适合�
 
 ### bison的实验
 
-暂时还没有信心训练agent玩蒙特祖玛的复仇，搞个简单的：一个迷宫有6个房间，房间之间只有一个小通道，移动的时候没有奖励，找到截至位置奖励10。
+暂时还没有信心训练agent玩蒙特祖玛的复仇，搞个简单的：一个迷宫有6个房间，房间之间只有一个小通道，移动的时候没有奖励，找到截至位置奖励1。
 
 对比有无RND方法的帮助，训练收敛速度和最优路径（步数最少）
 
-#### 在加入RND机制前：
+#### 问题一：
 
-由于奖励稀疏，基本上不能训练agent
+下面的代码，光说不适用RND的方式下，就搞了我一整天，出发点所在的第一个“房间”里的策略总是不正确，后面的房间里的策略都正确，哪怕训练5万个回合。我想了又想，可能和回报的归一化有关：我把回报减去均值再除以标准差，这样导致一个回合下早期时间步对应的回报总是负数，后期时间步的回报总是正数，不合理。
 
-```python
-from collections import deque
+所以我干脆不做归一化处理，因为最后终点的奖励是1，所以如果某个时间步的策略不正确，会导致回合长度变大，折扣下会使得该时间步的回报变小，相当于惩罚，反之是奖励。
 
-import numpy
-import torch
-import torch.nn as nn
-from torch.distributions import Categorical
-from torch.utils.tensorboard import  SummaryWriter
-import torch.nn.functional as F
-from datetime import datetime
+这样修改后，发现1200个回合就能很好的收敛了：
 
-# 10 x 10 maze, 1-start, 2-end, 3-obstacle
-g_map = torch.tensor([
-    [1, 0, 0, 3, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 3, 0, 0, 0, 3, 0, 0],
-    [0, 0, 0, 3, 0, 0, 0, 3, 0, 0],
-    [3, 3, 0, 3, 0, 0, 0, 3, 0, 0],
-    [0, 0, 0, 3, 0, 3, 3, 3, 0, 3],
-    [0, 0, 0, 3, 0, 0, 0, 3, 0, 0],
-    [0, 3, 3, 3, 3, 3, 0, 3, 3, 0],
-    [0, 3, 0, 0, 0, 3, 0, 3, 0, 0],
-    [0, 3, 0, 3, 0, 3, 0, 3, 0, 3],
-    [0, 0, 0, 3, 0, 0, 0, 3, 0, 2]
-])
-
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-dt = datetime.now().strftime("%Y%m%d_%H%M%S")
-writer = SummaryWriter(log_dir=f"logs/rnd_maze_{dt}")
-
-class Args:
-    MAP_SIZE:int = 10
-    ACTION_DIM:int = 4
-    ACTION_LIST:torch.Tensor = torch.tensor([[0, -1], [0, 1], [-1, 0], [1, 0]])  # 上,下,左,右
-    MAP_START_VALUE:int=1
-    MAP_END_VALUE: int = 2
-    MAP_OBS_VALUE: int = 3
-    MAP_HUMAN_VALUE:int = 4
-    MAP_MAX_VALUE: int = 4
-
-
-class PolicyNet(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-
-
-        t = torch.ones((1, 1, Args.MAP_SIZE, Args.MAP_SIZE), device=device)
-        t = self.conv1(t)
-        t = self.conv2(t) #type:torch.Tensor
-        t = t.view(t.shape[0], -1)
-        feature_dim = t.shape[1]
-
-        self.actor = nn.Sequential(
-            nn.Linear(feature_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, Args.ACTION_DIM))
-
-
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.view(x.shape[0], -1)
-        logits = self.actor(x)
-
-        return logits
-
-class Agent:
-    def __init__(self):
-        self.actor = PolicyNet().to(device)
-        self.optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.max_episodes = 10000
-        self.max_steps_per_episode = 500
-        self.gamma = 0.95
-        self.steps = 1
-
-    def step(self, action_delta:torch.Tensor, state:torch.Tensor):
-        assert len(state.shape) == 4 and state.shape[0] == 1
-        self.steps += 1
-        dx, dy = action_delta[0].item(), action_delta[1].item()
-        next_state = state.clone()
-        mask = (state == Args.MAP_HUMAN_VALUE).float()
-        flat_idx = torch.argmax(mask).item()
-        y, x = flat_idx // Args.MAP_SIZE, flat_idx % Args.MAP_SIZE  # 计算2D坐标
-        if x+dx < 0 or y+dy <0 or  x+dx >= Args.MAP_SIZE or  y+dy >= Args.MAP_SIZE:
-            if self.steps % 1000 == 0: writer.add_scalar("steps/move", 0, self.steps)
-            return next_state, 0, False
-
-        if g_map[y+dy, x+dx].item() == Args.MAP_OBS_VALUE:
-            if self.steps % 1000 == 0: writer.add_scalar("steps/move", 0, self.steps)
-            return next_state, 0, False
-
-        next_state[0, 0, y, x] = 0
-        y += dy
-        x += dx
-        if self.steps % 1000 == 0:  writer.add_scalar("steps/move", 1, self.steps)
-        if next_state[0, 0, y, x].item() == Args.MAP_END_VALUE:
-            return next_state, 3, True
-        next_state[0, 0, y, x] = Args.MAP_HUMAN_VALUE
-        return next_state, 0, False
-
-    def compute_returns(self, rewards):
-        returns = []
-        R = 0
-        for r in reversed(rewards):
-            R = r + self.gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns, device=device)
-        # 让权重有正有负，如果正的，我们就要增大在这个状态采取这个动作的概率；如果是负的，我们就要减小在这个状态采取这个动作的概率
-        returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-        return torch.tensor(returns, device=device)
-
-    def update_policy(self, returns, states, actions):
-        states = torch.stack(states)  # [T, 1, 10, 10]
-        actions = torch.stack(actions)  # [T]
-        returns = returns.detach()  # 确保不计算梯度
-
-        logits = self.actor(states)  # [T, 4]
-        m = Categorical(logits=logits)
-        log_probs = m.log_prob(actions)  # [T]
-
-        # 添加熵正则化
-        entropy = m.entropy().mean()
-        loss = -(log_probs * returns).mean() - 0.01 * entropy
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        # 可添加梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-        self.optimizer.step()
-        return loss.item()
-
-    def train(self):
-        entropy_list = deque(maxlen=100)
-        for episode in range(self.max_episodes):
-            state = g_map.clone().float().to(device)
-            state[0, 0] = Args.MAP_HUMAN_VALUE # human flag
-            state = state.unsqueeze(0).unsqueeze(0)
-
-            states = []
-            rewards = []
-            actions = []
-
-            for step in range(self.max_steps_per_episode):
-                with torch.no_grad():
-                    logits = self.actor(state)
-                m = Categorical(logits=logits)
-                action_idx = m.sample()
-                entropy = m.entropy()
-                entropy_list.append(entropy)
-
-                action_delta = Args.ACTION_LIST[action_idx[0]]  # 直接索引
-
-
-
-                next_state, r, done = self.step(action_delta, state)
-                states.append(state[0])
-                rewards.append(r)
-                actions.append(action_idx[0])
-
-                if done:
-                    break
-
-                state = next_state
-
-            # 计算回报
-            returns = self.compute_returns(rewards)
-            if returns[0].item() != 0: #没有得到有效的reward
-                loss = self.update_policy(returns, states, actions)
-            else:
-                loss = 99
-            writer.add_scalar("episode/return", returns[0].item(), episode)
-            writer.add_scalar("episode/loss", loss, episode)
-            writer.add_scalar("episode/action_entropy", numpy.array(entropy_list).mean(), episode)
-
-
-def main(mode="train"):
-    if mode == "train":
-        agent = Agent()
-        agent.train()
-
-main()
+```shell
+policy at 1163
+→ → ↓ ■ ↓ ↓ ↓ ↓ ↓ ↓ 
+→ → ↓ ■ ↓ ↓ ↓ ■ ↓ ↓ 
+→ → ↓ ■ ↓ ↓ ↓ ■ ↓ ↓ 
+■ ■ ↓ ■ ↓ ↓ ↓ ■ ↓ ↓ 
+↓ ↓ ← ■ ↓ ■ ■ ■ ↓ ■ 
+↓ ← ← ■ ↓ ↓ ↓ ■ ↓ ↓ 
+↓ ■ ■ ■ ■ ■ ↓ ■ ■ ↓ 
+↓ ■ ↓ ↓ ↓ ■ ↓ ■ ↓ ↓ 
+↓ ■ ↓ ■ ↓ ■ ↓ ■ ↓ ■ 
+→ X ↓ ■ ↓ ↓ ↓ ■ ↓ ↓ 
 ```
 
+![image-20250508193032626](img/image-20250508193032626.png)
 
-
-#### 加入RND机制后
+代码如下：
 
 ```python
 from collections import deque
@@ -311,6 +144,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 # 10 x 10 maze, 1-start, 2-end, 3-obstacle
+# 目标放在右下角藏太深，难以训练，所以放在左下角...
 g_map = torch.tensor([
     [1, 0, 0, 3, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 3, 0, 0, 0, 3, 0, 0],
@@ -321,7 +155,7 @@ g_map = torch.tensor([
     [0, 3, 3, 3, 3, 3, 0, 3, 3, 0],
     [0, 3, 0, 0, 0, 3, 0, 3, 0, 0],
     [0, 3, 0, 3, 0, 3, 0, 3, 0, 3],
-    [0, 0, 0, 3, 0, 0, 0, 3, 0, 2]
+    [0, 2, 0, 3, 0, 0, 0, 3, 0, 0]
 ])
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -337,6 +171,18 @@ class Args:
     MAP_OBS_VALUE: int = 3
     MAP_HUMAN_VALUE:int = 4
     MAP_MAX_VALUE: int = 4
+    USE_RND:bool = False
+    REWARD_HIT_WALL:float = 0 #撞墙的奖励
+    REWARD_HIT_OBST:float = 0 #撞障碍物的奖励
+    REWARD_GOAL:float = 1 # 达到目的地的奖励
+    REWARD_MOVE:float = 0 # 移动一步的奖励
+    MAX_EPISODES= 5000
+    MAX_STEPS_PER_EPISODE = 500
+    GAMMA = 0.98
+    INNER_R_SCALE = 0.1
+    ENTROPY_COEF = 0.1
+
+
 
 
 class PolicyNet(torch.nn.Module):
@@ -346,7 +192,7 @@ class PolicyNet(torch.nn.Module):
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
 
 
-        t = torch.ones((1, 1, Args.MAP_SIZE, Args.MAP_SIZE), device=device)
+        t = torch.ones((1, 1, Args.MAP_SIZE, Args.MAP_SIZE), device=self.conv1.weight.device)
         t = self.conv1(t)
         t = self.conv2(t) #type:torch.Tensor
         t = t.view(t.shape[0], -1)
@@ -368,37 +214,42 @@ class PolicyNet(torch.nn.Module):
 class RND(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        # 空间下采样模块
+        self.downsample = nn.Sequential(
+            nn.AdaptiveMaxPool2d((3, 3)),  # 10x10 → 3x3
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),  # 保持3x3
+            nn.ReLU()
+        )
 
+        # 房间特征编码器
+        self.room_encoder = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(32 * 3 * 3, 256),
+            nn.LayerNorm(256)
+        )
 
-        t = torch.ones((1, 1, Args.MAP_SIZE, Args.MAP_SIZE), device=device)
-        t = self.conv1(t)
-        t = self.conv2(t) #type:torch.Tensor
-        t = t.view(t.shape[0], -1)
-        feature_dim = t.shape[1]
-
-        self.fc = nn.Linear(feature_dim, 1024)
+        # 房间特征蒸馏器
+        self.distill = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.Tanh()
+        )
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.view(x.shape[0], -1)
-        x = F.relu(self.fc(x))
-        return x
+        x = self.downsample(x)  # [B,1,10,10] → [B,16,3,3]
+        x = self.room_encoder(x)  # [B,256]
+        return self.distill(x)  # [B,128]
 
 class Agent:
     def __init__(self):
         self.actor = PolicyNet().to(device)
         self.optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.max_episodes = 10000
-        self.max_steps_per_episode = 300
-        self.gamma = 0.95
         self.steps = 1
 
-        self.rnd_predictor = RND()
-        self.rnd_predictor.eval()
-        self.rnd_target = RND()
+        self.rnd_predictor = RND().to(device)
+        self.rnd_target = RND().to(device)
+        self.rnd_target.eval()
         self.rnd_optimizer = torch.optim.Adam(self.rnd_predictor.parameters(), lr=1e-4)
 
     def step(self, action_delta:torch.Tensor, state:torch.Tensor):
@@ -409,33 +260,44 @@ class Agent:
         mask = (state == Args.MAP_HUMAN_VALUE).float()
         flat_idx = torch.argmax(mask).item()
         y, x = flat_idx // Args.MAP_SIZE, flat_idx % Args.MAP_SIZE  # 计算2D坐标
+        #撞墙
         if x+dx < 0 or y+dy <0 or  x+dx >= Args.MAP_SIZE or  y+dy >= Args.MAP_SIZE:
             if self.steps % 1000 == 0: writer.add_scalar("steps/move", 0, self.steps)
-            return next_state, 0, False
-
+            return next_state, Args.REWARD_HIT_WALL, False, x, y
+        #撞障碍物
         if g_map[y+dy, x+dx].item() == Args.MAP_OBS_VALUE:
             if self.steps % 1000 == 0: writer.add_scalar("steps/move", 0, self.steps)
-            return next_state, 0, False
+            return next_state, Args.REWARD_HIT_OBST, False, x, y
 
         next_state[0, 0, y, x] = 0
         y += dy
         x += dx
         if self.steps % 1000 == 0:  writer.add_scalar("steps/move", 1, self.steps)
         if next_state[0, 0, y, x].item() == Args.MAP_END_VALUE:
-            return next_state, 3, True
+            return next_state, Args.REWARD_GOAL, True, x, y
         next_state[0, 0, y, x] = Args.MAP_HUMAN_VALUE
-        return next_state, 0, False
+        return next_state, Args.REWARD_MOVE, False, x, y
 
     def compute_returns(self, rewards):
         returns = []
         R = 0
         for r in reversed(rewards):
-            R = r + self.gamma * R
+            R = r + Args.GAMMA * R
             returns.insert(0, R)
         returns = torch.tensor(returns, device=device)
         # 让权重有正有负，如果正的，我们就要增大在这个状态采取这个动作的概率；如果是负的，我们就要减小在这个状态采取这个动作的概率
-        returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-        return returns
+        # 但似乎也有问题，当前迷宫任务下，会导致一个回合里，早期的时间步的回报总是负数，后期的时间步的回报总是整数。实验证明，去掉下面这行是更好的，否则
+        # 出发点所在的第一个房间里的策略总是不正确。
+        #regular_returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+        return returns, returns
+
+    def check_grad(self, writer, net:nn.Module, tag):
+        # 检查梯度是否存在
+        for name, param in net.named_parameters():
+            if param.grad is None:
+                writer.add_scalar(f"{tag}/{name}", 0, self.steps)
+            else:
+                writer.add_scalar(f"{tag}/{name}", param.grad.abs().mean().item(), self.steps)
 
     def update_policy(self, returns, states, actions):
         states = torch.stack(states)  # [T, 1, 10, 10]
@@ -448,21 +310,27 @@ class Agent:
 
         # 添加熵正则化
         entropy = m.entropy().mean()
-        loss = -(log_probs * returns).mean() - 0.01 * entropy
+        loss = -(log_probs * returns).mean() - Args.ENTROPY_COEF * entropy
 
         self.optimizer.zero_grad()
         loss.backward()
         # 可添加梯度裁剪
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+        if self.steps % 1000== 0:
+            self.check_grad(writer, self.actor, "actor_grad")
         self.optimizer.step()
 
         ######### update predictor ##############
-        predictor_loss = self.calc_inner_reward(states).mean()
-        self.rnd_optimizer.zero_grad()
-        predictor_loss.backward()
-        self.rnd_optimizer.step()
+        predictor_loss = torch.tensor(0.0)
+        if Args.USE_RND:
+            predictor_loss = self.calc_inner_reward(states).mean()
+            self.rnd_optimizer.zero_grad()
+            predictor_loss.backward()
+            if self.steps % 1000 == 0:
+                self.check_grad(writer, self.rnd_predictor, "predict_grad")
+            self.rnd_optimizer.step()
 
-        return loss.item() + predictor_loss.item()
+        return loss.item(), predictor_loss.item()
 
     def calc_inner_reward(self, state:torch.Tensor):
         assert len(state.shape) == 4
@@ -474,12 +342,40 @@ class Agent:
         mean = distance.mean(dim=1, keepdim=True)
         std = distance.std(dim=1, keepdim=True) + 1e-6
         distance = (distance - mean).abs() / std
+        distance = F.tanh(distance) # 归一化
         distance = distance.mean(dim=1)
         return distance
 
+    def print_trajectory(self, positions:list):
+        print("")
+        pos_dict = {}
+        for id, p in enumerate(positions):
+            pos_dict[p] = id+1
+        for row in range(Args.MAP_SIZE):
+            for col in range(Args.MAP_SIZE):
+                id = -1
+                if (row, col) in pos_dict:
+                    id = pos_dict[(row, col)]
+
+                if g_map[row, col] == 3:
+                    print("■ ", end="")
+                    continue
+                if g_map[row, col] == 2:
+                    print("X ", end="")
+                    continue
+                if id > -1:
+                    print("h ", end="")
+                    continue
+                else:
+                    print("  ", end="")
+            print("")
+
+
+
+
     def train(self):
         entropy_list = deque(maxlen=100)
-        for episode in tqdm(range(self.max_episodes), "train"):
+        for episode in tqdm(range(Args.MAX_EPISODES), "train"):
             state = g_map.clone().float().to(device)
             state[0, 0] = Args.MAP_HUMAN_VALUE # human flag
             state = state.unsqueeze(0).unsqueeze(0)
@@ -487,26 +383,30 @@ class Agent:
             states = []
             rewards = []
             actions = []
+            positions = []
             inner_rewards = []
             total_reward = 0
             goal = False
-            for step in range(self.max_steps_per_episode):
+            for step in range(Args.MAX_STEPS_PER_EPISODE):
                 with torch.no_grad():
                     logits = self.actor(state)
                 m = Categorical(logits=logits)
                 action_idx = m.sample()
                 entropy = m.entropy()
-                entropy_list.append(entropy)
+                entropy_list.append(entropy.cpu())
 
                 action_delta = Args.ACTION_LIST[action_idx[0]]  # 直接索引
 
-                next_state, r, done = self.step(action_delta, state)
-                inner_reward = self.calc_inner_reward(next_state)
-
-                r += inner_reward.item()
+                next_state, r, done, newx, newy = self.step(action_delta, state)
+                if Args.USE_RND:
+                    inner_reward = self.calc_inner_reward(next_state)
+                    if self.steps % 1000 == 0:
+                        writer.add_scalar("steps/inner_reward", inner_reward.item(), self.steps)
+                    r += Args.INNER_R_SCALE *  inner_reward.item()
                 states.append(state[0])
                 rewards.append(r)
                 actions.append(action_idx[0])
+                positions.append((newy, newx))
                 total_reward += r
 
                 if done:
@@ -515,32 +415,42 @@ class Agent:
 
                 state = next_state
 
+            if (episode+1) % 97 == 0:
+                self.print_trajectory(positions)
+                self.print_policy(f"policy at {episode}")
             #没有获得有效回报
             if total_reward == 0:
-                writer.add_scalar("episode/return", 00, episode)
-                writer.add_scalar("episode/loss", 0, episode)
                 writer.add_scalar("episode/action_entropy", numpy.array(entropy_list).mean(), episode)
+                writer.add_scalar("episode/goal", int(goal), episode)
+                writer.add_scalar("episode/len", len(states), episode)
                 continue
             # 计算回报
-            returns = self.compute_returns(rewards)
-            loss = self.update_policy(returns, states, actions)
+            returns,raw_returns = self.compute_returns(rewards)
+            loss1, loss2 = self.update_policy(returns, states, actions)
 
-            writer.add_scalar("episode/return", returns[0].item(), episode)
-            writer.add_scalar("episode/loss", loss, episode)
+            writer.add_scalar("episode/return", raw_returns[0].item(), episode)
+            writer.add_scalar("episode/loss1", loss1, episode)
+            writer.add_scalar("episode/loss2", loss2, episode)
             writer.add_scalar("episode/action_entropy", numpy.array(entropy_list).mean(), episode)
             writer.add_scalar("episode/goal", int(goal), episode)
-    def print_policy(self):
-        print("")
+            writer.add_scalar("episode/len", len(states), episode)
+
+        self.print_policy("policy at end")
+    def print_policy(self, msg=""):
+        print(f"{msg}")
         for row in range(Args.MAP_SIZE):
             for col in range(Args.MAP_SIZE):
-                input = g_map.clone().unsqueeze(0).unsqueeze(0)
+                input = g_map.clone().unsqueeze(0).unsqueeze(0).float().to(device)
                 input[0,0, row, col] = Args.MAP_HUMAN_VALUE
                 with torch.no_grad():
                     logits = self.actor(input) #type:torch.Tensor
                 action = F.softmax(logits, dim=1).argmax(dim=1)
                 action = action[0].item()
-                if g_map[row, col] == -1:
+                if g_map[row, col] == 3:
                     print("■ ", end="")
+                    continue
+                if g_map[row, col] == 2:
+                    print("X ", end="")
                     continue
                 if action == 2:
                     print("← ", end="")
@@ -562,6 +472,13 @@ def main(mode="train"):
         agent.train()
 
 main()
+writer.close()
 
 ```
+
+#### 问题二：
+
+终点位置太过“隐蔽”不能探索到，导致每个回合的奖励和回报都是全0，不能形成有效梯度，也就无法更新模型。
+
+也正是RND要解决的问题。但截止到目前，我还没有搞定
 
