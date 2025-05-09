@@ -101,11 +101,13 @@ RND方法适合局部探索，例如短期决策带来的后果，它不适合�
 
 ### bison的实验
 
+#### 1、基于策略网络的强化学习
+
 暂时还没有信心训练agent玩蒙特祖玛的复仇，搞个简单的：一个迷宫有6个房间，房间之间只有一个小通道，移动的时候没有奖励，找到截至位置奖励1。
 
 对比有无RND方法的帮助，训练收敛速度和最优路径（步数最少）
 
-#### 问题一：
+##### 问题一：
 
 下面的代码，光说不适用RND的方式下，就搞了我一整天，出发点所在的第一个“房间”里的策略总是不正确，后面的房间里的策略都正确，哪怕训练5万个回合。我想了又想，可能和回报的归一化有关：我把回报减去均值再除以标准差，这样导致一个回合下早期时间步对应的回报总是负数，后期时间步的回报总是正数，不合理。
 
@@ -476,9 +478,539 @@ writer.close()
 
 ```
 
-#### 问题二：
+##### 问题二：
 
 终点位置太过“隐蔽”不能探索到，导致每个回合的奖励和回报都是全0，不能形成有效梯度，也就无法更新模型。
 
-也正是RND要解决的问题。但截止到目前，我还没有搞定
+也正是RND要解决的问题。但截止到目前，我还没有搞定。
+
+**我总觉得RND不能解决这个问题，例如蒙特祖玛复仇游戏里，人类玩家不断探索，多次进入一个新房间进行尝试，就会导致RND对“处于新房间”这个状态不再“新鲜”，内部奖励变小，在取得真正的游戏进展（例如在新房间找到了宝剑）之前，不再鼓励agent对该房间做探索。**
+
+##### 问题三：
+
+我上面的代码，没有把RND带来的内部奖励实现为跨回合的非回合制方式，这可能是**RND没有效果**的原因。通过和AI简单的讨论，可能需要添加价值网络才能实现跨回合的内部奖励。
+
+#### 2、Actor-Critic方式
+
+由于上面的问题二、问题三，所以我还是只能回到Actor-Critic的方式。但其实RND也没有起到什么积极作用。
+
+![image-20250509192323224](C:\Users\bison\AppData\Roaming\Typora\typora-user-images\image-20250509192323224.png)
+
+代码如下：
+
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+from torch.distributions import Categorical
+import numpy as np
+import os
+import time
+from collections import deque
+from tqdm import tqdm
+from datetime import datetime
+
+# ========================== 环境配置 ==========================
+MAP = [
+    [1, 0, 0, 3, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 3, 0, 0, 0, 3, 0, 0],
+    [0, 0, 0, 3, 0, 0, 0, 3, 0, 0],
+    [3, 3, 0, 3, 0, 0, 0, 3, 0, 0],
+    [0, 0, 0, 3, 0, 3, 3, 3, 0, 3],
+    [0, 0, 0, 3, 0, 0, 0, 3, 0, 0],
+    [0, 3, 3, 3, 3, 3, 0, 3, 3, 0],
+    [0, 3, 0, 0, 0, 3, 0, 3, 0, 0],
+    [0, 3, 0, 3, 0, 3, 0, 3, 0, 3],
+    [0, 0, 0, 3, 0, 0, 2, 3, 0, 0]
+]
+
+# ========================== 超参数配置 ==========================
+config = {
+    'use_rnd': True,  # 是否启用RND探索
+    'seed': 42,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+
+    # 环境参数
+    'max_steps': 200,  # 单次episode最大步数
+    'action_dim': 4,  # 动作空间维度
+
+    # 网络参数
+    'state_channels': 3,  # 输入通道数（障碍物、代理、目标）
+    'cnn_features': 64,  # CNN特征维度
+    'rnd_embed_dim': 128,  # RND嵌入维度
+    'hidden_dim': 256,  # 全连接层维度
+
+    # 训练参数
+    'total_episodes': 10000,  # 总训练episode数
+    'gamma_ext': 0.99,  # 外在奖励折扣
+    'gamma_int': 0.99,  # 内在奖励折扣（非回合制）
+    'clip_eps': 0.2,  # PPO截断参数
+    'entropy_coef': 0.01,  # 熵正则化系数
+    'lr_actor': 3e-4,  # Actor学习率
+    'lr_critic': 1e-3,  # Critic学习率
+    'lr_rnd': 1e-4,  # RND学习率
+    'batch_size': 1024,  # 训练批次大小
+    'update_epochs': 4,  # PPO更新轮数
+
+    # 系统参数
+    'log_interval': 50,  # 日志记录间隔
+    'save_interval': 500,  # 模型保存间隔
+    'log_dir': 'logs',
+    'save_dir': 'checkpoints'
+}
+
+
+# ========================== 迷宫环境类 ==========================
+class MazeEnv:
+    def __init__(self):
+        self.raw_map = torch.tensor(MAP, dtype=torch.float32)
+        self.start_pos = (0, 0)
+        self.end_pos = (9, 6)
+        self.actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # 上下左右
+        self.reset()
+
+    def reset(self):
+        """重置环境，返回三通道图像状态"""
+        self.agent_pos = self.start_pos
+        return self._get_state()
+
+    def step(self, action):
+        """执行动作，返回(next_state, reward, done)"""
+        x, y = self.agent_pos
+        dx, dy = self.actions[action]
+        new_x = max(0, min(9, x + dx))
+        new_y = max(0, min(9, y + dy))
+
+        # 碰撞检测
+        if self.raw_map[new_x, new_y] == 3:
+            new_x, new_y = x, y  # 保持原位
+
+        self.agent_pos = (new_x, new_y)
+        done = (self.agent_pos == self.end_pos)
+        return self._get_state(), 1.0 if done else 0.0, done
+
+    def _get_state(self):
+        """构建三通道状态张量：(障碍物, 代理位置, 目标位置)"""
+        state = torch.zeros((3, 10, 10))
+        state[0] = (self.raw_map == 3).float()  # 障碍物通道
+        state[1, self.agent_pos[0], self.agent_pos[1]] = 1.0  # 代理位置
+        state[2, self.end_pos[0], self.end_pos[1]] = 1.0  # 目标位置
+        return state
+
+
+    def get_state(self, agent_pos):
+        assert len(agent_pos) == 2
+        """根据指定的agent_pos构建三通道状态张量：(障碍物, 代理位置, 目标位置)"""
+        state = torch.zeros((3, 10, 10))
+        state[0] = (self.raw_map == 3).float()  # 障碍物通道
+        state[1, agent_pos[0], agent_pos[1]] = 1.0  # 代理位置
+        state[2, self.end_pos[0], self.end_pos[1]] = 1.0  # 目标位置
+        return state
+
+    def render(self):
+        """可视化当前状态"""
+        grid = self.raw_map.clone().numpy().astype(int)
+        x, y = self.agent_pos
+        grid[x, y] = 8  # 代理位置标记
+        print('\n'.join([' '.join(map(str, row)) for row in grid]))
+
+
+# ========================== 网络定义 ==========================
+class CNNEncoder(nn.Module):
+    """共享的CNN特征提取器"""
+
+    def __init__(self, in_channels, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * 3 * 3, out_dim)  # 10x10 -> 5x5 -> 3x3
+        )
+
+        self.out_dim = out_dim
+
+    def forward(self, x):
+        return self.net(x)
+
+
+
+class ActorCritic(nn.Module):
+    """双头价值网络"""
+
+    def __init__(self, encoder:CNNEncoder, action_dim, hidden_dim):
+        super().__init__()
+        self.encoder = encoder
+
+        # 策略网络
+        self.actor = nn.Sequential(
+            nn.Linear(encoder.out_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Softmax(dim=-1)
+        )
+
+        # 双价值头
+        self.critic_ext = nn.Sequential(
+            nn.Linear(encoder.out_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.critic_int = nn.Sequential(
+            nn.Linear(encoder.out_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x):
+        features = self.encoder(x)
+        return self.actor(features), self.critic_ext(features), self.critic_int(features)
+
+
+class RNDNetwork(nn.Module):
+    """RND网络（目标网络+预测网络）"""
+
+    def __init__(self, encoder:CNNEncoder, embed_dim):
+        super().__init__()
+        self.target = CNNEncoder(3, embed_dim)
+        self.predictor = nn.Sequential(
+            encoder,
+            nn.Linear(encoder.out_dim, embed_dim)
+        )
+
+        # 冻结目标网络参数
+        for param in self.target.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        return self.predictor(x), self.target(x)
+
+
+# ========================== 代理类 ==========================
+class PPORNDAgent:
+    def __init__(self, config):
+        self.cfg = config
+        self.env = MazeEnv()
+        self._init_components()
+        self._reset_training_state()
+
+        os.makedirs(config['save_dir'], exist_ok=True)
+        dt = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.writer = SummaryWriter(f"{config['log_dir']}/maze_v2_{dt}")
+
+    def _init_components(self):
+        """初始化网络组件"""
+        # 共享编码器
+        self.encoder = CNNEncoder(self.cfg['state_channels'], self.cfg['hidden_dim']).to(self.cfg['device'])
+
+        # Actor-Critic网络
+        self.actor_critic = ActorCritic(
+            self.encoder,
+            self.cfg['action_dim'],
+            self.cfg['hidden_dim']
+        ).to(self.cfg['device'])
+
+        # RND组件
+        if self.cfg['use_rnd']:
+            self.rnd = RNDNetwork(
+                CNNEncoder(self.cfg['state_channels'], self.cfg['rnd_embed_dim']),
+                self.cfg['rnd_embed_dim']
+            ).to(self.cfg['device'])
+            self.optim_rnd = optim.Adam(self.rnd.predictor.parameters(), lr=self.cfg['lr_rnd'])
+
+        # 共享编码器参数应同时被Actor和Critic优化
+        shared_params = list(self.encoder.parameters())
+
+        # Actor优化器
+        self.optim_actor = optim.Adam(
+            shared_params + list(self.actor_critic.actor.parameters()),
+            lr=self.cfg['lr_actor']
+        )
+
+        # Critic优化器
+        self.optim_critic = optim.Adam(
+            shared_params + list(self.actor_critic.critic_ext.parameters())+ list(self.actor_critic.critic_int.parameters()),
+            lr=self.cfg['lr_critic']
+        )
+
+    def _reset_training_state(self):
+        """重置训练状态"""
+        self.buffer = []
+        self.episode_rewards = []
+        self.step_count = 0
+        self.last_intrinsic_value = 0.0  # 跨episode保留
+
+    def select_action(self, state, greedy=False):
+        """选择动作并返回相关信息"""
+        state_tensor = state.unsqueeze(0).to(self.cfg['device'])
+        with torch.no_grad():
+            probs, value_ext, value_int = self.actor_critic(state_tensor)# type: (torch.Tensor, torch.Tensor, torch.Tensor)
+
+        dist = Categorical(probs)
+        if greedy:
+            action = probs.argmax(dim=1)
+        else:
+            action = dist.sample()
+        return {
+            'action': action.item(),
+            'log_prob': dist.log_prob(action),
+            'value_ext': value_ext.squeeze(),
+            'value_int': value_int.squeeze()
+        }
+
+    def collect_experience(self, ep):
+        """收集经验数据（非回合制）"""
+        state = self.env.reset()
+        episode_reward = 0
+        intrinsic_return = 0.0
+
+        for _ in range(self.cfg['max_steps']):
+            # 选择动作
+            action_info = self.select_action(state)
+
+            # 执行动作
+            next_state, reward_ext, done = self.env.step(action_info['action'])
+
+            # 计算内在奖励
+            reward_int = 0.0
+            if self.cfg['use_rnd']:
+                with torch.no_grad():
+                    state_tensor = state.unsqueeze(0).to(self.cfg['device'])
+                    pred, target = self.rnd(state_tensor)
+                    reward_int = torch.mean((pred - target) ** 2).item()
+
+            # 保存经验
+            self.buffer.append((
+                state,
+                action_info['action'],
+                reward_ext,
+                reward_int,
+                action_info['log_prob'],
+                action_info['value_ext'],
+                action_info['value_int'],
+                done
+            ))
+
+            # 更新统计
+            episode_reward += reward_ext
+            intrinsic_return += reward_int
+            self.step_count += 1
+            state = next_state
+
+            if done:
+                break
+
+        # 记录episode信息
+        self.episode_rewards.append(episode_reward)
+        self.writer.add_scalar('episode/Reward_Extrinsic', episode_reward, ep)
+        if self.cfg['use_rnd']:
+            self.writer.add_scalar('episode/Reward_Intrinsic', intrinsic_return, ep)
+
+    def compute_advantages(self):
+        """计算GAE（非回合制）"""
+        states = torch.stack([t[0] for t in self.buffer]).to(self.cfg['device'])
+        dones = torch.tensor([t[7] for t in self.buffer]).float().to(self.cfg['device'])
+
+        # 获取价值估计
+        with torch.no_grad():
+            _, values_ext, values_int = self.actor_critic(states)
+
+        # 计算外在优势
+        advantages_ext, returns_ext = self._compute_gae(
+            torch.tensor([t[2] for t in self.buffer]).to(self.cfg['device']),
+            values_ext.squeeze(),
+            dones,
+            self.cfg['gamma_ext']
+        )
+
+        # 计算内在优势（非回合制）
+        advantages_int, returns_int = self._compute_gae(
+            torch.tensor([t[3] for t in self.buffer]).to(self.cfg['device']),
+            values_int.squeeze(),
+            torch.zeros_like(dones),  # 忽略done信号
+            self.cfg['gamma_int']
+        )
+
+        return advantages_ext + advantages_int, returns_ext + returns_int
+
+    def _compute_gae(self, rewards, values, dones, gamma):
+        """通用GAE计算"""
+        advantages = torch.zeros_like(rewards)
+        last_advantage = 0
+
+        # 逆序计算
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = self.last_intrinsic_value if gamma == self.cfg['gamma_int'] else 0
+            else:
+                next_value = values[t + 1]
+
+            delta = rewards[t] + gamma * (1 - dones[t]) * next_value - values[t]
+            advantages[t] = delta + gamma * 0.95 * (1 - dones[t]) * last_advantage
+            last_advantage = advantages[t]
+
+        returns = advantages + values
+        return advantages, returns
+
+    def update_networks(self,ep):
+        """更新网络参数"""
+        # 准备数据
+        states = torch.stack([t[0] for t in self.buffer]).to(self.cfg['device'])
+        actions = torch.tensor([t[1] for t in self.buffer]).to(self.cfg['device'])
+        old_log_probs = torch.stack([t[4] for t in self.buffer]).to(self.cfg['device'])
+        advantages, returns = self.compute_advantages()
+
+        # 更新RND
+        if self.cfg['use_rnd']:
+            pred, target = self.rnd(states)
+            rnd_loss = nn.functional.mse_loss(pred, target.detach())
+            self.optim_rnd.zero_grad()
+            rnd_loss.backward()
+            self.optim_rnd.step()
+            self.writer.add_scalar('episode/Loss_RND', rnd_loss.item(), ep)
+
+        # PPO更新
+        for idx in range(self.cfg['update_epochs']):
+            # 随机采样
+            indices = torch.randperm(len(self.buffer))[:self.cfg['batch_size']]
+
+            batch_states = states[indices]
+            batch_actions = actions[indices]
+            batch_old_log_probs = old_log_probs[indices]
+            batch_advantages = advantages[indices]
+            batch_returns = returns[indices]
+
+            # 计算新策略
+            probs, values_ext, values_int = self.actor_critic(batch_states)
+            dist = Categorical(probs)
+            new_log_probs = dist.log_prob(batch_actions)
+            entropy = dist.entropy().mean()
+
+            # 策略损失
+            ratio = (new_log_probs - batch_old_log_probs).exp()
+            surr1 = ratio * batch_advantages
+            surr2 = torch.clamp(ratio, 1 - self.cfg['clip_eps'], 1 + self.cfg['clip_eps']) * batch_advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # 价值损失
+            value_loss = nn.functional.mse_loss(values_ext.squeeze() + values_int.squeeze(), batch_returns)
+
+            # 总损失
+            total_loss = policy_loss + 0.5 * value_loss - self.cfg['entropy_coef'] * entropy
+
+            # 反向传播
+            self.optim_actor.zero_grad()
+            self.optim_critic.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), 0.5)
+            self.optim_actor.step()
+            self.optim_critic.step()
+
+            # 记录日志
+            if idx == 0:
+                self.writer.add_scalar('episode/Loss_Policy', policy_loss.item(), ep)
+                self.writer.add_scalar('episode/Loss_Value', value_loss.item(), ep)
+                self.writer.add_scalar('episode/Entropy', entropy.item(), ep)
+
+        # 清空缓冲区
+        self.buffer = []
+
+    def train(self):
+        """主训练循环"""
+        start_time = time.time()
+
+        for ep in tqdm(range(1, self.cfg['total_episodes'] + 1), "train"):
+            self.collect_experience(ep)
+
+            if len(self.buffer) >= self.cfg['batch_size']:
+                self.update_networks(ep)
+
+            # 记录日志
+            if ep % self.cfg['log_interval'] == 0:
+                avg_reward = np.mean(self.episode_rewards[-self.cfg['log_interval']:])
+                self.writer.add_scalar('episode/avg_reward', avg_reward, ep)
+
+            # 保存检查点
+            if ep % self.cfg['save_interval'] == 0:
+                self.save_checkpoint(ep)
+                self.print_policy()
+
+        print(f"Training completed in {time.time() - start_time:.1f}s")
+        self.writer.close()
+
+    def save_checkpoint(self, episode):
+        """保存模型状态"""
+        state = {
+            'episode': episode,
+            'actor_critic': self.actor_critic.state_dict(),
+            'optim_actor': self.optim_actor.state_dict(),
+            'optim_critic': self.optim_critic.state_dict(),
+        }
+        if self.cfg['use_rnd']:
+            state.update({
+                'rnd': self.rnd.state_dict(),
+                'optim_rnd': self.optim_rnd.state_dict()
+            })
+        path = os.path.join(self.cfg['save_dir'], f"checkpoint_ep{episode}.pth")
+        torch.save(state, path)
+        print(f"Saved checkpoint to {path}")
+
+    def load_checkpoint(self, path):
+        """加载模型状态"""
+        state = torch.load(path, map_location=self.cfg['device'])
+        self.actor_critic.load_state_dict(state['actor_critic'])
+        self.optim_actor.load_state_dict(state['optim_actor'])
+        self.optim_critic.load_state_dict(state['optim_critic'])
+        if self.cfg['use_rnd'] and 'rnd' in state:
+            self.rnd.load_state_dict(state['rnd'])
+            self.optim_rnd.load_state_dict(state['optim_rnd'])
+        print(f"Loaded checkpoint from {path}")
+
+    def print_policy(self):
+
+        for x in range(10):
+            for y in range(10):
+                if self.env.raw_map[x, y] == 3:
+                    print("■ ", end="")
+                    continue
+                if self.env.raw_map[x, y] == 2:
+                    print("X ", end="")
+                    continue
+                state = self.env.get_state((x, y))
+                action_info = self.select_action(state, True)
+                action = action_info['action']
+                if action == 2:
+                    print("← ", end="")
+                    continue
+                if action == 3:
+                    print("→ ", end="")
+                    continue
+                if action == 0:
+                    print("↑ ", end="")
+                    continue
+                if action == 1:
+                    print("↓ ", end="")
+                    continue
+            print("")
+
+
+
+
+# ========================== 主程序 ==========================
+if __name__ == "__main__":
+    torch.manual_seed(config['seed'])
+    np.random.seed(config['seed'])
+
+    agent = PPORNDAgent(config)
+
+    # 可选：加载现有模型
+    # agent.load_checkpoint('checkpoints_v2/checkpoint_ep500.pth')
+
+    # 开始训练
+    agent.train()
+
+```
 
