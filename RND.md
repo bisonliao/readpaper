@@ -494,7 +494,7 @@ writer.close()
 
 由于上面的问题二、问题三，所以我还是只能回到Actor-Critic的方式。但其实RND也没有起到什么积极作用。
 
-![image-20250509192323224](C:\Users\bison\AppData\Roaming\Typora\typora-user-images\image-20250509192323224.png)
+![image-20250509192323224](img/image-20250509192323224.png)
 
 代码如下：
 
