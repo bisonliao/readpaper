@@ -57,6 +57,10 @@ DPO的突破：
 
 ![image-20250511135042490](img/image-20250511135042490.png)
 
+关于如何使用beta控制偏离，也有些违反直觉：
+
+![image-20250512105527451](img/image-20250512105527451.png)
+
 ### Theoretical Analysis of DPO
 
 与RLHF的数学等价性的证明，我看不太懂。略过
@@ -105,12 +109,17 @@ Epoch 3: 100%|██████████| 2/2 [00:00<00:00, 11.47it/s]
 代码如下：
 
 ```python
+import copy
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, AdamW
 import torch.nn.functional as F
 from tqdm import tqdm
 import os
+import torch
+from transformers import AutoModelForCausalLM
+import numpy as np
 
 # ========= Toy 偏好数据 =========
 # 为了验证训练效果，我故意把chosen写成违反直觉的，而rejected是符合直觉的
@@ -267,6 +276,46 @@ def evaluate_dpo(policy_model, tokenizer, raw_data, model_name, device="cpu"):
     total = len(raw_data)
     print(f"✅ Evaluation: {model_name} preferred chosen completions in {win_count}/{total} ({win_count / total * 100:.1f}%) cases.")
 
+# 检查模型训练前后的参数的差异情况
+def compare_model_parameters_percentage(policy_model, ref_model):
+    differences = []
+
+    for (name1, param1), (name2, param2) in zip(policy_model.named_parameters(), ref_model.named_parameters()):
+        if name1 != name2:
+            raise ValueError(f"Parameter names do not match: {name1} vs {name2}")
+        if not param1.requires_grad:
+            continue
+
+        diff = (param1 - param2).abs().detach()
+        base = param2.abs().detach()
+        base[base == 0] = 1e-8  # Avoid division by zero
+
+        percent_diff = (diff / base).view(-1).cpu().numpy()
+        differences.append(percent_diff)
+
+    all_diffs = np.concatenate(differences)
+    return  float(all_diffs.max()),float(all_diffs.min()),float(all_diffs.mean())
+
+
+# 检查模型训练前后，对相同prompt输出的散度
+def compute_kl_divergence(prompts, policy_model, ref_model, tokenizer, device='cuda'):
+    kl_divs = []
+
+    for prompt in prompts:
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            logits_policy = policy_model(**inputs).logits[:, -1, :]
+            logits_ref = ref_model(**inputs).logits[:, -1, :]
+
+        log_probs_policy = F.log_softmax(logits_policy, dim=-1)
+        probs_ref = F.softmax(logits_ref, dim=-1)
+
+        kl_div = F.kl_div(log_probs_policy, probs_ref, reduction="batchmean", log_target=False)
+        kl_divs.append(kl_div.item())
+
+    return kl_divs
+
 # ========= 主函数 =========
 def main():
     model_name = "gpt2"
@@ -277,6 +326,8 @@ def main():
 
     policy_model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     ref_model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    old_model = copy.deepcopy(policy_model)
+    old_model.eval()
     ref_model.eval()
 
     dataset = PreferenceDataset(toy_data, tokenizer)
@@ -292,6 +343,11 @@ def main():
     policy_model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
     print(f"📦 Model saved to {save_path}")
+
+    print("weight diff percentage:", compare_model_parameters_percentage(policy_model, old_model))
+    prompts = ["The capital of France is", "Once upon a time"]
+    print("output kl divergence:", compute_kl_divergence(prompts, policy_model, old_model, tokenizer))
+
 
 # ========= 启动 =========
 if __name__ == "__main__":
