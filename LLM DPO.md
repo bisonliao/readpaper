@@ -153,7 +153,7 @@ class PreferenceDataset(Dataset):
         prompt = item["prompt"]
         chosen = item["chosen"]
         rejected = item["rejected"]
-
+        #把 prompt和response拼接起来作为一个完整的自生成样本
         chosen_input = self.tokenizer(prompt + " " + chosen, return_tensors="pt", truncation=True, max_length=self.max_length)
         rejected_input = self.tokenizer(prompt + " " + rejected, return_tensors="pt", truncation=True, max_length=self.max_length)
 
@@ -162,23 +162,40 @@ class PreferenceDataset(Dataset):
             "rejected": rejected_input["input_ids"].squeeze(0)
         }
 
+
+def get_log_probs(model, input_ids, no_grad, tokenizer):
+
+    # 用的是 HuggingFace 的 causal language model的 接口，它内部就会自动处理错位对齐
+    # https://huggingface.co/learn/llm-course/en/chapter7/6
+    # "Shifting the inputs and labels to align them happens inside the model, so the data collator just copies the inputs to create the labels."
+    input_ids = input_ids.to(model.device)
+    inputs = input_ids.clone()
+    labels = input_ids.clone()
+
+    with torch.no_grad() if  no_grad else torch.enable_grad():
+        outputs = model(input_ids=inputs, labels=labels)
+        # 损失函数输入的两个参数的形状：
+        # input：B x seqlen x vocabsz   ， tensor的每个元素是5万多个单词的每个单词的概率大小
+        #  target: B x seqlen,            tensor的每个元素表示token id，也就是第几个单词
+        #  reshape后：
+        #  input： （B x seqlen， vocabsz）
+        #  target：（B x seqlen，）
+        #  标准的交叉熵， 先对input（也就是第一个参数）的做softmax，然后挑选target指定的那个分量的概率求ln
+        # 由于输出的是下一个token，所以做比对的时候，标签要用原文后移一个token，而output最后一个token无效,要截断
+        log_probs = -F.cross_entropy(outputs.logits[:,:-1].reshape(-1, outputs.logits.size(-1)),
+                                     labels[:,1:].reshape(-1),
+                                     reduction="none")  # （B x seqlen，）
+        token_mask = labels[:, 1:] != tokenizer.pad_token_id
+        log_probs = log_probs.view(inputs.size(0), -1)  # shape变换回来： B X seqlen
+        seq_log_probs = (log_probs * token_mask).sum(dim=1)  # 剔除掉填充位置的损失值，并在时间步维度求和，(B,)
+    return seq_log_probs
+
 # ========= DPO 损失 =========
 def dpo_loss(policy_model, ref_model, batch, tokenizer, beta=0.1):
-    def get_log_probs(model, input_ids):
-        with torch.no_grad() if model is ref_model else torch.enable_grad():
-            outputs = model(input_ids=input_ids, labels=input_ids)
-            log_probs = -F.cross_entropy(outputs.logits[:, :-1].reshape(-1, outputs.logits.size(-1)),
-                                         input_ids[:, 1:].reshape(-1),
-                                         reduction="none")
-            token_mask = input_ids[:, 1:] != tokenizer.pad_token_id
-            log_probs = log_probs.view(input_ids.size(0), -1)
-            seq_log_probs = (log_probs * token_mask).sum(dim=1)
-        return seq_log_probs
-
-    logp_chosen = get_log_probs(policy_model, batch["chosen"])
-    logp_rejected = get_log_probs(policy_model, batch["rejected"])
-    logp_chosen_ref = get_log_probs(ref_model, batch["chosen"])
-    logp_rejected_ref = get_log_probs(ref_model, batch["rejected"])
+    logp_chosen = get_log_probs(policy_model, batch["chosen"], False, tokenizer)
+    logp_rejected = get_log_probs(policy_model, batch["rejected"], False, tokenizer)
+    logp_chosen_ref = get_log_probs(ref_model, batch["chosen"], True, tokenizer)
+    logp_rejected_ref = get_log_probs(ref_model, batch["rejected"], True, tokenizer)
 
     pi_ratio = beta * ((logp_chosen - logp_chosen_ref) - (logp_rejected - logp_rejected_ref))
     loss = -F.logsigmoid(pi_ratio).mean()
@@ -186,6 +203,8 @@ def dpo_loss(policy_model, ref_model, batch, tokenizer, beta=0.1):
 
 # ========= 训练函数 =========
 def train_dpo(policy_model, ref_model, tokenizer, dataset, epochs=3, batch_size=2, lr=5e-5, beta=0.1, device="cpu"):
+    # 这个函数完全就是深度学习常见的模样，稍微不一样的就是拿到的batch是一个字典，而不是input/label组成的tuple
+    # 用dataset初始化dataloader，深度学习的标准做法。同时会补齐长度，方便做batch tensor
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x: {
         "chosen": torch.nn.utils.rnn.pad_sequence([i["chosen"] for i in x], batch_first=True, padding_value=tokenizer.pad_token_id).to(device),
         "rejected": torch.nn.utils.rnn.pad_sequence([i["rejected"] for i in x], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
@@ -221,12 +240,22 @@ def evaluate_dpo(policy_model, tokenizer, raw_data, model_name, device="cpu"):
         rejected_ids = tokenizer(rejected, return_tensors="pt", truncation=True).input_ids.to(device)
 
         def get_response_logprob(response_ids):
-            input_ids = torch.cat([prompt_ids, response_ids[:, 1:]], dim=1)  # 拼接 prompt + response
+            input_ids = torch.cat([prompt_ids, response_ids], dim=1)  # 拼接 prompt + response
+            # 用的是 HuggingFace 的 causal language model的 接口，它内部就会自动处理错位对齐
+            # https://huggingface.co/learn/llm-course/en/chapter7/6
+            # "Shifting the inputs and labels to align them happens inside the model, so the data collator just copies the inputs to create the labels."
             labels = input_ids.clone()
+
+            # prompt这一段不要计算损失值
+            # pytorch的官方文档提到：如果计算损失的时候要忽略某些部分的损失之，就把target这些位置置为-100：
+            # class torch.nn.CrossEntropyLoss(weight=None, size_average=None, ignore_index=-100, reduce=None, reduction='mean', label_smoothing=0.0)[source]
+            # Specifies a target value that is ignored and does not contribute to the input gradient.
             labels[:, :prompt_ids.shape[1]] = -100  # mask 掉 prompt 部分
             outputs = policy_model(input_ids=input_ids, labels=labels)
             loss = outputs.loss
-            return -loss.item() * response_ids.shape[1]  # 转为总 logprob
+            # 转为总 logprob， 因为模型内部求loss的时候，按照seqlen求了mean，所以这里乘以长度得到总的损失值作为分数，
+            # 加上符号，就是让分数越大表示越贴近label（损失值本来是越小越贴近）
+            return -loss.item() * response_ids.shape[1]
 
         chosen_score = get_response_logprob(chosen_ids)
         rejected_score = get_response_logprob(rejected_ids)
@@ -254,7 +283,7 @@ def main():
 
     train_dpo(policy_model, ref_model, tokenizer, dataset, epochs=3, device=device)
 
-    for i in range(5): #运行五次，是确保不是因为运气好而看到有效的结果
+    for i in range(5):
         evaluate_dpo(policy_model, tokenizer, toy_data, "trained model", device=device)
         evaluate_dpo(ref_model, tokenizer, toy_data, "original model", device=device)
         print("")
