@@ -2,7 +2,36 @@
 
 ### Introduction
 
-通过结合监督学习（人类演示数据）和强化学习（人类偏好排序数据）的微调方法（RLHF）, 可以使得大模型：
+预训练版本的可用程度的直观感受：未经fine tune的预训练的GPT-2，自回归生成的文本是很糟糕的，不通顺、语法不正确、也没有清晰的语义，下面是一个例子：
+
+```
+Minnesota's Democratic-Farmer-Labor Party is trying to get Donald Trump kicked off the state ballot. | Getty Minnesota Democrats move to speeds speeds Fighting replicatedLuaLua defy defy sil silearedilated gccsignedcean handle periodically offices hubPK chemical 409 gates travels knowledgeable Sylv upheaval Yeiny dis Palest Dad Sherlock insuits appear exits PalestArea Frieza defy Croatia highlight Framework stirred calculuscription :[ WIN entert Rico tim tim enlarg deductible1971 fibervich Promotion cloud slate Frieza subsystem widgetsillas snow baseballulence652 Sett DropCLUS Spells IR Hyper Weapon Canal fort bigaline tragedies Chrys fors impl breadthn peel Romancen peeltnelt994 WeakFive narrativeillas Palest
+```
+
+我以为是我给的prompt不对，即使在开头加上类似这样的指示也没有帮助：
+
+```
+I will give you a passage of English text, approximately 30 words long. Please continue writing this passage, ensuring that the continuation is coherent, meaningful, and grammatically correct in English.\n\n
+```
+
+由此可见，后面的SFT和RLHF是多么关键的环节。
+
+huggin face上有openai官方开源的不同大小的预训练的GPT-2，但没有官方开源的fine-tune后的GPT-2的版本。搜了一下，有一些非官方的fine-tune版本：
+
+```
+# 预训练版本
+https://huggingface.co/openai-community/gpt2
+
+# fine-tune后的版本，非官方
+https://huggingface.co/TheCarBun/GPT-2-fine-tuned-mental-health
+
+# 搜索链接：
+https://huggingface.co/models?search=gpt2%20fine-tuned
+```
+
+
+
+本论文的工作是通过结合监督学习（人类演示数据）和强化学习（人类偏好排序数据）的微调方法（RLHF）, 可以使得大模型：
 
 1. 更好的遵循人类的意图，对人类更有实质性的帮助
 2. 更好的生成真实的答案
@@ -65,6 +94,10 @@ RM训练是这样构造的：
 
 **bandit环境，简单的说就是回合长度为1的即时奖励的环境。**
 
+**在该论文的 RLHF（Reinforcement Learning from Human Feedback）框架中，强化学习环境被建模为一个 bandit 环境**：
+
+"The environment is a bandit environment which presents a random customer prompt and expects a response to the prompt. Given the prompt and response, it produces a reward determined by the reward model and ends the episode."
+
 
 
 **强化学习阶段很重要的是避免过拟合到RM：**
@@ -86,7 +119,13 @@ RM训练是这样构造的：
 
 用一个toy problem 来体验RLHF，我的奖励模型很简单：大模型输出的文本里如果有数字，就为正奖励，否则为负奖励。鼓励大模型用数据说话。
 
+正如前面所说，每次生成一个文本，都当作一个动作/一个时间步，而不是把每个token的生成当作一个动作。这样每次与环境交互的回合长度都是1，这样大大简化了代码和计算量。
 
+瞎折腾一天，效果不好，生成的文本中的数字没有显著增长：
+
+![image-20250513170449540](img/image-20250513170449540.png)
+
+代码如下：
 
 ```python
 import torch
@@ -106,7 +145,7 @@ BATCH_SIZE = 4
 MAX_NEW_TOKENS = 100
 EPOCHS = 100
 CLIP_EPS = 0.2
-KL_COEFF = 0.1  # KL 散度系数
+KL_COEFF = 0.2  # KL 散度系数
 VF_COEFF = 0.5  # Value loss 系数
 SAVE_PATH = "./saved_model"
 GAMMA = 0.99  # Discount factor (用于 GAE 或计算 returns，当前简单 reward 未直接使用)
@@ -114,10 +153,12 @@ LR_ACTOR = 1e-5
 LR_CRITIC = 1e-5
 
 global_step = 0
+context = '''I will give you a passage of English text, approximately 30 words long. Please continue writing this passage with correct English.\n\n'''
+
 
 # ==== Dataset ====
 class MyDataset(Dataset):
-    def __init__(self, tokenizer, max_prompt_len=30, num_samples=5000):
+    def __init__(self, tokenizer, max_prompt_len=30, num_samples=1000):
         self.tokenizer = tokenizer
         try:
             streamed_dataset = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
@@ -132,13 +173,14 @@ class MyDataset(Dataset):
             words = clean_text.split()
             if len(words) >= max_prompt_len:
                 prompt = " ".join(words[:max_prompt_len])
+                prompt = context+prompt
                 prompts.append(prompt)
 
         prompts = [p for p in prompts if p.strip()]
         if not prompts:
             raise ValueError("No valid prompts generated from the dataset.")
 
-        encodings = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_len)
+        encodings = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_len+len(context))
         self.input_ids = encodings["input_ids"]
         self.attention_mask = encodings["attention_mask"]
 
@@ -186,13 +228,18 @@ class CriticModel(nn.Module):
             attention_mask=attention_mask,
             **kwargs
         )
-        hidden_states = output.last_hidden_state
+        '''hidden_states = output.last_hidden_state
         if attention_mask is None:
             values = self.value_head(hidden_states[:, -1, :]).squeeze(-1)
         else:
             sequence_lengths = attention_mask.sum(dim=1) - 1
             last_token_hidden_states = hidden_states[torch.arange(hidden_states.shape[0], device=hidden_states.device), sequence_lengths]
             values = self.value_head(last_token_hidden_states).squeeze(-1)
+        return values'''
+        hidden_states = output.last_hidden_state
+        mask = attention_mask.unsqueeze(-1).float()
+        avg_hidden = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1)
+        values = self.value_head(avg_hidden).squeeze(-1)
         return values
 
 # ==== Function to get log probabilities of a sequence ====
@@ -232,7 +279,7 @@ def train():
     writer = SummaryWriter(f"logs/ppo_separate_hf_adv_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
     print("Loading dataset...")
-    dataset = MyDataset(tokenizer, max_prompt_len=20, num_samples=5000)
+    dataset = MyDataset(tokenizer, max_prompt_len=20)
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size
     train_set, _ = random_split(dataset, [train_size, val_size])
@@ -258,7 +305,8 @@ def train():
                     attention_mask=prompt_attention_mask,
                     max_new_tokens=MAX_NEW_TOKENS,
                     do_sample=True,
-                    temperature=1.0,
+                    temperature=0.7,
+                    top_k=50,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id
                 )
@@ -269,6 +317,11 @@ def train():
             old_actor.train()
             actor.train()
 
+            if global_step < 2:
+                for txt in full_texts:
+                    print(txt)
+                    print("")
+
             # --- 2. Compute Rewards ---
             rewards, alignment = compute_reward(full_texts)
 
@@ -276,10 +329,11 @@ def train():
             with torch.no_grad():
                 log_probs_old = get_sequence_log_probs(old_actor, generated_ids, generated_attention_mask)
                 values = critic(input_ids=generated_ids, attention_mask=generated_attention_mask)
+                values = torch.clamp(values, -1.0, 1.0)
 
             # --- 4. Compute Advantages ---
             advantages = rewards - values
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             # --- 5. PPO Optimization Phase ---
             log_probs_new = get_sequence_log_probs(actor, generated_ids, generated_attention_mask)
@@ -318,6 +372,7 @@ def train():
                 writer.add_scalar("steps/loss_value", value_loss.item(), global_step)
                 writer.add_scalar("steps/loss_actor_total", actor_loss.item(), global_step)
                 writer.add_scalar("steps/loss_critic_total", critic_loss_total.item(), global_step)
+                writer.add_scalar("steps/critic_values", values.mean().item(), global_step)
                 writer.add_scalar("steps/kl_div", kl_div.item(), global_step)
                 writer.add_scalar("steps/alignment", alignment, global_step)
                 writer.add_scalar("steps/advantages_mean", advantages.mean().item(), global_step)
@@ -329,13 +384,14 @@ def train():
         os.makedirs(epoch_save_path_actor, exist_ok=True)
         os.makedirs(epoch_save_path_critic, exist_ok=True)
 
-        print(f"Saving models for epoch {epoch+1}...")
-        actor.transformer.save_pretrained(epoch_save_path_actor)
-        critic.transformer.save_pretrained(os.path.join(epoch_save_path_critic, "transformer"))
-        torch.save(critic.value_head.state_dict(), os.path.join(epoch_save_path_critic, "value_head.pth"))
-        tokenizer.save_pretrained(epoch_save_path_actor)
-        tokenizer.save_pretrained(epoch_save_path_critic)
-        print("Models saved.")
+        if (epoch+1) % 5 == 0:
+            print(f"Saving models for epoch {epoch+1}...")
+            actor.transformer.save_pretrained(epoch_save_path_actor)
+            critic.transformer.save_pretrained(os.path.join(epoch_save_path_critic, "transformer"))
+            torch.save(critic.value_head.state_dict(), os.path.join(epoch_save_path_critic, "value_head.pth"))
+            tokenizer.save_pretrained(epoch_save_path_actor)
+            tokenizer.save_pretrained(epoch_save_path_critic)
+            print("Models saved.")
 
     writer.close()
     print("Training finished.")
