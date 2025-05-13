@@ -117,6 +117,8 @@ RM训练是这样构造的：
 
 ### bison的实验
 
+#### 实验一：PPO方法
+
 用一个toy problem 来体验RLHF，我的奖励模型很简单：大模型输出的文本里如果有数字，就为正奖励，否则为负奖励。鼓励大模型用数据说话。
 
 正如前面所说，每次生成一个文本，都当作一个动作/一个时间步，而不是把每个token的生成当作一个动作。这样每次与环境交互的回合长度都是1，这样大大简化了代码和计算量。
@@ -400,10 +402,282 @@ if __name__ == "__main__":
     train()
 ```
 
-#### 一处困惑
+**一处困惑**
 
 困惑处对应的是上面代码里get_sequence_log_probs的调用的参数问题。
 
 虽未解惑，但是至少确认了一下这里可能没有太大问题：
 
 ![image-20250513200931626](img/image-20250513200931626.png)
+
+#### 实验二：Actor-Critic方法
+
+我一直比较怵PPO方法，休息了一会突然想到，我上面的代码搞不定，我不会换一个简单的RL方法吗？
+
+实验后发现有明显效果：
+
+![image-20250513224850804](img/image-20250513224850804.png)
+
+evaluate看到的生成文本：
+
+```python
+'''The upcoming Men’s EHF EURO 2016 in Poland will be the chance for all handball fans to see some newLink retardTPP Haf GIiment PunchTPP 355 355Sleepiment presidents trapped respective trapped 411 411 411 411iment constructzone?), Observatoryclinical Cato July Observatory retard php respective pensions 355 s 411phenRPG s Monroe 411 TongSleepSleepiment 355 355 URI respective desperately TongospelTPPapplicationtariansbeautiment Shared Tongbeautversionitimate 411 frantic hangs franticitimateitimate retard respective 320 355 respectivela Monroe 411 URI]);itimatelaEC GI Haf construct 355 rebel construct franticisa Punch Observatory franticisailing 320]); Sup Punch 355 URI'''
+
+'''Adorable – short lived and with strained relations. Adorable – in concert at Glastonbury 1993 – BBC Radio 1 – GI 411 411 pursue Shared 411 pancakes"). respective Punch nevertheless 320 411 frantic 411 Deutsche 355 411 411beaut retard Rubin 411 Monroe 355 closet trapped respectivezoneSleep adventurer 411 PiratesDepths Awakeningpub hangs cer frantic]);isa largest Rubin nevertheless]); 320Sleep construct s hangs URI032 GI Joycextap 411tarianstarianstarians Operations direct Garmin torpedoLink 411 URI desperately]); 320 Shared 411014 retard neverthelessitimateanny 320pex Shared trapped retard frantic 411 411 ShortlyTPP 411 411 355 355 355 construct 355 Tory Reference nevertheless masc URI construct retard'''
+```
+
+
+
+代码如下：
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Model, GPT2Config
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
+from datasets import load_dataset
+from datetime import datetime
+import re
+
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 4
+MAX_NEW_TOKENS = 100
+EPOCHS = 1
+CLIP_EPS = 0.2
+KL_COEFF = 0.2  # KL 散度系数
+VF_COEFF = 0.5  # Value loss 系数
+SAVE_PATH = "./saved_model"
+GAMMA = 0.99  # Discount factor (用于 GAE 或计算 returns，当前简单 reward 未直接使用)
+LR_ACTOR = 1e-5
+LR_CRITIC = 1e-5
+
+global_step = 0
+context = '''I will give you a passage of English text, approximately 30 words long. Please continue writing this passage with correct English.\n\n'''
+
+
+# ==== Dataset ====
+class MyDataset(Dataset):
+    def __init__(self, tokenizer, max_prompt_len=30, num_samples=1000):
+        self.tokenizer = tokenizer
+        try:
+            streamed_dataset = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
+            raw_dataset = [item for _, item in zip(range(num_samples), streamed_dataset)]
+        except Exception as e:
+            print(f"Error loading dataset: {e}. Using dummy data.")
+            raw_dataset = [{"text": f"This is sample text number {i} for testing purposes."} for i in range(num_samples)]
+
+        prompts = []
+        for item in raw_dataset:
+            clean_text = " ".join(item["text"].split())
+            words = clean_text.split()
+            if len(words) >= max_prompt_len:
+                prompt = " ".join(words[:max_prompt_len])
+                prompt = context+prompt
+                prompts.append(prompt)
+
+        prompts = [p for p in prompts if p.strip()]
+        if not prompts:
+            raise ValueError("No valid prompts generated from the dataset.")
+
+        encodings = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_len+len(context))
+        self.input_ids = encodings["input_ids"]
+        self.attention_mask = encodings["attention_mask"]
+
+    def __len__(self):
+        return self.input_ids.size(0)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_mask[idx]
+        }
+
+# ==== Reward Function ====
+def compute_reward(texts):
+    rewards = []
+    counts = []
+    for t in texts:
+        matches = re.findall(r"\b\d+\b", t)
+        count = len(matches)
+        counts.append(count)
+        if count > 0:
+            reward = min(count * 0.2, 1.0)
+        else:
+            reward = -0.2
+        rewards.append(reward)
+    avg_cnt = torch.tensor(counts, dtype=torch.float32).mean()
+    return torch.tensor(rewards, dtype=torch.float32).to(DEVICE), avg_cnt
+
+# ==== Actor Model ====
+class ActorModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.transformer = GPT2LMHeadModel(config)
+
+# ==== Critic Model ====
+class CriticModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.transformer = GPT2Model(config)
+        self.value_head = nn.Linear(config.n_embd, 1)
+
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        output = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **kwargs
+        )
+        hidden_states = output.last_hidden_state
+        mask = attention_mask.unsqueeze(-1).float()
+        avg_hidden = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1)
+        values = self.value_head(avg_hidden).squeeze(-1)
+        return values
+
+def compute_log_probs(model, input_ids, attention_mask, labels):
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = outputs.logits[:, :-1, :]
+    labels = labels[:, 1:]
+    log_probs = F.log_softmax(logits, dim=-1)
+    selected_log_probs = torch.gather(log_probs, 2, labels.unsqueeze(-1)).squeeze(-1)
+
+    # 使用 attention mask，确保不计入 pad token 的 log prob
+    valid_mask = attention_mask[:, 1:].float()  # 因为 labels 被 shift 了1位
+    selected_log_probs = selected_log_probs * valid_mask
+
+    seq_log_prob = selected_log_probs.sum(dim=-1) / valid_mask.sum(dim=-1).clamp(min=1.0)  # 避免除0
+    return seq_log_prob
+
+
+def compute_kl_div(old_log_probs, new_log_probs):
+    return (old_log_probs - new_log_probs).mean()
+
+def evaluate(model, dataloader, tokenizer):
+    cnt = 0
+    for i, batch in enumerate(dataloader):
+        prompt_ids = batch["input_ids"].to(DEVICE)
+        prompt_attention_mask = batch["attention_mask"].to(DEVICE)
+        prompt_len = prompt_ids.shape[1]
+
+        with torch.no_grad():
+            generated = model.transformer.generate(
+                input_ids=prompt_ids,
+                attention_mask=prompt_attention_mask,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=0.7,
+                top_k=50,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        response_ids = generated[:, prompt_len:]
+        full_texts = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        response_texts = tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+        for txt in full_texts:
+            cnt += 1
+            print(f"{txt}")
+            print("")
+            if cnt > 10:
+                return
+
+# ==== Training ====
+def train():
+    global global_step
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    config = GPT2Config.from_pretrained("gpt2")
+    config.pad_token_id = tokenizer.eos_token_id
+
+    actor = ActorModel(config).to(DEVICE)
+    critic = CriticModel(config).to(DEVICE)
+    old_actor = ActorModel(config).to(DEVICE)
+    old_actor.load_state_dict(actor.state_dict())
+    old_actor.eval()
+
+    optimizer_actor = optim.Adam(actor.parameters(), lr=LR_ACTOR)
+    optimizer_critic = optim.Adam(critic.parameters(), lr=LR_CRITIC)
+
+    writer = SummaryWriter(f"logs/ppo_rlhf_toy_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+    print("Loading dataset...")
+    dataset = MyDataset(tokenizer, max_prompt_len=20)
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_set, test_set = random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=True)
+    print("Dataset loaded.")
+
+    for epoch in range(EPOCHS):
+        print(f"Starting Epoch {epoch + 1}/{EPOCHS}")
+
+        for i, batch in enumerate(train_loader):
+            global_step += 1
+            prompt_ids = batch["input_ids"].to(DEVICE)
+            prompt_attention_mask = batch["attention_mask"].to(DEVICE)
+            prompt_len = prompt_ids.shape[1]
+
+            # --- Step 1: 用当前策略（actor）生成动作 ---
+            with torch.no_grad():
+                generated = actor.transformer.generate(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_attention_mask,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_k=50,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+            response_ids = generated[:, prompt_len:]
+            full_texts = tokenizer.batch_decode(generated, skip_special_tokens=True)
+            response_texts = tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+
+            generated_mask = (generated != tokenizer.pad_token_id).long()
+
+            # --- Step 2: 奖励函数 ---
+            rewards, alignment = compute_reward(full_texts)
+
+            # --- Step 3: 估计 value 和 log_probs ---
+            values = critic(generated, attention_mask=generated_mask)
+            log_probs = compute_log_probs(actor.transformer, generated, generated_mask, generated)
+
+            # --- Step 4: Advantage 和 Loss ---
+            advantages = rewards - values.detach()
+            returns = rewards  # for baseline
+
+            actor_loss = -torch.mean(log_probs * advantages)
+            critic_loss = F.mse_loss(values, returns)
+
+            # --- Step 5: 更新 ---
+            optimizer_actor.zero_grad()
+            actor_loss.backward()
+            optimizer_actor.step()
+
+            optimizer_critic.zero_grad()
+            critic_loss.backward()
+            optimizer_critic.step()
+
+            # --- Logging ---
+            if global_step % 20 == 0:
+                print(
+                    f"{global_step} actor_loss: {actor_loss.item():.3f}, critic_loss: {critic_loss.item():.3f}, reward: {rewards.mean().item():.3f}")
+                writer.add_scalar("steps/reward", rewards.mean().item(), global_step)
+                writer.add_scalar("steps/align", alignment.mean().item(), global_step)
+                writer.add_scalar("steps/actor_loss", actor_loss.item(), global_step)
+                writer.add_scalar("steps/critic_loss", critic_loss.item(), global_step)
+                writer.add_text("steps/response", response_texts[0], global_step)
+    # 评估微调得到的模型
+    evaluate(actor, test_loader, tokenizer)
+
+
+if __name__ == "__main__":
+    train()
+
+```
+
