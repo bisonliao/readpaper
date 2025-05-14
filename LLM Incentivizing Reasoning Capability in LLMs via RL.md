@@ -46,3 +46,58 @@ AI：DeepSeek-V3-Base 是预训练阶段的基础模型，而 DeepSeek-V3 是在
 
 
 ### Approach
+
+想想都觉得神奇，怎么设计reward model，才能对数学推理这样的文本问题做出准确性判断呢，LLM又怎么能学到各式各样的数学推理能力呢。可以说RL让计算机真的自我进化起来了。
+
+论文好几次这样说：
+
+```
+This behavior is not only a testament to the model’s growing reasoning abilities but also a captivating example of how reinforcement learning can lead to unexpected and sophisticated outcomes.
+
+This is also an aha moment for us,allowing us to witness the power and beauty of reinforcement learning.
+```
+
+LLM似乎具备反思/顿悟的能力，例如当LLM面对下面这个没有实数解的方程：
+
+![image-20250514200918442](img/image-20250514200918442.png)
+
+DeepSeek-R1-Zero只使用RL（GRPO算法优化掉value函数）不使用SFT，后者需要大量的样本标注工作。训练中使用基于规则的奖励函数，包括“准确性奖励”和“格式奖励”。模型逐步学会延长思考过程、进行自我反思，甚至出现“aha moment”（自发性的再思考行为）。
+
+为解决DeepSeek-R1-Zero可读性差/多语言混杂的问题，在RL前引入少量冷启动数据，提升模型初始状态并提升可读性。训练流程包括：冷启动微调、推理导向的RL训练、拒绝采样与SFT扩展多任务能力、再进行覆盖所有场景的RL训练，最终获得兼具强推理能力与通用性、可读性的DeepSeek-R1。
+
+![image-20250514203339301](img/image-20250514203339301.png)
+
+最后将DeepSeek-R1的推理能力迁移至小模型（如Qwen与LLaMA），通过SFT方式训练，证明即使不使用RL，小模型也能通过蒸馏获得强大的推理性能。
+
+### Expertiments
+
+![image-20250514204456451](img/image-20250514204456451.png)
+
+
+
+![image-20250514204602161](img/image-20250514204602161.png)
+
+论文中的表格5，不太容易得出结论，下面是AI帮忙提炼的解读，有三个重要的观点：
+
+![image-20250514205316495](img/image-20250514205316495.png)
+
+有两个重要的结论：
+
+1. 将强大的大模型蒸馏出小的模型会产生极好的结果，而使用前面提到的RL微调方法来训练小的模型需要巨大的计算能力，甚至可能无法达到蒸馏出的小模型的性能。
+2. 虽然蒸馏策略既经济又有效，但超越智能边界可能仍然需要更强大的基础模型和更大规模的强化学习。
+
+### Discussion
+
+重点列一下作者提到的两个失败的尝试：
+
+1. 尝试过程奖励模型（Process Reward Model, PRM，）。PRM 的初衷是**奖励模型在推理过程中的每一步表现**，而不仅仅是最后答案是否正确。比如模型写一个数学证明，PRM希望在每个中间步骤判断对不对，鼓励“正确的思考路径”。遇到的问题是不好定义每一步的粒度、不好标注用来训练PRM的数据、还容易被actor欺骗。
+2. 尝试参考AlphaGo使用MCTS，系统性地探索生成空间，**将推理过程拆成步骤、逐步搜索最优路径**。希望这样能提升模型推理深度和可靠性。遇到的问题是搜索空间过大又不好剪枝、value函数不好训练（难以定义语言生成的每一步的价值）
+
+### Conclusion, Limitations, and Future Work
+
+主要有这些展望：
+
+1. 通用能力：提高DeepSeek-R1的通用能力，目前这些方面还不如V3
+2. 语言混用：DeepSeek-R1 目前主要支持中英文，在多语言任务中会出现“语言混用”的问题。未来还支持更多的语言。
+3. 提示词工程：DeepSeek-R1对提示语敏感，例如对few-shot（prompt里只有很少的输入输出样例）反而性能不好。所以我们建议用户使用zero-shot方式，直接告诉模型你所要求的输出格式
+4. 软件工程任务：软件工程任务的处理方面DeepSeek-R1还有些欠缺，没有很广泛的使用RL对他进行微调。
