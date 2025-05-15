@@ -145,7 +145,7 @@ import os
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 4
 MAX_NEW_TOKENS = 100
-EPOCHS = 100
+EPOCHS = 3
 CLIP_EPS = 0.2
 KL_COEFF = 0.2  # KL 散度系数
 VF_COEFF = 0.5  # Value loss 系数
