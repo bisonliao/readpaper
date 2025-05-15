@@ -230,14 +230,7 @@ class CriticModel(nn.Module):
             attention_mask=attention_mask,
             **kwargs
         )
-        '''hidden_states = output.last_hidden_state
-        if attention_mask is None:
-            values = self.value_head(hidden_states[:, -1, :]).squeeze(-1)
-        else:
-            sequence_lengths = attention_mask.sum(dim=1) - 1
-            last_token_hidden_states = hidden_states[torch.arange(hidden_states.shape[0], device=hidden_states.device), sequence_lengths]
-            values = self.value_head(last_token_hidden_states).squeeze(-1)
-        return values'''
+
         hidden_states = output.last_hidden_state
         mask = attention_mask.unsqueeze(-1).float()
         avg_hidden = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1)
