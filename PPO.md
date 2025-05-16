@@ -47,6 +47,8 @@ Initialize value_function with parameters φ
 for iteration in range(max_iterations):
     
     # 1. 收集数据，使用 old_policy（即 θ_old = θ）
+    # 本质上还是用当前策略与环境交互来收集数据，因为每个回合开始前，都会更新old_policy
+    # 所以有的代码这里写的是当前策略与环境交互，是没有问题的。
     θ_old ← θ
     old_policy ← copy of trained_policy with frozen θ_old
     
@@ -64,7 +66,8 @@ for iteration in range(max_iterations):
             R_t = A_t + V_φ(s_t)    # TD目标
     
     # 3. 用 fixed old_policy 和 current trained_policy 训练
-    for epoch in range(K_epochs):           # 多次遍历数据
+    # old_policy在这里主要作用就是用来计算KL散度和重要性采样的比率
+    for epoch in range(K_epochs):           # 多次遍历数据，但次数不能太多
         for minibatch in trajectories:
             
             # 当前策略的概率
