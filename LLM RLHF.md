@@ -237,20 +237,51 @@ class CriticModel(nn.Module):
         values = self.value_head(avg_hidden).squeeze(-1)
         return values
 
-# ==== Function to get log probabilities of a sequence ====
 def get_sequence_log_probs(model, input_ids, attention_mask):
+    """
+    给定一批由 actor (GPT2LMHeadModel) 生成的 token 序列，计算它们的整体 log 概率。
+
+    参数:
+        model: GPT2LMHeadModel 类型，语言模型 actor
+        input_ids: Tensor，形状为 [batch_size, seq_len]，actor 生成的 token 序列
+        attention_mask: Tensor，形状为 [batch_size, seq_len]，用 1 表示有效 token，0 表示 padding
+
+    返回:
+        一个大小为 [batch_size] 的 tensor，表示每个序列的 log p(sequence)
+    """
+
+    # 模型前向传播，输出 logits：[batch_size, seq_len, vocab_size]
     outputs = model.transformer(input_ids=input_ids, attention_mask=attention_mask)
     logits = outputs.logits
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-    action_ids = input_ids[:, 1:].unsqueeze(-1)
-    gathered_log_probs = log_probs.gather(dim=-1, index=action_ids).squeeze(-1)
 
-    if attention_mask is not None:
-        mask = attention_mask[:, 1:].float()
-        gathered_log_probs = gathered_log_probs * mask
+    # GPT2 是自回归模型，t 时刻的输出 logits 是用来预测 t+1 的 token
+    # 所以我们要把输入和输出都往左“对齐”：忽略最后一个 token 的 logits 和第一个 token 的 label
 
-    sequence_log_probs = gathered_log_probs.sum(dim=1)
-    return sequence_log_probs
+    shift_logits = logits[:, :-1, :]         # 删除最后一个位置 -> 用于预测位置 1 ~ T-1 的 token。模型的实际输出
+    shift_labels = input_ids[:, 1:]          # 删除第一个 token -> 是 shift_logits 该预测的目标。模型的期望输出（标注）
+    shift_mask = attention_mask[:, 1:]       # 同样移动 mask，只看非 padding 的部分
+
+    # 对 logits 做 softmax 得到概率分布，然后取对数（log softmax 更稳定）
+    # 得到每个位置上，对整个词表的 log 概率分布
+    log_probs = F.log_softmax(shift_logits, dim=-1)  # shape: [batch_size, seq_len-1, vocab_size]
+
+    # 为了获取每个 token 被采样时的 log 概率，我们用 gather 取出它对应的 log prob
+    # shift_labels 是每个位置实际出现的 token 的 id，shape: [B, T-1]
+    # 我们要从 log_probs 中按这个 id 把对应的 log p(token) 提取出来
+    # gather 的 index 维度要对齐，所以需要先扩展一个维度： [B, T-1] -> [B, T-1, 1]
+    shift_labels = shift_labels.unsqueeze(-1)
+
+    # 现在从 log_probs 中取出每个位置上，预测正确 token 的 log 概率
+    token_log_probs = torch.gather(log_probs, dim=-1, index=shift_labels)  # shape: [B, T-1, 1]
+    token_log_probs = token_log_probs.squeeze(-1)  # 去掉最后一维 -> [B, T-1]
+
+    # 只保留非 padding 的部分：token_log_probs * mask
+    token_log_probs = token_log_probs * shift_mask  # shape: [B, T-1]
+
+    # 对每个序列，把所有 token 的 log 概率加起来：log p(seq) = sum(log p(token_i))
+    seq_log_probs = token_log_probs.sum(dim=-1)  # shape: [B]
+
+    return seq_log_probs
 
 # ==== Training ====
 def train():
