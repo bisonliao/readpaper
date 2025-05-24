@@ -461,8 +461,11 @@ if __name__ == "__main__":
    3. reward：对环境施加action后，获得的奖励
    4. value：t 时刻的观测 obs 对应的价值评估
    5. done：t 时刻的obs是不是一个终止状态。这个字段很容易出问题，step函数返回的done，已经是 t+1 时刻的done了。
-3. 计算GAE，最后一个时间步（SARVD信息）依赖的下一个时间步的done和value信息不在buffer里，要额外计算一下放进去。（next_value, next_done）
-4. 并发多个环境收集的时间步，一开始保持n_envs这个维度作为批量进行GAE计算、划分minibatch，然后在更新模型参数的时候，把n_envs和n_steps两个维度打平成一个维度了。
+3. 固定收集的n_steps个时间步，保存在数组里，相同下标的不同元素有对应关系：
+   1. 如果是只有一个单发环境，就保存在二维数组里，维度分别是steps, field_name。
+   2. 如果是多个并发环境，就保存在三维数组里。维度分别是 env, steps,  field_name。
+4. 计算GAE，最后一个时间步（SARVD信息）依赖的下一个时间步的done和value信息不在buffer里，要额外计算一下放进去。（next_value, next_done）
+5. 并发多个环境收集的时间步，一开始保持n_envs这个维度作为批量进行GAE计算、划分minibatch，然后在更新模型参数的时候，把n_envs和n_steps两个维度打平成一个维度了。
 
 
 
