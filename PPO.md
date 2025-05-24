@@ -106,6 +106,8 @@ PPO相比传统Actor-Critic方法的优势：
 
 ### show me the code
 
+#### 离散动作空间
+
 我自己写的PPO代码有很多细节不到位，直接贴CleanRL的代码吧：
 
 ```python
@@ -486,3 +488,192 @@ if __name__ == "__main__":
 
 
 ![image-20250524142941139](img/image-20250524142941139.png)
+
+#### 连续动作空间
+
+能够很好的收敛
+
+![image-20250524162218274](img\image-20250524162218274.png)
+
+```python
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torch.distributions import Normal, Independent
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime as dt
+import pygame
+
+# 设置随机种子
+torch.manual_seed(42)
+np.random.seed(42)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+writer = SummaryWriter(log_dir=f"logs/Pendulum_PPO_{dt.now().strftime('%y%m%d_%H%M%S')}")
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU()
+        )
+        self.mean = nn.Linear(hidden_dim // 2, 1)
+        self.log_std = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        x = x / torch.tensor([1.0, 1.0, 8.0], device=x.device)  # normalize
+        x = self.net(x)
+        mean = self.mean(x)
+        std = self.log_std.exp().expand_as(mean)
+        return mean, std
+
+
+class ValueNetwork(nn.Module):
+    def __init__(self, state_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    values = values + [0.0]  # bootstrap
+    gae, returns = 0, []
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * values[t+1] * (1 - dones[t]) - values[t]
+        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        returns.insert(0, gae + values[t])
+    return torch.tensor(returns, device=device)
+
+def show(filename):
+
+    env = gym.make("Pendulum-v1", render_mode='human')
+    state_dim = env.observation_space.shape[0]
+    policy = PolicyNetwork(state_dim).to(device)
+    policy = torch.load(filename, weights_only=False)
+    state, _ = env.reset()
+    for i in range(2000):
+        state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
+        with torch.no_grad():
+            mean, std = policy(state_tensor.unsqueeze(0))
+        '''dist = Independent(Normal(mean, std), 1)
+        action_raw = dist.rsample()'''
+        action_raw = mean
+        action = torch.tanh(action_raw) * 2.0
+        action_np = action.squeeze(0).cpu().numpy()
+        next_state, reward, terminated, truncated, _ = env.step(action_np)
+        state = next_state
+        env.render()
+
+
+def train():
+    env = gym.make("Pendulum-v1")
+    state_dim = env.observation_space.shape[0]
+
+    policy = PolicyNetwork(state_dim).to(device)
+    value_fn = ValueNetwork(state_dim).to(device)
+    optim_policy = optim.Adam(policy.parameters(), lr=3e-4)
+    optim_value = optim.Adam(value_fn.parameters(), lr=1e-3)
+
+    step_count = 0
+
+    while step_count < 600_000:
+        states, actions, rewards, dones, log_probs, values = [], [], [], [], [], []
+        state, _ = env.reset()
+
+        while len(states) < 2048:
+            state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                mean, std = policy(state_tensor.unsqueeze(0))
+            dist = Independent(Normal(mean, std), 1)
+            action_raw = dist.rsample()
+            action = torch.tanh(action_raw) * 2.0
+            log_prob = dist.log_prob(action_raw)
+
+            value = value_fn(state_tensor.unsqueeze(0)).item()
+
+            action_np = action.cpu().numpy().astype(np.float32) # action.cpu().numpy()[0]
+
+            next_state, reward, terminated, truncated, _ = env.step(action_np[0])
+            reward = torch.tensor(reward, dtype=torch.float32)
+            done = terminated or truncated
+
+            states.append(state_tensor)
+            actions.append(action_raw.squeeze(0))
+            rewards.append(reward)
+            dones.append(done)
+            log_probs.append(log_prob.squeeze(0))
+            values.append(value)
+
+            state = next_state
+            step_count += 1
+            if done:
+                state, _ = env.reset()
+
+        with torch.no_grad():
+            next_value = value_fn(torch.tensor(state, dtype=torch.float32).to(device).unsqueeze(0)).item()
+        values.append(next_value)
+        returns = compute_gae(rewards, values, dones)
+        values = torch.tensor(values[:-1], device=device)
+        advantages = returns - values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 转换为张量
+        states = torch.stack(states)
+        actions = torch.stack(actions)
+        log_probs_old = torch.stack(log_probs)
+
+        for _ in range(10):  # PPO更新迭代次数
+            mean, std = policy(states)
+            dist = Independent(Normal(mean, std), 1)
+            log_probs_new = dist.log_prob(actions)
+            entropy = dist.entropy().mean()
+
+            ratio = torch.exp(log_probs_new - log_probs_old)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean() - 0.001 * entropy
+
+            value_preds = value_fn(states)
+            value_loss = nn.functional.mse_loss(value_preds, returns)
+
+            optim_policy.zero_grad()
+            policy_loss.backward()
+            optim_policy.step()
+
+            optim_value.zero_grad()
+            value_loss.backward()
+            optim_value.step()
+
+        writer.add_scalar("loss/policy", policy_loss.item(), step_count)
+        writer.add_scalar("loss/value", value_loss.item(), step_count)
+        writer.add_scalar("stats/returns", sum(rewards), step_count)
+        writer.flush()
+
+        print(f"Step: {step_count}, Return: {sum(rewards):.2f}, Policy Loss: {policy_loss.item():.3f}")
+
+    env.close()
+    torch.save(policy, "./checkpoints/Pendulum_RPO.pth")
+
+
+
+if __name__ == "__main__":
+    train()
+    show("./checkpoints/Pendulum_RPO.pth")
+
+```
+
