@@ -77,9 +77,13 @@ RAD（**Reinforcement Learning with Augmented Data**）和 DrAC（**Data-regular
 
 ### bison的实验
 
+#### pendulum
+
 下面的PPO和RPO都能够很好的收敛。由于pendulum任务比较简单，也没有体现RPO的明显优势：
 
 ![image-20250524171509348](img/image-20250524171509348.png)
+
+2048次交互的returns为-1500左右的时候，agent已经表现很好了，钟摆屹立不倒。所以论文里说的RPO比PPO在pendulum上表现好很多不知道是怎么做的。
 
 代码如下：
 
@@ -271,6 +275,226 @@ def train():
 if __name__ == "__main__":
     train()
     show("./checkpoints/Pendulum_RPO.pth")
+
+```
+
+#### BipedalWalker
+
+这个任务确实就很好的展示了RPO相对PPO的优势。虽然前半段PPO表现比RPO好，但是RPO后来居然。实际动画显示RPO训练的两足机器人行走也很稳。
+
+![image-20250524231102868](img/image-20250524231102868.png)
+
+代码如下：
+
+
+```python
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torch.distributions import Normal, Independent
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime as dt
+import pygame
+
+# 设置随机种子
+torch.manual_seed(42)
+np.random.seed(42)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+writer = SummaryWriter(log_dir=f"logs/BipedalWalker_PPO_{dt.now().strftime('%y%m%d_%H%M%S')}")
+
+alpha = 1.0
+
+def perturb_mean(mean):
+    noise = torch.rand_like(mean)*2-1.0
+    noise = (noise * alpha).to(device)
+    return mean+noise
+
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU()
+        )
+        # 动作空间是 4个连续的浮点数，各代表一个关节，所以mean / std都要输出4个
+        self.mean = nn.Linear(hidden_dim // 2, 4)
+        self.log_std = nn.Linear(hidden_dim // 2, 4)
+
+    def forward(self, x):
+        x = x / torch.tensor([[3.14, 5., 5., 5., 3.14, 5., 3.14, 5., 5., 3.14, 5., 3.14, 5., 5., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1. ]], device=x.device)  # normalize
+        x = self.net(x)
+        mean = self.mean(x)
+        std = self.log_std(x).exp() # type:torch.Tensor
+        return mean, std
+
+
+class ValueNetwork(nn.Module):
+    def __init__(self, state_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, x):
+        x = x / torch.tensor([[3.14, 5., 5., 5., 3.14, 5., 3.14, 5., 5., 3.14, 5., 3.14, 5., 5., 1., 1., 1., 1., 1., 1.,
+                               1., 1., 1., 1.]], device=x.device)  # normalize
+        return self.net(x).squeeze(-1)
+
+
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    values = values + [0.0]  # bootstrap
+    gae, returns = 0, []
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * values[t+1] * (1 - dones[t]) - values[t]
+        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        returns.insert(0, gae + values[t])
+    return torch.tensor(returns, device=device)
+
+def show(filename):
+
+    env = gym.make("BipedalWalker-v3", render_mode='human')
+    #state_dim = env.observation_space.shape[0]
+    #policy = PolicyNetwork(state_dim).to(device)
+    policy = torch.load(filename, weights_only=False).to(device)
+    policy.eval()
+    state, _ = env.reset()
+    for i in range(2000):
+        state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
+        with torch.no_grad():
+            mean, std = policy(state_tensor.unsqueeze(0))
+        #mean = perturb_mean(mean)
+
+        dist = Independent(Normal(mean, std), 1)
+        action_raw = dist.rsample()
+        #action_raw = mean
+        action = torch.tanh(action_raw)
+        action_np = action.squeeze(0).cpu().numpy()
+        next_state, reward, terminated, truncated, _ = env.step(action_np)
+        env.render()
+        if terminated or truncated:
+            break
+        state = next_state
+    policy.train()
+
+
+def train():
+    env = gym.make("BipedalWalker-v3")
+    state_dim = env.observation_space.shape[0]
+
+    policy = PolicyNetwork(state_dim).to(device)
+    value_fn = ValueNetwork(state_dim).to(device)
+    optim_policy = optim.Adam(policy.parameters(), lr=3e-4)
+    optim_value = optim.Adam(value_fn.parameters(), lr=1e-3)
+
+    step_count = 0
+    ep_len = 0
+    ep_rew = 0
+
+    while step_count < 4_000_000:
+        states, actions, rewards, dones, log_probs, values = [], [], [], [], [], []
+        state, _ = env.reset()
+
+        while len(states) < 2048:
+            state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                mean, std = policy(state_tensor.unsqueeze(0))
+            mean = perturb_mean(mean)
+
+            dist = Independent(Normal(mean, std), 1)
+            action_raw = dist.rsample()
+            action = torch.tanh(action_raw)
+            # log_prob.shape == (1,) 是因为 Independent(Normal(...), 1) 把动作视为一个多维事件，并对每个维度的 log_prob 做了求和。
+            log_prob = dist.log_prob(action_raw)
+
+            value = value_fn(state_tensor.unsqueeze(0)).item()
+
+            action_np = action.cpu().numpy().astype(np.float32) # action.cpu().numpy()[0]
+
+            next_state, reward, terminated, truncated, _ = env.step(action_np[0])
+            ep_rew += reward
+            reward = torch.tensor(reward, dtype=torch.float32)
+            done = terminated or truncated
+
+            states.append(state_tensor)
+            actions.append(action_raw.squeeze(0))
+            rewards.append(reward)
+            dones.append(done)
+            log_probs.append(log_prob.squeeze(0))
+            values.append(value)
+
+            state = next_state
+            step_count += 1
+            ep_len += 1
+            if done:
+                state, _ = env.reset()
+                writer.add_scalar("stats/ep_len", ep_len, step_count)
+                writer.add_scalar("stats/ep_rew", ep_rew, step_count)
+                ep_len = 0
+                ep_rew = 0
+
+        with torch.no_grad():
+            next_value = value_fn(torch.tensor(state, dtype=torch.float32).to(device).unsqueeze(0)).item()
+        values.append(next_value)
+        returns = compute_gae(rewards, values, dones)
+        values = torch.tensor(values[:-1], device=device)
+        advantages = returns - values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 转换为张量
+        states = torch.stack(states)
+        actions = torch.stack(actions)
+        log_probs_old = torch.stack(log_probs)
+
+        for _ in range(10):  # PPO更新迭代次数
+            mean, std = policy(states)
+            mean = perturb_mean(mean)
+            dist = Independent(Normal(mean, std), 1)
+            log_probs_new = dist.log_prob(actions)
+            entropy = dist.entropy().mean()
+
+            ratio = torch.exp(log_probs_new - log_probs_old)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean() - 0.001 * entropy
+
+            value_preds = value_fn(states)
+            value_loss = nn.functional.mse_loss(value_preds, returns)
+
+            optim_policy.zero_grad()
+            policy_loss.backward()
+            optim_policy.step()
+
+            optim_value.zero_grad()
+            value_loss.backward()
+            optim_value.step()
+
+        writer.add_scalar("loss/policy", policy_loss.item(), step_count)
+        writer.add_scalar("loss/value", value_loss.item(), step_count)
+        writer.add_scalar("stats/returns", sum(rewards), step_count)
+        writer.flush()
+
+        print(f"Step: {step_count}, Return: {sum(rewards):.2f}, Policy Loss: {policy_loss.item():.3f}")
+
+    env.close()
+    torch.save(policy, "./checkpoints/BipedalWalker_RPO.pth")
+
+
+
+if __name__ == "__main__":
+    train()
+    show("./checkpoints/BipedalWalker_RPO.pth")
 
 ```
 
