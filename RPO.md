@@ -282,7 +282,9 @@ if __name__ == "__main__":
 
 ![image-20250524231102868](img/image-20250524231102868.png)
 
-上面的图片和下面的代码不完全一致。图片对应的代码，没有对样本做随机打散，所需的训练步数要少些。打散后步数要600万步才能达到240分的回合reward。而且“每次开始收集轨迹是否env.reset()”对所需步数有一定影响
+上面的图片和下面的代码不完全一致。图片对应的代码，没有对样本做随机打散。
+
+打散后要做minibatch，要不训练效果会很差。
 
 env.reset()是一个开销比较大的操作，如果每次开始收集轨迹前都做，训练时间会double。
 
@@ -305,7 +307,8 @@ import pygame
 torch.manual_seed(42)
 np.random.seed(42)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cpu"
 writer = SummaryWriter(log_dir=f"logs/BipedalWalker_PPO_{dt.now().strftime('%y%m%d_%H%M%S')}")
 
 alpha = 1.0
@@ -371,23 +374,27 @@ def show(filename):
     #policy = PolicyNetwork(state_dim).to(device)
     policy = torch.load(filename, weights_only=False).to(device)
     policy.eval()
-    state, _ = env.reset()
-    for i in range(2000):
-        state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
-        with torch.no_grad():
-            mean, std = policy(state_tensor.unsqueeze(0))
-        #mean = perturb_mean(mean)
+    for _ in range(5):
+        state, _ = env.reset()
+        total_reward = 0
+        for i in range(2000):
+            state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                mean, std = policy(state_tensor.unsqueeze(0))
+            #mean = perturb_mean(mean)
 
-        dist = Independent(Normal(mean, std), 1)
-        action_raw = dist.rsample()
-        #action_raw = mean
-        action = torch.tanh(action_raw)
-        action_np = action.squeeze(0).cpu().numpy()
-        next_state, reward, terminated, truncated, _ = env.step(action_np)
-        env.render()
-        if terminated or truncated:
-            break
-        state = next_state
+            dist = Independent(Normal(mean, std), 1)
+            action_raw = dist.rsample()
+            #action_raw = mean
+            action = torch.tanh(action_raw)
+            action_np = action.squeeze(0).cpu().numpy()
+            next_state, reward, terminated, truncated, _ = env.step(action_np)
+            total_reward += reward
+            env.render()
+            if terminated or truncated:
+                break
+            state = next_state
+        print(f"total reward={total_reward}")
     policy.train()
 
 
@@ -396,19 +403,22 @@ def train():
     state_dim = env.observation_space.shape[0]
 
     policy = PolicyNetwork(state_dim).to(device)
+    #policy = torch.load("./checkpoints/BipedalWalker_RPO.pth", weights_only=False).to(device)
     value_fn = ValueNetwork(state_dim).to(device)
     optim_policy = optim.Adam(policy.parameters(), lr=3e-4)
     optim_value = optim.Adam(value_fn.parameters(), lr=1e-3)
 
     step_count = 0
 
-    while step_count < 8_000_000:
+    # 每次都是开始一个新的回合收集，但是收集的数据可能不止一个回合，遇到done就再开一个回合，直到步数满足
+    state, _ = env.reset()
+    ep_len = 0
+    ep_rew = 0
+
+    while step_count < 6_000_000:
         states, actions, rewards, dones, log_probs, values = [], [], [], [], [], []
 
-        # 每次都是开始一个新的回合收集，但是可能不止一个回合，遇到done就再开一个回合，直到步数满足
-        state, _ = env.reset()
-        ep_len = 0
-        ep_rew = 0
+
         while len(states) < 2048:
             state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
             with torch.no_grad():
@@ -460,36 +470,50 @@ def train():
         actions = torch.stack(actions)
         log_probs_old = torch.stack(log_probs)
 
+        batch_size = 256
+        n = states.size(0)
+        n_batches = (n + batch_size - 1) // batch_size  # 向上取整
+
         # 打乱样本顺序
-        perm = torch.randperm(states.size(0))
+        perm = torch.randperm(n)
         states = states[perm]
         actions = actions[perm]
         log_probs_old = log_probs_old[perm]
         advantages = advantages[perm]
         returns = returns[perm]
 
-        for _ in range(10):  # PPO更新迭代次数
-            mean, std = policy(states)
-            mean = perturb_mean(mean)
-            dist = Independent(Normal(mean, std), 1)
-            log_probs_new = dist.log_prob(actions)
-            entropy = dist.entropy().mean()
+        for _ in range(10):  # PPO 更新迭代次数
+            for i in range(n_batches):
+                start = i * batch_size
+                end = min(start + batch_size, n)
 
-            ratio = torch.exp(log_probs_new - log_probs_old)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean() - 0.001 * entropy
+                batch_states = states[start:end]
+                batch_actions = actions[start:end]
+                batch_log_probs_old = log_probs_old[start:end]
+                batch_advantages = advantages[start:end]
+                batch_returns = returns[start:end]
 
-            value_preds = value_fn(states)
-            value_loss = nn.functional.mse_loss(value_preds, returns)
+                mean, std = policy(batch_states)
+                mean = perturb_mean(mean)
+                dist = Independent(Normal(mean, std), 1)
+                log_probs_new = dist.log_prob(batch_actions)
+                entropy = dist.entropy().mean()
 
-            optim_policy.zero_grad()
-            policy_loss.backward()
-            optim_policy.step()
+                ratio = torch.exp(log_probs_new - batch_log_probs_old)
+                surr1 = ratio * batch_advantages
+                surr2 = torch.clamp(ratio, 0.8, 1.2) * batch_advantages
+                policy_loss = -torch.min(surr1, surr2).mean() - 0.001 * entropy
 
-            optim_value.zero_grad()
-            value_loss.backward()
-            optim_value.step()
+                value_preds = value_fn(batch_states)
+                value_loss = nn.functional.mse_loss(value_preds, batch_returns)
+
+                optim_policy.zero_grad()
+                policy_loss.backward()
+                optim_policy.step()
+
+                optim_value.zero_grad()
+                value_loss.backward()
+                optim_value.step()
 
         writer.add_scalar("loss/policy", policy_loss.item(), step_count)
         writer.add_scalar("loss/value", value_loss.item(), step_count)
@@ -517,6 +541,9 @@ if __name__ == "__main__":
 
 1. PPO的效果比RPO还要好，
 2. 相比单环境，多环境并发的不到100万步就出现回合回报大于0了，而单环境需要250万步
+3. 多环境最后训的的agent的得分比单环境的要明显高（250分 比 200分）
+
+我怀疑2、3跟多环境每次收集的步长大有关（8192 vs 2048）
 
 ![image-20250525134034569](img/image-20250525134034569.png)
 
