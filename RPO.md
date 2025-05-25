@@ -282,6 +282,10 @@ if __name__ == "__main__":
 
 ![image-20250524231102868](img/image-20250524231102868.png)
 
+上面的图片和下面的代码不完全一致。图片对应的代码，没有对样本做随机打散，所需的训练步数要少些。打散后步数要600万步才能达到240分的回合reward。而且“每次开始收集轨迹是否env.reset()”对所需步数有一定影响
+
+env.reset()是一个开销比较大的操作，如果每次开始收集轨迹前都做，训练时间会double。
+
 代码如下：
 
 
@@ -398,11 +402,10 @@ def train():
 
     step_count = 0
 
-    while step_count < 4_000_000:
+    while step_count < 8_000_000:
         states, actions, rewards, dones, log_probs, values = [], [], [], [], [], []
 
         # 每次都是开始一个新的回合收集，但是可能不止一个回合，遇到done就再开一个回合，直到步数满足
-        # 如果下面三行移动到 while step_count < 4_000_000上面，应该也是可以的，但是实际运行效果不好，还没有想清楚
         state, _ = env.reset()
         ep_len = 0
         ep_rew = 0
@@ -683,18 +686,21 @@ def train():
     optim_value = optim.Adam(value_fn.parameters(), lr=1e-3)
 
     step_count = 0
-    ep_len = 0
-    ep_rew = 0
+
     alpha_first = 0.7
     alpha_last = 0.05
     alpha = alpha_first
 
     max_steps = 4_000_000
 
-    state = env.reset()
 
     while step_count < max_steps:
         states, actions, rewards, dones, log_probs, values = [], [], [], [], [], []
+        
+        #每轮收集，都从一个崭新的回合开始
+        ep_len = 0
+        ep_rew = 0
+        state = env.reset()
         # 要确保 每个环境平均分到2048个时间步才好，因为这个游戏一个回合通常有1600步。
         while len(states) < 8192//n_envs:
             state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
