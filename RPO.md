@@ -73,7 +73,7 @@ RAD（**Reinforcement Learning with Augmented Data**）和 DrAC（**Data-regular
 
 ### Conclusion
 
-
+![image-20250525212815640](img/image-20250525212815640.png)
 
 ### bison的实验
 
@@ -523,7 +523,7 @@ if __name__ == "__main__":
 过程中犯了两个错误，导致并发环境版本搞了差不多一天：
 
 1. 没有打散样本，没有分minibatch
-2. env.reset()位置不对，导致每收集一次就重新reset，使得环境0的统计出现了问题
+2. env.reset()与环境0的统计变量的初始化没有配合好，导致统计出现了问题，定位这个问题花了不少时间
 
 showcase的得分：
 
