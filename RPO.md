@@ -334,10 +334,12 @@ class PolicyNetwork(nn.Module):
         self.log_std = nn.Linear(hidden_dim // 2, 4)
 
     def forward(self, x):
-        x = x / torch.tensor([[3.14, 5., 5., 5., 3.14, 5., 3.14, 5., 5., 3.14, 5., 3.14, 5., 5., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1. ]], device=x.device)  # normalize
+        x = x / torch.tensor([[3.14, 5., 5., 5., 3.14, 5., 3.14, 5., 5., 3.14, 5., 3.14, 5., 5., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1. ]], device=x.device, dtype=x.dtype)  # normalize
         x = self.net(x)
         mean = self.mean(x)
-        std = self.log_std(x).exp() # type:torch.Tensor
+        std = self.log_std(x)
+        std = torch.clamp(std, min=-10, max=10) #限制一下，避免下来的exp(x)爆炸
+        std = std.exp() # type:torch.Tensor
         return mean, std
 
 
@@ -354,7 +356,7 @@ class ValueNetwork(nn.Module):
 
     def forward(self, x):
         x = x / torch.tensor([[3.14, 5., 5., 5., 3.14, 5., 3.14, 5., 5., 3.14, 5., 3.14, 5., 5., 1., 1., 1., 1., 1., 1.,
-                               1., 1., 1., 1.]], device=x.device)  # normalize
+                               1., 1., 1., 1.]], device=x.device, dtype=x.dtype)  # normalize
         return self.net(x).squeeze(-1)
 
 
