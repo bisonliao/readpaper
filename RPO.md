@@ -278,15 +278,18 @@ if __name__ == "__main__":
 
 #### BipedalWalker
 
-这个任务确实就很好的展示了RPO相对PPO的优势。虽然前半段PPO表现比RPO好，但是RPO后来居上。实际动画显示RPO训练的两足机器人行走也很稳。
+我的结论还是反过来的：PPO比RPO性能要好，动画显示两个算法训练的两足机器人行走都很稳，但得分RPO要比PPO的机器人低40分。
 
 ![image-20250524231102868](img/image-20250524231102868.png)
 
-上面的图片和下面的代码不完全一致。图片对应的代码，没有对样本做随机打散，也没有对alpha做衰减。
-
-打散后要做minibatch，要不训练效果会很差。
-
-env.reset()是一个开销比较大的操作，如果每次开始收集轨迹前都做，训练时间会double。
+```shell
+# PPO训练的agent的行走得分。RPO的网络保存，250分左右
+total reward=293.80
+total reward=295.48
+total reward=297.90
+total reward=296.04
+total reward=298.11
+```
 
 代码如下：
 
@@ -488,7 +491,7 @@ def train():
 
 
         for _ in range(10):  # PPO 更新迭代次数
-            # 打乱样本顺序
+            # 打乱样本顺序，每次都随机打散一次，对训练效果有明显帮助
             perm = torch.randperm(n)
             states_ = states[perm]
             actions_ = actions[perm]
@@ -890,9 +893,3 @@ if __name__ == "__main__":
 
 ```
 
-#### 进一步实验的改进点
-
-查看cleanRL的RPO的代码，发现：
-
-1. 它每次更新网络参数，都对收集到的样本做洗牌打散。我的单环境下代码都没有这样做
-2. 它会对价值网络输出的值做裁剪，限制在一定的范围内，我的都没有这样做
