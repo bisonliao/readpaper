@@ -58,3 +58,355 @@ RRL 不是一个新的算法，而是一种训练方法论：别再每次从零�
 ![image-20250526131607483](img/image-20250526131607483.png)
 
 ### bison的实验
+
+根据前面的经验知道，用DQN算法难以训练出agent玩转Pong任务，因为这个任务的奖励太稀疏了。
+
+所以这次的实验，就以Gym的Pong为任务，以[CleanRL训练的PPO模型](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari.py)为teacher，蒸馏学习DQN，看看有teacher的帮助，能否训练出好的DQN模型来。
+
+
+
+代码如下：
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+import gymnasium as gym
+import numpy as np
+import random
+import os
+from collections import deque, namedtuple
+from datetime import datetime
+from torch.distributions.categorical import Categorical
+from stable_baselines3.common.atari_wrappers import (  # isort:skip
+    ClipRewardEnv,
+    EpisodicLifeEnv,
+    FireResetEnv,
+    MaxAndSkipEnv,
+    NoopResetEnv,
+)
+from tqdm import tqdm
+import ale_py
+
+# ----------- 超参数 -----------
+BATCH_SIZE = 32
+GAMMA = 0.99
+LEARNING_RATE = 1e-4
+BUFFER_SIZE = int(1e5)
+MIN_REPLAY_SIZE = 5000
+TARGET_UPDATE_FREQ = 1000
+TAU = 1.0   # temperature for softmax
+LAMBDA = 1.0  # distillation loss weight
+EPSILON_START = 1.0
+EPSILON_END = 0.05
+EPSILON_DECAY = 100_000  # over how many steps to decay epsilon
+OFFLINE_PHASE_STEPS = 20_000  # first N steps using teacher policy
+ONLINE_PHASE_STEPS = 80_000  # first N steps using teacher policy
+env_id = "PongNoFrameskip-v4"
+num_envs=4
+model_saving="./Pong_DQN_QDagger.pth"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# todo:
+# LAMBDA 要衰减
+# 两阶段的replay_buffer应该要分开
+
+#----------------------environments--------------------
+def make_env(env_id, idx, capture_video, run_name):
+    def thunk():
+        if capture_video and idx == 0:
+            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = NoopResetEnv(env, noop_max=30)
+        env = MaxAndSkipEnv(env, skip=4)
+        env = EpisodicLifeEnv(env)
+        if "FIRE" in env.unwrapped.get_action_meanings():
+            env = FireResetEnv(env)
+        env = ClipRewardEnv(env)
+        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        env = gym.wrappers.GrayscaleObservation(env)
+        env = gym.wrappers.FrameStackObservation(env, 4)
+        return env
+
+    return thunk
+
+# -------------------- teacher -----------------------
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+class Agent(nn.Module):
+    def __init__(self, envs):
+        super().__init__()
+        self.network = nn.Sequential(
+            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(64 * 7 * 7, 512)),
+            nn.ReLU(),
+        )
+        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(512, 1), std=1)
+
+    def get_value(self, x):
+        return self.critic(self.network(x / 255.0))
+
+    def get_action_and_value(self, x, action=None):
+        hidden = self.network(x / 255.0)
+        logits = self.actor(hidden)
+        probs = Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+    def get_action_prob(self, x):
+        hidden = self.network(x / 255.0)
+        logits = self.actor(hidden)
+        return torch.nn.functional.softmax(logits, dim=1)
+
+
+# ----------- Replay Buffer -----------
+Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'done'])
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, *args):
+        self.buffer.append(Transition(*args))
+
+    def sample(self, batch_size):
+        transitions = random.sample(self.buffer, batch_size)
+        return Transition(*zip(*transitions))
+
+    def __len__(self):
+        return len(self.buffer)
+    def clear(self):
+        self.buffer.clear()
+
+# ----------- DQN 网络 -----------
+class DQN(nn.Module):
+    def __init__(self, input_shape, n_actions):
+        super(DQN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+
+    def forward(self, x):
+        return self.net(x / 255.0)  # normalize pixel values
+
+# ----------- QDagger Trainer -----------
+class QDaggerTrainer:
+    def __init__(self, envs, teacher, run_name, log_dir='logs'):
+        self.envs = envs
+        self.teacher = teacher
+        obs_shape = envs.single_observation_space.shape
+        n_actions = envs.single_action_space.n
+
+        self.q_net = DQN(obs_shape, n_actions).to(DEVICE)
+        self.target_q_net = DQN(obs_shape, n_actions).to(DEVICE)
+        self.target_q_net.load_state_dict(self.q_net.state_dict())
+
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=LEARNING_RATE)
+        self.replay_buffer = ReplayBuffer(BUFFER_SIZE)
+        self.writer = SummaryWriter(os.path.join(log_dir, run_name))
+
+        self.n_actions = n_actions
+        self.global_step = 0
+        self.run_name = run_name
+
+    def softmax_policy(self, q_values):
+        return F.softmax(q_values / TAU, dim=-1)
+
+    def epsilon_greedy_action(self, q_values, epsilon):
+        if random.random() < epsilon:
+            return random.randint(0, self.n_actions - 1)
+        else:
+            return q_values.argmax().item()
+
+    def update(self, stage:str, lambda_: float):
+        if len(self.replay_buffer) < MIN_REPLAY_SIZE:
+            return
+
+        batch = self.replay_buffer.sample(BATCH_SIZE)
+
+        state = torch.tensor(np.array(batch.state), dtype=torch.float32).to(DEVICE)
+        action = torch.tensor(batch.action).to(DEVICE)
+        reward = torch.tensor(batch.reward, dtype=torch.float32).to(DEVICE)
+        next_state = torch.tensor(np.array(batch.next_state), dtype=torch.float32).to(DEVICE)
+        done = torch.tensor(batch.done, dtype=torch.float32).to(DEVICE)
+
+        # TD Loss
+        q_values = self.q_net(state)
+        q_value = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
+
+        with torch.no_grad():
+            next_q_values = self.target_q_net(next_state)
+            max_next_q = next_q_values.max(1)[0]
+            target_q = reward + GAMMA * (1 - done) * max_next_q
+
+        td_loss = F.mse_loss(q_value, target_q)
+
+        # Distillation Loss（仅 teacher 阶段有效）
+        with torch.no_grad():
+            teacher_prob = self.teacher.get_action_prob(state).to(dtype=torch.float32)
+        student_logits = self.q_net(state)
+        student_prob = self.softmax_policy(student_logits)
+        distill_loss = F.kl_div(student_prob.log(), teacher_prob, reduction='batchmean')
+
+        loss = td_loss + lambda_ * distill_loss
+        loss = loss.to(dtype=torch.float32)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # loggin
+        if random.randint(0, 10) < 5: #避免写日志的开销太大
+            self.writer.add_scalar(f"{stage}/loss_td", td_loss.item(), self.global_step)
+            self.writer.add_scalar(f"{stage}/loss_distill", distill_loss.item(), self.global_step)
+            self.writer.add_scalar(f"{stage}/loss_total", loss.item(), self.global_step)
+            self.writer.add_scalar(f"{stage}/lambda_", lambda_, self.global_step)
+
+        # Update target
+        if self.global_step % TARGET_UPDATE_FREQ == 0:
+            self.writer.add_scalar(f"{stage}/update_target", 1, self.global_step)
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
+
+
+    def linear_schedule(self,  duration: int, t: int):
+        start_e = EPSILON_START
+        end_e = EPSILON_END
+        slope = (end_e - start_e) / duration
+        return max(slope * t + start_e, end_e)
+
+    def train(self):
+
+        # -----------------------------------------------------------
+        # offline learning
+        self.global_step = 1
+        self.replay_buffer.clear()
+        obs,_ = self.envs.reset()
+        episode_rewards = [0.0 for _ in range(self.envs.num_envs)]
+        lambda_ = LAMBDA
+        stage = "offline_stage"
+        print(f"start {stage}")
+        for self.global_step in tqdm(range(1, OFFLINE_PHASE_STEPS), stage):
+            epsilon = self.linear_schedule(OFFLINE_PHASE_STEPS, self.global_step)
+            if self.global_step % 1000 == 0:self.writer.add_scalar(f"{stage}/epsilon", epsilon, self.global_step)
+            obs_tensor = torch.tensor(obs, dtype=torch.float32).to(DEVICE)
+
+            with torch.no_grad():
+                if random.random() < epsilon: #cleanRL的实现是对于offline阶段也做epsilon greedy todo:值得商榷，是不是尽快用上teacher比较好
+                    action = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+                else:
+                    # 用teacher作为行动策略（epsilon-greedy）
+                    action_probs = self.teacher.get_action_prob(obs_tensor) # obs是每个环境一个观测，所以action_prob也是每个环境一个分布
+                    action = [np.random.choice(self.n_actions, p=probs.cpu().numpy()) for probs in action_probs] #每个环境一个动作，根据对应的动作分布抽样
+
+
+            next_obs, reward, done, truncated, info = self.envs.step(action)
+            for i in range(self.envs.num_envs):
+                terminal = done[i] or truncated[i]
+                if done[i] and not truncated[i]: #如果回合正常终止了， 并发环境会自动reset
+                    final_next_obs = obs[i] #没办法的事情，会有误差，但比直接使用reset后的下个回合的第一帧强。 gym的并发环境没有在info字段里存放真正的下一帧
+                    self.writer.add_scalar(f"{stage}/obs_as_terminal_observation", 1, self.global_step)
+                else:
+                    final_next_obs = next_obs[i]
+                self.replay_buffer.push(obs[i], action[i], reward[i], final_next_obs, terminal)
+                episode_rewards[i] += reward[i]
+
+                if done[i] or truncated[i]:
+                    self.writer.add_scalar(f"{stage}/episode_reward", episode_rewards[i], self.global_step)
+                    episode_rewards[i] = 0.0
+
+            obs = next_obs
+            # 这个4，要能整除 TARGET_UPDATE_FREQ， 否则update函数里不会命中TARGET_UPDATE_FREQ
+            if self.global_step % 4 == 0:
+                self.update(stage, lambda_)
+            self.global_step += 1
+        #-----------------------------------------------------------
+        #online learning
+        self.global_step = 1
+        self.replay_buffer.clear()
+        obs, _ = self.envs.reset()
+        episode_rewards = [0.0 for _ in range(self.envs.num_envs)]
+        lambda_ = LAMBDA
+        stage = "online_stage"
+        print(f"start {stage}")
+        for self.global_step in tqdm(range(1, ONLINE_PHASE_STEPS), stage):
+            epsilon = self.linear_schedule( 0.5 * ONLINE_PHASE_STEPS, self.global_step)
+            if self.global_step % 1000 == 0: self.writer.add_scalar(f"{stage}/epsilon", epsilon, self.global_step)
+            obs_tensor = torch.tensor(obs, dtype=torch.float32).to(DEVICE)
+
+            with torch.no_grad():
+                # 用 student 策略（epsilon-greedy）
+                q_values = self.q_net(obs_tensor) # obs是每个环境一个观测，所以q_values是每个环境一组数据，每组数据里包括多个动作的回报值大小
+                action = [self.epsilon_greedy_action(q, epsilon) for q in q_values] #每个环境得到一个动作
+
+            next_obs, reward, done, truncated, info = self.envs.step(action)
+            for i in range(self.envs.num_envs):
+                terminal = done[i] or truncated[i]
+                if done[i] and not truncated[i]: #如果回合正常终止了， 并发环境会自动reset
+                    final_next_obs = obs[i] #没办法的事情，会有误差，但比直接使用reset后的下个回合的第一帧强。 gym的并发环境没有在info字段里存放真正的下一帧
+                    self.writer.add_scalar(f"{stage}/obs_as_terminal_observation", 1, self.global_step)
+                else:
+                    final_next_obs = next_obs[i]
+                self.replay_buffer.push(obs[i], action[i], reward[i], final_next_obs, terminal)
+
+                episode_rewards[i] += reward[i]
+
+                if done[i] or truncated[i]:
+                    self.writer.add_scalar(f"{stage}/episode_reward", episode_rewards[i], self.global_step)
+                    episode_rewards[i] = 0.0
+
+            obs = next_obs
+            # 这个4，要能整除 TARGET_UPDATE_FREQ， 否则update函数里不会命中TARGET_UPDATE_FREQ
+            if self.global_step % 4 == 0:
+                self.update(stage, lambda_)
+            self.global_step += 1
+            lambda_ = max(0.05, 1.0 - float(self.global_step*2) / ONLINE_PHASE_STEPS)
+
+        torch.save(self.q_net, model_saving)
+
+        self.writer.close()
+
+
+if __name__ == "__main__":
+    # env setup
+    envs = gym.vector.AsyncVectorEnv(
+        [make_env(env_id, i, False, "") for i in range(num_envs)],
+    )
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+
+    teacher = torch.load("./agent_cleanrl_pong.pth", weights_only=False)
+    teacher = teacher.to(DEVICE)
+    teacher.eval()
+    print("teacher loaded")
+
+
+    trainer = QDaggerTrainer(envs, teacher, run_name=f'qdagger_dqn_pong_{datetime.now().strftime("%y%m%d_%H%M%S")}')
+    trainer.train()
+
+```
+
