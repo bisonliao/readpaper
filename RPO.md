@@ -282,7 +282,7 @@ if __name__ == "__main__":
 
 ![image-20250524231102868](img/image-20250524231102868.png)
 
-上面的图片和下面的代码不完全一致。图片对应的代码，没有对样本做随机打散。
+上面的图片和下面的代码不完全一致。图片对应的代码，没有对样本做随机打散，也没有对alpha做衰减。
 
 打散后要做minibatch，要不训练效果会很差。
 
@@ -311,9 +311,8 @@ np.random.seed(42)
 device = "cpu"
 writer = SummaryWriter(log_dir=f"logs/BipedalWalker_PPO_{dt.now().strftime('%y%m%d_%H%M%S')}")
 
-alpha = 1.0
 
-def perturb_mean(mean):
+def perturb_mean(mean, alpha):
     noise = torch.rand_like(mean)*2-1.0
     noise = (noise * alpha).to(device)
     return mean+noise
@@ -399,6 +398,9 @@ def show(filename):
         print(f"total reward={total_reward}")
     policy.train()
 
+def decay_alpha(alpha_first, alpha_last, step_count, max_steps):
+    dec_per_step = (alpha_first - alpha_last) / max_steps
+    return alpha_first - dec_per_step * step_count
 
 def train():
     env = gym.make("BipedalWalker-v3")
@@ -412,20 +414,27 @@ def train():
 
     step_count = 0
 
-    # 每次都是开始一个新的回合收集，但是收集的数据可能不止一个回合，遇到done就再开一个回合，直到步数满足
+    alpha_first = 0.7
+    alpha_last = 0.05
+    alpha = alpha_first
+
+
+
+    max_steps = 4_000_000
+
     state, _ = env.reset()
     ep_len = 0
     ep_rew = 0
 
-    while step_count < 2_000_000:
+    while step_count < max_steps:
         states, actions, rewards, dones, log_probs, values = [], [], [], [], [], []
 
 
-        while len(states) < 2048:
+        while len(states) < 8192:
             state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
             with torch.no_grad():
                 mean, std = policy(state_tensor.unsqueeze(0))
-            mean = perturb_mean(mean)
+            mean = perturb_mean(mean, alpha)
 
             dist = Independent(Normal(mean, std), 1)
             action_raw = dist.rsample()
@@ -476,27 +485,28 @@ def train():
         n = states.size(0)
         n_batches = (n + batch_size - 1) // batch_size  # 向上取整
 
-        # 打乱样本顺序
-        perm = torch.randperm(n)
-        states = states[perm]
-        actions = actions[perm]
-        log_probs_old = log_probs_old[perm]
-        advantages = advantages[perm]
-        returns = returns[perm]
+
 
         for _ in range(10):  # PPO 更新迭代次数
+            # 打乱样本顺序
+            perm = torch.randperm(n)
+            states_ = states[perm]
+            actions_ = actions[perm]
+            log_probs_old_ = log_probs_old[perm]
+            advantages_ = advantages[perm]
+            returns_ = returns[perm]
             for i in range(n_batches):
                 start = i * batch_size
                 end = min(start + batch_size, n)
 
-                batch_states = states[start:end]
-                batch_actions = actions[start:end]
-                batch_log_probs_old = log_probs_old[start:end]
-                batch_advantages = advantages[start:end]
-                batch_returns = returns[start:end]
+                batch_states = states_[start:end]
+                batch_actions = actions_[start:end]
+                batch_log_probs_old = log_probs_old_[start:end]
+                batch_advantages = advantages_[start:end]
+                batch_returns = returns_[start:end]
 
                 mean, std = policy(batch_states)
-                mean = perturb_mean(mean)
+                mean = perturb_mean(mean, alpha)
                 dist = Independent(Normal(mean, std), 1)
                 log_probs_new = dist.log_prob(batch_actions)
                 entropy = dist.entropy().mean()
@@ -517,6 +527,8 @@ def train():
                 value_loss.backward()
                 optim_value.step()
 
+        alpha = decay_alpha(alpha_first, alpha_last, step_count, max_steps)
+        writer.add_scalar("stats/alpha", alpha, step_count)
         writer.add_scalar("loss/policy", policy_loss.item(), step_count)
         writer.add_scalar("loss/value", value_loss.item(), step_count)
         writer.add_scalar("stats/returns", sum(rewards), step_count)
@@ -878,3 +890,9 @@ if __name__ == "__main__":
 
 ```
 
+#### 进一步实验的改进点
+
+查看cleanRL的RPO的代码，发现：
+
+1. 它每次更新网络参数，都对收集到的样本做洗牌打散。我的单环境下代码都没有这样做
+2. 它会对价值网络输出的值做裁剪，限制在一定的范围内，我的都没有这样做
