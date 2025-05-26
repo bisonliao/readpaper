@@ -61,7 +61,26 @@ RRL 不是一个新的算法，而是一种训练方法论：别再每次从零�
 
 根据前面的经验知道，用DQN算法难以训练出agent玩转Pong任务，因为这个任务的奖励太稀疏了。
 
-所以这次的实验，就以Gym的Pong为任务，以[CleanRL训练的PPO模型](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari.py)为teacher，蒸馏学习DQN，看看有teacher的帮助，能否训练出好的DQN模型来。
+所以这次的实验，特意挑战一下：就以Gym的Pong为任务，以[CleanRL训练的PPO模型](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari.py)为teacher，蒸馏学习DQN，看看有teacher的帮助，能否训练出好的DQN模型来。
+
+通过一些取巧的超参数调整，最终让DQN学习到了正确的策略：
+
+1. offline阶段，loss全部由distill_loss组成，TD loss被忽略，而且epsilon很快降低到0.1，让replaybuffer里大量的teacher的action，相当于teacher进行标注，然后对DQN做有监督学习。学习的时间步要足够多：20万步
+2. online阶段，teacher要尽快退场，让DQN凭借在上一阶段学习到的本领，去环境中搏杀，获得正面和负面的回报，使用RL的方式进行学习，这时候TD loss是主要的。也保证足够多的时间步：20万步
+
+showcase效果如下（可惜不能渲染出画面，我记得SB3的VecEnv是可以同时输出rgb_array同时渲染出画面的）：
+
+```
+episode reward:20.0
+episode reward:20.0
+episode reward:20.0
+episode reward:20.0
+episode reward:20.0
+```
+
+teacher模型可是用了400万步才获得这样的能力，student只用了40万步就学习到了。可见QDagger算法有明显的作用。
+
+![image-20250526203452456](img/image-20250526203452456.png)
 
 
 
@@ -101,10 +120,9 @@ TARGET_UPDATE_FREQ = 1000
 TAU = 1.0   # temperature for softmax
 LAMBDA = 1.0  # distillation loss weight
 EPSILON_START = 1.0
-EPSILON_END = 0.05
-EPSILON_DECAY = 100_000  # over how many steps to decay epsilon
-OFFLINE_PHASE_STEPS = 20_000  # first N steps using teacher policy
-ONLINE_PHASE_STEPS = 80_000  # first N steps using teacher policy
+EPSILON_END = 0.1
+OFFLINE_PHASE_STEPS = 200_000
+ONLINE_PHASE_STEPS = 200_000
 env_id = "PongNoFrameskip-v4"
 num_envs=4
 model_saving="./Pong_DQN_QDagger.pth"
@@ -274,7 +292,7 @@ class QDaggerTrainer:
         student_prob = self.softmax_policy(student_logits)
         distill_loss = F.kl_div(student_prob.log(), teacher_prob, reduction='batchmean')
 
-        loss = td_loss + lambda_ * distill_loss
+        loss = td_loss * (1-lambda_) + lambda_ * distill_loss #todo: 我自己给td_loss加上了系数，要去掉
         loss = loss.to(dtype=torch.float32)
 
         self.optimizer.zero_grad()
@@ -312,7 +330,7 @@ class QDaggerTrainer:
         stage = "offline_stage"
         print(f"start {stage}")
         for self.global_step in tqdm(range(1, OFFLINE_PHASE_STEPS), stage):
-            epsilon = self.linear_schedule(OFFLINE_PHASE_STEPS, self.global_step)
+            epsilon = self.linear_schedule(OFFLINE_PHASE_STEPS // 5, self.global_step)
             if self.global_step % 1000 == 0:self.writer.add_scalar(f"{stage}/epsilon", epsilon, self.global_step)
             obs_tensor = torch.tensor(obs, dtype=torch.float32).to(DEVICE)
 
@@ -356,6 +374,7 @@ class QDaggerTrainer:
         print(f"start {stage}")
         for self.global_step in tqdm(range(1, ONLINE_PHASE_STEPS), stage):
             epsilon = self.linear_schedule( 0.5 * ONLINE_PHASE_STEPS, self.global_step)
+            epsilon = 0.1
             if self.global_step % 1000 == 0: self.writer.add_scalar(f"{stage}/epsilon", epsilon, self.global_step)
             obs_tensor = torch.tensor(obs, dtype=torch.float32).to(DEVICE)
 
@@ -385,11 +404,42 @@ class QDaggerTrainer:
             if self.global_step % 4 == 0:
                 self.update(stage, lambda_)
             self.global_step += 1
-            lambda_ = max(0.05, 1.0 - float(self.global_step*2) / ONLINE_PHASE_STEPS)
+            lambda_ = max(0.05, 1.0 - float(self.global_step*5) / ONLINE_PHASE_STEPS)
 
         torch.save(self.q_net, model_saving)
 
         self.writer.close()
+
+    def show(self):
+        self.q_net = torch.load(model_saving, weights_only=False)
+        self.q_net = self.q_net.to(DEVICE)
+        self.q_net.eval()
+
+        envs = gym.vector.SyncVectorEnv(
+            [make_env(env_id, 0, False, "")],
+        )
+
+        for _ in range(5):
+            obs, _ = envs.reset()
+            episode_reward = 0
+
+            while True:
+
+                obs_tensor = torch.tensor(obs, dtype=torch.float32).to(DEVICE)
+
+                with torch.no_grad():
+                    q_values = self.q_net(obs_tensor)  # obs是每个环境一个观测，所以q_values是每个环境一组数据，每组数据里包括多个动作的回报值大小
+                action = [q.argmax().item() for q in q_values]
+
+                next_obs, reward, done, truncated, info = envs.step(action)
+                #envs.render() #不知道怎么把图片画出来
+                episode_reward += reward[0]
+                if done[0] or truncated[0]:
+                    break
+                obs = next_obs
+            print(f"episode reward:{episode_reward}")
+        self.q_net.train()
+
 
 
 if __name__ == "__main__":
@@ -407,6 +457,7 @@ if __name__ == "__main__":
 
     trainer = QDaggerTrainer(envs, teacher, run_name=f'qdagger_dqn_pong_{datetime.now().strftime("%y%m%d_%H%M%S")}')
     trainer.train()
+    trainer.show()
 
 ```
 
