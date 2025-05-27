@@ -75,6 +75,8 @@ DQN主要被诟病的是：
 
 ![image-20250527164908557](img/image-20250527164908557.png)
 
+[5M时间步后的视频在此](img/PQN_breakout.mp4)
+
 从上图可以看出：
 
 1. 使用TD(0)算法，reward稀疏也是可以训练的。一开始每次收集到的轨迹里面，99%的时间步的reward都是0
@@ -88,6 +90,8 @@ DQN主要被诟病的是：
 1. 3个环境并行，每个环境每轮收集256步，收敛
 2. 8个环境并行，每个环境没路收集128步，收敛
 3. 4个环境并行，每个环境每轮收集256步，发散
+
+
 
 代码如下。
 
@@ -199,18 +203,6 @@ class PQNAgent:
     def decay_epsilon(self, episode, total_episodes):
         self.epsilon = self.final_epsilon + (1.0 - self.final_epsilon) * max(0, (1 - episode / total_episodes))
 
-    def calc_returns(self, states, next_states, rewards, dones):
-        # Compute Q(lambda) targets
-        num_steps = states.shape[0]
-        with torch.no_grad():
-            returns = torch.zeros_like(rewards).to(device)
-            for t in reversed(range(num_steps)):
-                next_value, _ = torch.max(self.policy_net(next_states[t].unsqueeze(0)), dim=-1)
-                nextnonterminal = 1.0 - dones[t]
-                returns[t] = rewards[t] + 0.99 * next_value * nextnonterminal
-        return returns
-
-
     def train(self, total_steps=2_000_000):
         episode_cnt = 0 #统计evn#0经历的回合个数，用于控制训练的次数
 
@@ -287,8 +279,8 @@ class PQNAgent:
         torch.save(self.policy_net, "./pqn_breakout.pth")
         self.writer.close()
 
-    def evaluate(self, vec_env, num_episodes=5, model_path="best_model.pth"):
-        self.policy_net.load_state_dict(torch.load(model_path))
+    def evaluate(self, vec_env, num_episodes=5, model_path="./pqn_breakout.pth"):
+        self.policy_net = torch.load(model_path, weights_only=False)
         self.policy_net.eval()
 
         total_rewards = []
@@ -308,6 +300,7 @@ class PQNAgent:
 
             total_rewards.append(total_reward)
             print(f"Evaluation Episode {ep+1} | Reward: {total_reward:.2f}")
+
 
         print(f"Average Reward: {np.mean(total_rewards):.2f}")
 
