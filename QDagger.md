@@ -449,7 +449,7 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    teacher = torch.load("./agent_cleanrl_pong.pth", weights_only=False)
+    teacher = torch.load("./models/agent_cleanrl_pong.pth", weights_only=False)
     teacher = teacher.to(DEVICE)
     teacher.eval()
     print("teacher loaded")
