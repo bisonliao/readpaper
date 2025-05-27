@@ -76,7 +76,8 @@ DQN主要被诟病的是：
 从上图可以看出：
 
 1. 使用TD(0)算法，reward稀疏也是可以训练的。一开始每次收集到的轨迹里面，99%的时间步的reward都是0
-2. 3个并行的环境共计完成2百万步，耗时51分。但是这个其实不太好与DQN比较，毕竟实现细节可以有很多出入
+2. cleanRL的示例代码，是用的TD(lambda)，我的代码是用的TD(0)，在breakout这种奖励稀疏的环境下，TD(lambda)会更好，而且融合了MTC的优势，也就是能更好的克服TD(0)的有偏的问题，当然方差就大一点。
+3. 3个并行的环境共计完成2百万步，耗时51分。但是这个其实不太好与DQN比较墙上时钟的效率，毕竟实现细节可以有很多出入
 
 代码如下：
 
@@ -316,3 +317,21 @@ if __name__ == "__main__":
 
 ```
 
+#### python程序性能分析
+
+一开始，我的PQN代码性能很差，慢的无法忍受。我用下面的命令很方便就分析出来瓶颈所在：
+
+```
+# 加上-m cProfile -s time -o pqn_profile.prof这几个参数
+python3 -m cProfile -s time -o pqn_profile.prof   ./PQN_Breakout.py
+
+#安装分析工具
+pip3 install snakeviz
+
+#查看性能分析
+snakeviz pqn_profile.prof
+```
+
+
+
+性能开销主要就是在update_model函数里临时把list转tensor开销非常大，让这个函数占了整个程序执行时间的95%。优化方法就是一开始就创建指定大小的numpy数组，收集轨迹的过程对号入座的插入数据，然后预先转tensor后传给update_model函数。
