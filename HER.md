@@ -9,8 +9,9 @@ RL面临很大的一个挑战是奖励稀疏的问题，而人工设计episode�
 我理解HER的主要思想就是：
 
 1. 通常的off-policy方法是训练在确定目标g 下的策略 Pi(state) --> action，而对于HER训练的策略，输入参数不只有state，还有目标g'，也就是HER训练策略 Pi(state, g')-->action，通过深度神经网络的泛化能力，策略网络能学会不同目标下的行为映射。训练收敛后，输入desired goal的时候，策略网络能够指挥agent执行正确的动作，到达desired goal
-2. HER 会将一个 episode 中实际达到的某些状态（比如最终状态 sTs_TsT）**当作目标**，将这条本来以“失败”告终的轨迹转化为“成功”轨迹来训练策略。也就是说，在经验回放时，不仅使用原始目标 ggg，还使用替换后的目标 g′=m(sT)g' = m(s_T)g′=m(sT)，从而增强经验多样性和可学习性
+2. HER 会将一个 episode 中实际达到的某些状态（比如最终状态 s_T）**当作目标**，将这条本来以“失败”告终的轨迹转化为“成功”轨迹来训练策略。也就是说，在经验回放时，不仅使用原始目标 g，还使用替换后的目标 g′=m(s_T)，从而增强经验多样性和可学习性
 3. HER 是一种数据增强方式，本质上是通过**目标的替换**，来增加有效的训练样本数量，提升样本效率。
+4. HER算法实现的核心组件是HerReplayBuffer，通过在buffer里构造目标为achieved goal的样本（数据增强的过程），训练出对goal泛化的策略网络DQN SAC等off-policy算法的深度网络，需要支持拼接了goal之后的输入。
 
 ### Background
 
@@ -36,6 +37,8 @@ RL面临很大的一个挑战是奖励稀疏的问题，而人工设计episode�
 
 ![image-20250601200143005](img/image-20250601200143005.png)
 
+![image-20250602214402525](img/image-20250602214402525.png)
+
 ### Expertiments
 
 ![image-20250601190456291](img/image-20250601190456291.png)
@@ -51,6 +54,15 @@ From Fig. 4 it is clear that DDPG+HER performs much better than pure DDPG even i
 在**Hindsight Experience Replay (HER)** 的论文中，**奖励通常是稀疏且二元的**（如成功/失败），但**HER的核心思想并不严格依赖二元奖励**，而是适用于**稀疏奖励**的场景。
 
 ### bison的实验
+
+提供了适合HER算法的很多任务的模拟环境：
+
+```
+# Gymnasium-Robotics Documentation
+https://robotics.farama.org/
+```
+
+
 
 #### 疯狂的赛车
 
@@ -529,3 +541,294 @@ if __name__ == '__main__':
 ```
 
 不能收敛，不知道问题出在哪里
+
+![image-20250602130642590](img/image-20250602130642590.png)
+
+#### FetchReach
+
+**任务目标**：控制机械臂的末端执行器（end-effector）**移动到目标位置**，这是一个 **3D 空间中的目标点**，通常是一个随机生成的坐标。
+
+- 奖励结构是稀疏奖励。如果末端执行器距离目标位置小于一个阈值（通常是 `0.05m`），就给 **+0 奖励**（即成功）；否则是 **-1**（失败）。
+
+- 动作是一个 **4维连续向量**：前三维是 `Δx, Δy, Δz`（末端位置的增量），第4维是 `gripper` 的开合指令（在 FetchReach 中通常会被忽略）。
+
+  动作经过内部处理后转换为末端执行器在笛卡尔空间中的**小幅移动**。
+
+详细介绍见[官方文档](https://robotics.farama.org/envs/fetch/reach/)：
+
+##### 直接使用SB3库实现（不收敛）
+
+```python
+import os
+import gymnasium as gym
+import numpy as np
+import gymnasium_robotics
+import time
+from stable_baselines3 import HerReplayBuffer,SAC
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecVideoRecorder
+from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.logger import configure
+
+LOG_DIR = "./logs"
+VIDEO_DIR = os.path.join(LOG_DIR, "videos")
+MODEL_PATH = "./sac_her_fetchreach"
+
+# ===== 1. 创建多进程并行环境 =====
+def make_env(rank, seed=0):
+    def _init():
+        env = gym.make("FetchReach-v3")
+        env.reset(seed=seed+rank)
+        return env
+    return _init
+
+if __name__ == "__main__":
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+
+    # 启动 4 个 FetchReach 环境并向量化
+    num_envs = 4
+    env_fns = [make_env(i) for i in range(num_envs)]
+    vec_env = SubprocVecEnv(env_fns)
+    vec_env = VecMonitor(vec_env, filename=os.path.join(LOG_DIR, "monitor.csv"))
+
+    # ===== 2. 自定义 TensorBoard 日志器 =====
+    custom_logger = configure(LOG_DIR, ["stdout", "tensorboard"])
+
+    # ===== 3. 创建 SAC + HER 模型 =====
+    model = SAC(
+        policy="MultiInputPolicy",
+        env=vec_env,
+        replay_buffer_class=HerReplayBuffer,
+        replay_buffer_kwargs=dict(
+            n_sampled_goal=4,
+            goal_selection_strategy="future",
+        ),
+        learning_starts=1000,
+        verbose=1,
+        tensorboard_log=LOG_DIR,
+        batch_size=256,
+        gamma=0.98,
+        learning_rate=3e-4,
+        buffer_size=int(1e6),
+        train_freq=1,
+        gradient_steps=1,
+        policy_kwargs=dict(net_arch=[256, 256]),
+    )
+    model.set_logger(custom_logger)
+
+    # ===== 5. 开始训练 =====
+    model.learn(total_timesteps=1_000_000)
+
+    # ===== 6. 保存模型到磁盘 =====
+    model.save(MODEL_PATH)
+    print(f"\n✅ 模型已保存到 {MODEL_PATH}")
+
+    # ===== 7. 加载模型并渲染演示 =====
+    test_env = gym.make("FetchReach-v3", render_mode="human")  # human 模式可视化
+    obs = test_env.reset()
+    model = SAC.load(MODEL_PATH, env=test_env)
+
+    for _ in range(3):  # 演示3回合
+        obs, _ = test_env.reset()
+        for _ in range(50):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, _, _ = test_env.step(action)
+            time.sleep(0.05)
+            if done:
+                break
+    test_env.close()
+
+```
+
+##### 网上开源的代码（复现不能收敛）
+
+[这个小哥的项目](https://github.com/Emre-Akgul/Robot-Trajectory-Planner/tree/main?tab=readme-ov-file)，代码非常清晰。他的readme里说是收敛的，但是我执行下来6000多个回合（30万时间步），不能收敛：
+
+![image-20250602223444775](img/image-20250602223444775.png)
+
+小哥的代码很清晰，让人爱不释手，所以我fork了他的这个repository到[我的repo](https://github.com/bisonliao/Robot-Trajectory-Planner)。
+
+下面放出来是我修改过的文件，加了tb上报：
+
+train_agent.py
+
+```python
+import datetime
+import sys
+import os
+from collections import deque
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import gymnasium as gym
+import gymnasium_robotics
+import numpy as np
+import torch
+from models.sac_agent import SAC
+from utils.model_saver import save_agent, save_replay_buffer
+from buffers.her_replay_buffer import HERReplayBuffer
+from torch.utils.tensorboard import SummaryWriter
+
+
+def main():
+    # Set up environment
+    env = gym.make('FetchReach-v3', render_mode=None, reward_type="sparse")
+    obs = env.reset()[0]
+    state_dim = obs['observation'].shape[0] + obs['desired_goal'].shape[0]
+    action_dim = env.action_space.shape[0]
+    writer = SummaryWriter(log_dir=f'./logs/sac_her_fetchreach_{datetime.datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+    # Device setup
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
+
+    # Initialize SAC agent
+    sac = SAC(state_dim, action_dim, device=device)
+    save_dir = "checkpoints/"
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Set hyperparameters
+    max_episodes = 20000 # max number of episodes to stop training
+    steps_cnt = 0
+    episode_length = env._max_episode_steps # the default is 50
+    batch_size = 256
+    num_random_episodes = batch_size
+    save = True
+    success_record = deque(maxlen=100)
+
+    for episode in range(max_episodes):
+        obs, _ = env.reset()
+        episode_reward = 0
+        trajectory = []
+
+        for t in range(episode_length):
+            # Create the state input by concatenating observation and desired goal
+            state = np.concatenate([obs['observation'], obs['desired_goal']])
+
+            # Select action
+            action = sac.select_action(state)
+
+            # Step in the environment
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            steps_cnt += 1
+
+
+            # Append transition to trajectory
+            trajectory.append((obs, action, reward, next_obs, done))
+            obs = next_obs
+            episode_reward += reward
+
+            if done:
+                break
+
+        # Store trajectory in the HER replay buffer
+        sac.replay_buffer.store_trajectory(trajectory)
+
+        # Train the SAC agent, 这样写有点奇怪，一般不是写在时间步的循环里嘛
+        if len(sac.replay_buffer) > num_random_episodes*4:
+            for _ in range(episode_length):
+                sac.update(batch_size)
+
+        # Define success (if last position is within 0.05 of the goal)
+        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+        success_record.append(success)
+
+        if (episode+1) % 20 == 0:
+            writer.add_scalar("episode/succeed_ratio", success_record.count(1) / 100.0, episode)
+            writer.add_scalar("episode/episode_reward", episode_reward, episode)
+            print(f"Episode {episode}, Reward: {episode_reward}, Succcess: {success}")
+        
+        # save model in every 1000 episodes
+        if save and (episode + 1) % 500 == 0:
+            agent_path = os.path.join(save_dir, f"sac_her_fetchreach_{episode + 1}.pth")
+            replay_buffer_path = os.path.join(save_dir, f"replay_buffer_{episode + 1}.pkl")
+            save_agent(sac, agent_path)
+            save_replay_buffer(sac.replay_buffer, replay_buffer_path) # in case want to train further later
+            print("Model and replay buffer saved at episode:", episode + 1)
+        
+    print("Training completed.")
+
+if __name__ == "__main__":
+    main()
+
+```
+
+her_replay_buffer.py最能体现HER的思路，所以也贴一下:
+
+```python
+import numpy as np
+import random
+from collections import deque
+
+class HERReplayBuffer:
+    def __init__(self, capacity=1000000, k_future=4):
+        self.buffer = deque(maxlen=capacity)
+        self.k_future = k_future
+    
+    def store_trajectory(self, trajectory):
+        # Store original trajectory
+        for t in range(len(trajectory)):
+            self.buffer.append(trajectory[t])
+        
+        # Apply HER - using future strategy
+        for t in range(len(trajectory)):
+            '''
+            对每一个时间步：
+            都随机选出未来时间步中的 k 个 achieved_goal 作为整条复制后轨迹的 desired_goal，进行 k 次循环：
+            复制并修改当前时间步的样本数据，修改desired_goal字段和reward
+            '''
+            # Sample k random states from the future of the trajectory
+            future_ids = random.choices(
+                range(t + 1, len(trajectory)), 
+                k=min(self.k_future, len(trajectory) - t - 1)
+            )
+            
+            for future_id in future_ids:
+                # Get the achieved goal from the future state
+                future_ag = trajectory[future_id][3]['achieved_goal']
+                
+                # Create new goal-conditioned experience
+                state = trajectory[t][0].copy()
+                next_state = trajectory[t][3].copy()
+                
+                # Replace goal with the future achieved goal
+                # 整条轨迹的 desired_goal 都被替换
+                state['desired_goal'] = future_ag
+                next_state['desired_goal'] = future_ag
+                
+                # Calculate reward
+                reward = 0.0 if np.linalg.norm(next_state['achieved_goal'] - future_ag) < 0.05 else -1.0
+                
+                self.buffer.append((state, trajectory[t][1], reward, next_state, trajectory[t][4]))
+    
+    def sample(self, batch_size):
+        if len(self.buffer) < batch_size:
+            return None
+        
+        batch = random.sample(self.buffer, batch_size)
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = zip(*batch)
+        
+
+        cur_observations = np.array([s['observation'] for s in state_batch])
+        cur_goals = np.array([s['desired_goal'] for s in state_batch])
+        cur_state = np.concatenate([cur_observations, cur_goals], axis=1)
+        
+
+        next_observations = np.array([s['observation'] for s in next_state_batch])
+        next_goals = np.array([s['desired_goal'] for s in next_state_batch])
+        next_state = np.concatenate([next_observations, next_goals], axis=1)
+        return (
+            cur_state,
+            np.array(action_batch),
+            np.array(reward_batch),
+            next_state,
+            np.array(done_batch)
+        )
+    
+    def __len__(self):
+        return len(self.buffer)
+
+```
+
