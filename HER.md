@@ -6,6 +6,12 @@ RL面临很大的一个挑战是奖励稀疏的问题，而人工设计episode�
 
 本论文贡献的HER方法，是一种通用的、可以和任何off-policy方法结合的reward shaping方法，用于处理稀疏的二值奖励（任务要么完成了，要么没有完整，没有更多的奖励信息）的任务。
 
+我理解HER的主要思想就是：
+
+1. 通常的off-policy方法是训练在确定目标g 下的策略 Pi(state) --> action，而对于HER训练的策略，输入参数不只有state，还有目标g'，也就是HER训练策略 Pi(state, g')-->action，通过深度神经网络的泛化能力，策略网络能学会不同目标下的行为映射。训练收敛后，输入desired goal的时候，策略网络能够指挥agent执行正确的动作，到达desired goal
+2. HER 会将一个 episode 中实际达到的某些状态（比如最终状态 sTs_TsT）**当作目标**，将这条本来以“失败”告终的轨迹转化为“成功”轨迹来训练策略。也就是说，在经验回放时，不仅使用原始目标 ggg，还使用替换后的目标 g′=m(sT)g' = m(s_T)g′=m(sT)，从而增强经验多样性和可学习性
+3. HER 是一种数据增强方式，本质上是通过**目标的替换**，来增加有效的训练样本数量，提升样本效率。
+
 ### Background
 
 简单介绍了RL、DQN、DDPG、Universal Value Function Approximator
@@ -80,14 +86,18 @@ class RaceCarEnv(gym.Env ):
     - 动作空间：转向和油门控制
     """
 
-    def __init__(self, writer:SummaryWriter, render=False,fps=100):
+    def __init__(self, render=False,fps=100, rank=0):
         """
         初始化环境
         Args:
             render (bool): 是否开启GUI渲染
         """
         super(RaceCarEnv, self).__init__()
-        self.writer = writer
+        if rank == 0:
+            self.writer  = SummaryWriter(log_dir=f"logs/RaceCarEnv_{datetime.datetime.now().strftime('%y%m%d_%H%M%S')}")
+        else:
+            self.writer = None
+        self.rank = rank
 
         # 连接物理引擎
         if render:
@@ -141,6 +151,7 @@ class RaceCarEnv(gym.Env ):
         self.last_pos = None  # 上一步的位置
         self.recordVedio = False
         self.frames = []
+        self.prng = random.Random()  # 创建实例
 
         self.coins = [] #中途奖励的金币
         # 重置环境
@@ -236,8 +247,16 @@ class RaceCarEnv(gym.Env ):
 
     def reset(self, seed=None, options=None, **kwargs):
         super().reset(seed=seed)
+
         """重置环境到初始状态"""
         p.resetSimulation()
+
+        # 随机选择赛道上的某个点作为目标（而不仅是终点）
+
+        self.prng.seed(seed if seed else 42)  # 设置种子
+        possible_goals = [[3, 3], [9, 5], [11, 7], [14.5, 7.5]]  # 金币位置+终点
+        self.goal = self.prng.choice(possible_goals) # 使用固定seed的随机选择
+
         self._create_track()
 
         # 重置赛车位置和速度
@@ -258,10 +277,10 @@ class RaceCarEnv(gym.Env ):
         #抽样录一个回合视频
         if self.recordVedio and len(self.frames) > 10:
             imageio.mimsave(f"./racecar_{datetime.datetime.now().strftime('%H%M%S')}.mp4", self.frames, format='FFMPEG', fps=self.fps)
-            self.writer.add_scalar("steps/saveMP4", 1, self.total_step)
+            if self.writer: self.writer.add_scalar("steps/saveMP4", 1, self.total_step)
 
         self.frames = []
-        if random.randint(0, 10) < 1:
+        if self.rank == 0 and random.randint(0, 25) < 1:
             self.recordVedio = True
         else:
             self.recordVedio = False
@@ -276,7 +295,7 @@ class RaceCarEnv(gym.Env ):
     def _check_hit_wall(self):
         for cp in p.getContactPoints(self.car):
             if cp[2] in self.walls:
-                self.writer.add_scalar("steps/hitWall", 1, self.total_step)
+                if self.writer: self.writer.add_scalar("steps/hitWall", 1, self.total_step)
                 return True
         return False
     def step(self, action):
@@ -452,50 +471,61 @@ SB3极简的训练代码：
 
 ```python
 import datetime
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecMonitor
 #from stable_baselines3.common.env_checker import check_env
 from gymnasium.utils.env_checker import check_env
 from racecar_env import RaceCarEnv
 from stable_baselines3 import HerReplayBuffer,SAC,HER
 from torch.utils.tensorboard import SummaryWriter
 
-writer = SummaryWriter(log_dir=f"logs/RaceCarEnv_{datetime.datetime.now().strftime('%y%m%d_%H%M%S')}")
-env = RaceCarEnv(writer, render=False)
-# It will check your custom environment and output additional warnings if needed
-check_env(env)
+def make_env(rank, writer=None, render=False):
+    """
+    创建一个环境构造函数，供 SubprocVecEnv 使用
+    """
+    def _init():
+        env = RaceCarEnv(render=render, rank=rank)
+        return env
+    return _init
 
-env = DummyVecEnv([lambda: env])
-env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0) #对环境的输出（观测、奖励）进行归一化标准化
-env = VecMonitor(env)
+if __name__ == '__main__':
 
-# Initialize the model
-# 在 SB3 中，"future" 策略会从当前 transition 之后的 k 个时间步中随机选择一个状态作为替代目标（k 由 n_sampled_goal 参数控制）。
-# 相比 "final"（仅用 episode 的最终状态作为替代目标），"future" 能提供更多样化的目标，通常效果更好。
-model = SAC(
-    "MultiInputPolicy",
-    env,
-    replay_buffer_class=HerReplayBuffer,
-    # Parameters for HER
-    replay_buffer_kwargs=dict(
-        n_sampled_goal=4,
-        goal_selection_strategy="future",
-    ),
-    verbose=1,
-    learning_starts=1000,
-    tensorboard_log='logs/'
-)
+    # 创建 4 个并行环境
+    num_envs = 4
+    env_fns = [make_env(i, writer=None, render=False) for i in range(num_envs)]
+    env = SubprocVecEnv(env_fns)
+
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0) #对环境的输出（观测、奖励）进行归一化标准化
+    env = VecMonitor(env)
+
+    # Initialize the model
+    # 在 SB3 中，"future" 策略会从当前 transition 之后的 k 个时间步中随机选择一个状态作为替代目标（k 由 n_sampled_goal 参数控制）。
+    # 相比 "final"（仅用 episode 的最终状态作为替代目标），"future" 能提供更多样化的目标，通常效果更好。
+    # 定义 HER 的关键参数
+    model = SAC(
+        policy="MultiInputPolicy",  # 因为 observation 是 Dict
+        env=env,
+        replay_buffer_class=HerReplayBuffer,
+        replay_buffer_kwargs=dict(
+            n_sampled_goal=4,  # 每条经验额外采样几个 g'
+            goal_selection_strategy="future",  # 可选 final / future / episode
+        ),
+        learning_starts=10000,
+        verbose=1,
+        batch_size=256,
+        learning_rate=3e-4,
+        gamma=0.98,
+        buffer_size=int(1e6),
+        train_freq=1,
+        gradient_steps=1,
+        policy_kwargs=dict(net_arch=[256, 256]),
+        tensorboard_log='logs/'
+    )
 
 
-# 3. 训练10,000步
-model.learn(total_timesteps=2_000_000)
+    # 3. 训练
+    model.learn(total_timesteps=2_000_000)
 
-# 4. 测试训练结果
-obs, _ = env.reset()
-for _ in range(100):
-    action, _ = model.predict(obs)
-    obs, reward, done, _, _ = env.step(action)
-    if done:
-        break
-env.close()
+    env.close()
 ```
 
+不能收敛，不知道问题出在哪里
