@@ -684,64 +684,70 @@ def main():
     device = "cpu"
 
     # Initialize SAC agent
-    sac = SAC(state_dim, action_dim, device=device)
+    sac = SAC(state_dim, action_dim, device=device, writer=writer)
     save_dir = "checkpoints/"
     os.makedirs(save_dir, exist_ok=True)
 
     # Set hyperparameters
-    max_episodes = 20000 # max number of episodes to stop training
+    max_episodes = 10000 # max number of episodes to stop training
     steps_cnt = 0
     episode_length = env._max_episode_steps # the default is 50
-    batch_size = 256
+    batch_size = 128
     num_random_episodes = batch_size
     save = True
     success_record = deque(maxlen=100)
 
     for episode in range(max_episodes):
-        obs, _ = env.reset()
-        episode_reward = 0
-        trajectory = []
+        # 按照论文的描述，调整为：
+        # 每个episode做两个事情：
+        # 1、收集 16次轨迹
+        # 2、对model做40次mini-batch update
+        for _ in range(16):
+            obs, _ = env.reset()
+            episode_reward = 0
+            trajectory = []
 
-        for t in range(episode_length):
-            # Create the state input by concatenating observation and desired goal
-            state = np.concatenate([obs['observation'], obs['desired_goal']])
+            for t in range(episode_length):
+                # Create the state input by concatenating observation and desired goal
+                state = np.concatenate([obs['observation'], obs['desired_goal']])
 
-            # Select action
-            action = sac.select_action(state)
+                # Select action
+                action = sac.select_action(state)
 
-            # Step in the environment
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            steps_cnt += 1
+                # Step in the environment
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                steps_cnt += 1
 
 
-            # Append transition to trajectory
-            trajectory.append((obs, action, reward, next_obs, done))
-            obs = next_obs
-            episode_reward += reward
+                # Append transition to trajectory
+                trajectory.append((obs, action, reward, next_obs, done))
+                obs = next_obs
+                episode_reward += reward
 
-            if done:
-                break
+                if done:
+                    break
 
-        # Store trajectory in the HER replay buffer
-        sac.replay_buffer.store_trajectory(trajectory)
+            # Store trajectory in the HER replay buffer
+            sac.replay_buffer.store_trajectory(trajectory)
 
-        # Train the SAC agent, 这样写有点奇怪，一般不是写在时间步的循环里嘛
-        if len(sac.replay_buffer) > num_random_episodes*4:
-            for _ in range(episode_length):
+            # Define success (if last position is within 0.05 of the goal)
+            success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+            success_record.append(success)
+
+        # Train the SAC agent
+        if len(sac.replay_buffer) > num_random_episodes:
+            for _ in range(40):
                 sac.update(batch_size)
 
-        # Define success (if last position is within 0.05 of the goal)
-        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
-        success_record.append(success)
 
-        if (episode+1) % 20 == 0:
-            writer.add_scalar("episode/succeed_ratio", success_record.count(1) / 100.0, episode)
-            writer.add_scalar("episode/episode_reward", episode_reward, episode)
-            print(f"Episode {episode}, Reward: {episode_reward}, Succcess: {success}")
+
+        writer.add_scalar("episode/succeed_ratio", success_record.count(1) / 100.0, episode)
+        writer.add_scalar("episode/episode_reward", episode_reward, episode)
+        print(f"Episode {episode}, Reward: {episode_reward}, Succcess: {success}")
         
         # save model in every 1000 episodes
-        if save and (episode + 1) % 500 == 0:
+        if save and (episode + 1) % 1000 == 0:
             agent_path = os.path.join(save_dir, f"sac_her_fetchreach_{episode + 1}.pth")
             replay_buffer_path = os.path.join(save_dir, f"replay_buffer_{episode + 1}.pkl")
             save_agent(sac, agent_path)
