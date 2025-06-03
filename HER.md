@@ -838,3 +838,12 @@ class HERReplayBuffer:
 
 ```
 
+在小哥的代码基础上尝试：
+
+1. 按照论文进行训练过程的调整：收集16个轨迹后，进行40次mini-batch update。（没有明显起色）
+2. 对输入做rescale，减去0.5，移动分布的中心。修改了train.py和buffer.py。（好一些）
+3. 增加设置seed的函数，尝试不同的seed
+4. 增加exploration，修改了SAC的select_action函数和所有调用它的地方（要传参数区分是train还是eval），没有显著提升，相比rescale成功率还整体跌了一些
+
+
+
