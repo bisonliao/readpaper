@@ -853,3 +853,73 @@ class HERReplayBuffer:
 
 
 
+另外，我发现在300次epoch后，成功率已经到达30%，这时候完全关闭HER机制，让算法变成完全的SAC，继续训练，发现成功率不会继续上升，所以是不是SAC相关的超参数的设置不合适呢？HER相当于只用于前半段进行引导和启发，后半段在已经有一定比例的成功样本的情况下，SAC应该要能学习并收敛。
+
+下面的代码实现了在一定的步数后关闭HER的relabel功能、继续训练。很遗憾，不能收敛。
+
+```python
+import os
+import gymnasium as gym
+import numpy as np
+import gymnasium_robotics
+import time
+from stable_baselines3 import HerReplayBuffer,SAC
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecVideoRecorder
+from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.logger import configure
+
+
+MODEL_PATH = "./sac_her_fetchreach"
+
+# ===== 1. 创建多进程并行环境 =====
+def make_env(rank, seed=0):
+    def _init():
+        env = gym.make("FetchReach-v3")
+        env.reset(seed=seed+rank)
+        return env
+    return _init
+
+if __name__ == "__main__":
+
+    # 启动 4 个 FetchReach 环境并向量化
+    num_envs = 4
+    env_fns = [make_env(i) for i in range(num_envs)]
+    vec_env = SubprocVecEnv(env_fns)
+    vec_env = VecMonitor(vec_env, filename=os.path.join("logs", "monitor.csv"))
+
+    # ===== 3. 创建 SAC + HER 模型 =====
+    model = SAC(
+        policy="MultiInputPolicy",
+        env=vec_env,
+        replay_buffer_class=HerReplayBuffer,
+        replay_buffer_kwargs=dict(
+            n_sampled_goal=4,
+            goal_selection_strategy="future",
+        ),
+        learning_starts=1000,
+        tensorboard_log='logs',
+        verbose=1,
+        batch_size=256,
+        gamma=0.98,
+        learning_rate=3e-4,
+        buffer_size=int(1e6),
+        train_freq=1,
+        gradient_steps=1,
+        policy_kwargs=dict(net_arch=[256, 256]),
+    )
+
+
+
+    # ===== 5. 开始训练 =====
+    model.learn(total_timesteps=100_000)
+
+    model.replay_buffer.her_ratio = 0.0 #关闭HER
+
+    model.learn(total_timesteps=200_000)
+
+```
+
+运行效果：
+
+![image-20250603234237627](img/image-20250603234237627.png)
