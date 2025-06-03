@@ -838,12 +838,18 @@ class HERReplayBuffer:
 
 ```
 
+##### 继续各种挣扎
+
 在小哥的代码基础上尝试：
 
-1. 按照论文进行训练过程的调整：收集16个轨迹后，进行40次mini-batch update。（没有明显起色）
-2. 对输入做rescale，减去0.5，移动分布的中心。修改了train.py和buffer.py。（好一些）
+1. 按照论文附录提到的方法进行训练过程的调整：收集16个轨迹后，进行40次mini-batch update。（没有明显起色）
+2. 对输入做rescale，减去0.5，移动分布的中心。修改了train.py和buffer.py。（成功率明显好一些）
 3. 增加设置seed的函数，尝试不同的seed
-4. 增加exploration，修改了SAC的select_action函数和所有调用它的地方（要传参数区分是train还是eval），没有显著提升，相比rescale成功率还整体跌了一些
+4. 增加exploration：修改了SAC的select_action函数以支持epsilon greedy，还修改所有调用它的地方、并进行epsilon decay，没有显著提升，相比rescale成功率还整体跌了一些
+5. 不断的减少HER的参与情况，逢1000就对k_future减一
+6. 我还试了一下[这个开源项目](https://github.com/DLR-RM/rl-baselines3-zoo)运行命令行训练，但是发现各种报错，错误解决不完。 python train.py --algo sac  --env FetchReach-v1
+
+![image-20250603163637953](img/image-20250603163637953.png)
 
 
 
