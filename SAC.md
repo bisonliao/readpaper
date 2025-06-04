@@ -377,7 +377,7 @@ def main():
             sac.replay_buffer.add( obs, next_obs, action, np.array(reward), np.array(done), {})
             obs = next_obs
             episode_reward += reward
-            if reward[0] > 200: #不能判断等于300，因为每次移动施加扭矩，都会有一定的开销
+            if reward > 200: #不能判断等于300，因为每次移动施加扭矩，都会有一定的开销
                 success = 1
 
             sac.update(batch_size)
