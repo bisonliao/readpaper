@@ -75,3 +75,331 @@ SAC与其他几个SOTA算法的实验对比：
 我们提出了soft actor-critic算法，这是一种基于最大熵框架的off-policy深度强化学习方法，能够在保持熵最大化的优势的同时，实现高效的样本利用率和训练稳定性。我们的理论分析证明了软策略迭代（Soft Policy Iteration）的收敛性，并基于此理论推导出实用的SAC算法。实验结果表明，SAC在性能上显著优于当前最先进的离线策略（如DDPG）和在线策略（如PPO）深度强化学习方法，并且在样本效率方面远超DDPG。
 
 我们的研究结果表明，随机策略+熵最大化的强化学习方法能够显著提升算法的鲁棒性和稳定性。未来，进一步探索最大熵方法（如结合二阶优化信息或更复杂的策略表示）将是一个极具潜力的研究方向。
+
+### bison的实验
+
+##### BipedalWalker
+
+训练了约24万步，表现还可以
+
+![image-20250604161325063](img/image-20250604161325063.png)
+
+showcase的日志：
+
+```
+Training completed. evaluating...
+total reward:306.76385498046875
+total reward:307.753173828125
+total reward:309.64227294921875
+total reward:308.17364501953125
+total reward:3.774566650390625
+```
+
+代码如下：
+
+```python
+
+import gymnasium as gym
+from gymnasium import Env
+import gymnasium_robotics
+import os
+import datetime
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+from collections import deque
+import random
+
+from  stable_baselines3.common.buffers import ReplayBuffer
+from torch.utils.tensorboard import SummaryWriter
+
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, log_std_min=-20, log_std_max=2):
+        super(PolicyNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+
+        self.mean = nn.Linear(256, action_dim)
+        self.log_std = nn.Linear(256, action_dim)
+
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+
+        mean = self.mean(x)
+        log_std = self.log_std(x)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std)
+
+        return mean, std
+
+    def sample(self, state):
+        mean, std = self.forward(state)
+        normal = torch.distributions.Normal(mean, std)
+        x = normal.rsample()
+        action = torch.tanh(x)
+
+        log_prob = normal.log_prob(x)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+
+        return action, log_prob
+
+
+class QNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(QNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 1)
+
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+class SAC:
+    def __init__(self, state_dim, action_dim, env:Env, device="cpu", writer=None):
+        # set hyperparameters
+        self.device = device
+        self.gamma = 0.99
+        self.tau = 0.005
+        self.alpha = 0.2
+        self.writer = writer  # type:SummaryWriter
+        self.update_count = 0
+        self.action_dim = action_dim
+
+        # initialize actor
+        self.policy = PolicyNetwork(state_dim, action_dim).to(device)
+
+        # initialize critics - we will use double Q network clipping trick
+        self.q1 = QNetwork(state_dim, action_dim).to(device)
+        self.q2 = QNetwork(state_dim, action_dim).to(device)
+        self.q1_target = QNetwork(state_dim, action_dim).to(device)
+        self.q2_target = QNetwork(state_dim, action_dim).to(device)
+
+        # copy weights to target networks
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        # adam optimizers lr=3e-4
+        self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=1e-3)
+        self.q1_optimizer = optim.Adam(self.q1.parameters(), lr=1e-3)
+        self.q2_optimizer = optim.Adam(self.q2.parameters(), lr=1e-3)
+
+        # entropy target
+        self.target_entropy = -action_dim
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=1e-3)
+
+        self.replay_buffer = ReplayBuffer(1_000_000, env.observation_space, env.action_space, device, handle_timeout_termination=False)
+
+    def select_action(self, state):
+
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action, _ = self.policy.sample(state_tensor)
+            action = action.cpu().numpy()[0]
+            action = np.clip(action, -1, 1)
+        return action
+
+    def update(self, batch_size):
+        batch = self.replay_buffer.sample(batch_size)
+        if batch is None:
+            return
+
+        self.update_count += 1
+
+        state_batch = batch.observations
+        action_batch = batch.actions
+        next_state_batch = batch.next_observations
+        reward_batch = batch.rewards
+        done_batch = batch.dones
+
+        # Convert to tensors
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        done_batch = torch.FloatTensor(done_batch).to(self.device)
+
+        # Update Q networks
+        with torch.no_grad():
+            next_action, next_log_prob = self.policy.sample(next_state_batch)
+            next_q1 = self.q1_target(next_state_batch, next_action)
+            next_q2 = self.q2_target(next_state_batch, next_action)
+            # Q network clipping trick
+            next_q = torch.min(next_q1, next_q2) - self.alpha * next_log_prob
+            target_q = reward_batch + (1 - done_batch) * self.gamma * next_q
+
+        # Q1 update
+        current_q1 = self.q1(state_batch, action_batch)
+        q1_loss = F.mse_loss(current_q1, target_q)
+        self.q1_optimizer.zero_grad()
+        q1_loss.backward()
+        self.q1_optimizer.step()
+
+        # Q2 update
+        current_q2 = self.q2(state_batch, action_batch)
+        q2_loss = F.mse_loss(current_q2, target_q)
+        self.q2_optimizer.zero_grad()
+        q2_loss.backward()
+        self.q2_optimizer.step()
+
+        # Policy update
+        new_action, log_prob = self.policy.sample(state_batch)
+        q1_new = self.q1(state_batch, new_action)
+        q2_new = self.q2(state_batch, new_action)
+        q_new = torch.min(q1_new, q2_new)
+
+        policy_loss = (self.alpha * log_prob - q_new).mean()
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
+
+        # Alpha update
+        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+        self.alpha = self.log_alpha.exp()
+
+        if self.writer and self.update_count % 200 == 0:
+            self.writer.add_scalar('SAC/q1_loss', q1_loss.item(), self.update_count)
+            self.writer.add_scalar('SAC/q2_loss', q2_loss.item(), self.update_count)
+            self.writer.add_scalar('SAC/policy_loss', policy_loss.item(), self.update_count)
+            self.writer.add_scalar('SAC/alpha_loss', alpha_loss.item(), self.update_count)
+            self.writer.add_scalar('SAC/alpha', self.alpha.item(), self.update_count)
+
+        # Update target networks
+        for param, target_param in zip(self.q1.parameters(), self.q1_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        for param, target_param in zip(self.q2.parameters(), self.q2_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+
+def set_seed(seed):
+    random.seed(seed)  # Python 的随机数种子
+    np.random.seed(seed)  # NumPy 的随机数种子
+
+    torch.manual_seed(seed)  # PyTorch 的 CPU 随机数种子
+    torch.cuda.manual_seed(seed)  # PyTorch 的 GPU 随机数种子（当前 GPU）
+    torch.cuda.manual_seed_all(seed)  # 如果使用多个 GPU
+
+    # 保证在 GPU 上的运算 deterministic（会牺牲一些性能）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def show(sac:SAC):
+
+    env = gym.make("BipedalWalker-v3", render_mode='human')
+
+    sac.policy.eval()
+
+    for _ in range(5):# 多实验几次
+        state, _= env.reset()
+        total_reward = 0
+        for i in range(2000):
+            with torch.no_grad():
+                action = sac.select_action(state)
+
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            env.render()
+            if terminated or truncated:
+                break
+            state = next_state
+        print(f"total reward:{total_reward}")
+    sac.policy.train()
+
+def main():
+    SEED = 43
+    set_seed(SEED)
+    # Set up environment
+    env = gym.make('BipedalWalker-v3', render_mode=None)
+    obs = env.reset(seed=SEED)[0]
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    print(f"action_dim:{action_dim}, state_dim:{state_dim}")
+
+    writer = SummaryWriter(log_dir=f'./logs/sac_bipedalwalker_{datetime.datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+    # Device setup
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
+
+    # Initialize SAC agent
+    sac = SAC(state_dim, action_dim, env, device=device, writer=writer)
+
+
+    # Set hyperparameters
+    max_episodes = 200  # max number of episodes to stop training
+    steps_cnt = 0
+    episode_length = 2000
+    batch_size = 256
+    success_record = deque(maxlen=100) #保留过去100个回合的胜负
+
+    for episode in range(max_episodes):
+
+        obs, _ = env.reset()
+        episode_reward = 0
+        episode_len = 0
+        success = 0
+        for t in range(episode_length):
+            # Create the state input by concatenating observation and desired goal
+            state = obs
+            # 跟踪输入的scale，如果太离谱，要做rescale
+            if steps_cnt % 1000 == 3:
+                writer.add_scalar("state/min", state.min(), steps_cnt)
+                writer.add_scalar("state/max", state.max(), steps_cnt)
+                writer.add_scalar("state/mean", state.mean(), steps_cnt)
+
+            # Select action
+            action = sac.select_action(state)
+
+            # Step in the environment
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            steps_cnt += 1
+            episode_len += 1
+
+
+            # Append transition to buffer
+            sac.replay_buffer.add( obs, next_obs, action, np.array(reward), np.array(done), {})
+            obs = next_obs
+            episode_reward += reward
+            if reward[0] > 200: #不能判断等于300，因为每次移动施加扭矩，都会有一定的开销
+                success = 1
+
+            sac.update(batch_size)
+
+            if done:
+                break
+
+        success_record.append(success)
+
+        writer.add_scalar("episode/succeed_ratio", success_record.count(1) / 100.0, episode)
+        writer.add_scalar("episode/episode_reward", episode_reward, episode)
+        writer.add_scalar("episode/episode_len", episode_len, episode)
+        if episode % 20 == 0:
+            print(f"Episode {episode}, Reward: {episode_reward}")
+
+    print("Training completed. evaluating...")
+    env.close()
+    show(sac)
+    torch.save(sac, "./sac.pkl")
+
+
+if __name__ == "__main__":
+    main()
+```
+
