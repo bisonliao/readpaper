@@ -282,7 +282,7 @@ if __name__ == "__main__":
 ![image-20250524231102868](img/image-20250524231102868.png)
 
 ```shell
-# PPO训练的agent的行走得分。RPO的网络保存，250分左右
+# PPO训练的agent的行走得分。RPO的忘了保存，250分左右
 total reward=293.80
 total reward=295.48
 total reward=297.90
