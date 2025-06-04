@@ -195,8 +195,7 @@ def train():
             state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
             with torch.no_grad():
                 mean, std = policy(state_tensor.unsqueeze(0))
-            mean = perturb_mean(mean)
-
+            
             dist = Independent(Normal(mean, std), 1)
             action_raw = dist.rsample()
             action = torch.tanh(action_raw) * 2.0
@@ -437,7 +436,7 @@ def train():
             state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
             with torch.no_grad():
                 mean, std = policy(state_tensor.unsqueeze(0))
-            mean = perturb_mean(mean, alpha)
+            
 
             dist = Independent(Normal(mean, std), 1)
             action_raw = dist.rsample()
@@ -750,8 +749,7 @@ def train():
             state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
             with torch.no_grad():
                 mean, std = policy(state_tensor)
-            mean = perturb_mean(mean, alpha)
-
+           
             dist = Independent(Normal(mean, std), 1)
             action_raw = dist.rsample()
             action = torch.tanh(action_raw)
