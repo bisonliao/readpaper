@@ -12,6 +12,11 @@
 2. Even in the absence of any extrinsic rewards, a curious agent learns good exploration policies.
 3. the proposed method enables an agent to learn generalizable skills even in the absence of an explicit goal: the exploration policy learned in the first level of Mario helps the agent explore subsequent levels faster.
 
+第一点比较费解，AI解释：
+
+- 逆模型的训练目标仅仅是**准确预测动作**，因此它只会关注那些**与动作因果关联的状态变化**。
+- 如果环境中的某些变化（如树叶摇动、光照变化）与Agent的动作无关，逆模型会**忽略这些变化**，不会将它们编码到 *ϕ*(*s*) 中。
+
 ### Curiosity-Driven Exploration
 
 #### 算法原理
