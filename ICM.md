@@ -315,7 +315,11 @@ https://github.com/chagmgang/pytorch_ppo_rl
 3. 自定义Policy，也就是将ICM作为策略的一部分，通过重写`predict()`和`learn()`方法集成。适合与SAC等既有策略共享特征提取层
 4. 直接继承Gym的Env类，定制化修改环境的reward，插入自己的ICM结构和训练过程，也是一个方案。但它类似1，在VecEnv下怎么搞？是一个环境一套ICM，还是要共用一套
 
-#### 疯狂的赛车
+#### 疯狂的赛车 （失败）
+
+在鼓励探索方面有一定的帮助，x方向最远走到过9m，也就是第二个拐弯处，小车会拐入第二段直道。但后来情况似乎变糟糕了。
+
+![image-20250606163940691](img/image-20250606163940691.png)
 
 修改环境的代码，把ICM机制嵌入进去：
 
@@ -341,18 +345,7 @@ from torch.distributions import Categorical
 
 # 全局超参数（来自论文Section 3）
 class Config:
-    # 输入预处理
-    INPUT_SIZE = (42, 42)          # 输入图像resize尺寸
-    INPUT_CHANNELS = 4             # 堆叠的帧数（当前帧 + 过去3帧）
-    ACTION_REPEAT = 4              # VizDoom的动作重复次数
-    GRAYSCALE = True               # 是否转为灰度图
 
-    # A3C网络参数
-    A3C_CONV_FILTERS = [32, 32, 32, 32]  # 4层卷积的滤波器数
-    A3C_CONV_KERNEL = 3           # 卷积核大小
-    A3C_CONV_STRIDE = 2           # 卷积步长
-    A3C_CONV_PADDING = 1          # 卷积padding
-    A3C_LSTM_UNITS = 256           # LSTM隐藏单元数
 
     # ICM网络参数
     ICM_FEATURE_DIM = 288          # 逆模型输出的特征维度
@@ -367,6 +360,7 @@ class Config:
     LR = 1e-3                      # 学习率（ADAM优化器）
     GAMMA = 0.99                   # 奖励折扣因子
     ENTROPY_BETA = 0.01           # 熵正则化系数
+    BATCH_SZ = 64
 
 class InverseModel(nn.Module):
     def __init__(self):
@@ -387,9 +381,11 @@ class InverseModel(nn.Module):
 class ICM(nn.Module):
     def __init__(self):
         super(ICM, self).__init__()
-        # 共享的特征编码器（4层卷积，与A3C相同但独立）
+        # 共享的特征编码器
         self.feature_encoder = nn.Sequential(
+            nn.LayerNorm(9),  # 输入标准化（可选）
             nn.Linear(9, Config.ICM_FEATURE_FC_UNITS),
+            nn.LayerNorm(Config.ICM_FEATURE_FC_UNITS),
             nn.ELU(),
             nn.Linear(Config.ICM_FEATURE_FC_UNITS, Config.ICM_FEATURE_DIM),
             nn.ELU()
@@ -415,7 +411,7 @@ class ICM(nn.Module):
         # 逆模型损失
         inverse_input = torch.cat([phi_state, phi_next_state], dim=1)
         pred_action = self.inverse_model(inverse_input)
-        inverse_loss = nn.CrossEntropyLoss()(pred_action, action)
+        inverse_loss = nn.MSELoss()(pred_action, action)
 
         # 前向模型损失
         forward_input = torch.cat([phi_state, action], dim=1)
@@ -440,16 +436,17 @@ class RaceCarEnv(gym.Env):
     """
 
     def __init__(self, writer:SummaryWriter, render=False,fps=100):
-        """
-        初始化环境
-        Args:
-            render (bool): 是否开启GUI渲染
-        """
+        # 检测是否在并行环境中运行
+        if hasattr(self, 'metadata') and 'is_vector_env' in self.metadata and self.metadata['is_vector_env']:
+            raise RuntimeError(
+                "RaceCarEnv does not support parallel execution with SB3 VecEnv. "
+                "Please use a single instance of the environment."
+            )
         super(RaceCarEnv, self).__init__()
         self.writer = writer
         self.icm = ICM()
         self.buffer = []
-        self.adm = torch.optim.Adam(self.icm.parameters(), lr=1e-4)
+        self.adm = torch.optim.Adam(self.icm.parameters(), lr=Config.LR)
 
         # 连接物理引擎
         if render:
@@ -582,8 +579,8 @@ class RaceCarEnv(gym.Env):
 
         return wall_id
 
-    def _train_icm(self):
-        batchsz = 64
+    def _train_icm(self, it:int):
+        batchsz = Config.BATCH_SZ
         sample_num = len(self.buffer)
         if batchsz > sample_num:
             return
@@ -607,7 +604,7 @@ class RaceCarEnv(gym.Env):
             actions_tensor = torch.FloatTensor(actions)
 
             intrinsic_reward, inverse_loss, forward_loss = self.icm.forward(states_tensor, next_states_tensor, actions_tensor)
-            if i == 0:
+            if i == 0 and it == 0:
                 self.writer.add_scalar("steps/inverse_loss", inverse_loss.mean(), self.total_step)
                 self.writer.add_scalar("steps/forward_loss", forward_loss.mean(), self.total_step)
             loss = ( (1-Config.ICM_BETA) * inverse_loss + Config.ICM_BETA * forward_loss).mean()
@@ -656,9 +653,9 @@ class RaceCarEnv(gym.Env):
             self.recordVedio = False
 
         # 训练ICM
-        if self.buffer:
-            for _ in range(4):
-                self._train_icm()
+        if len(self.buffer) > (Config.BATCH_SZ*2):
+            for it in range(10):
+                self._train_icm(it)
             self.buffer = []
 
         # 获取初始状态
@@ -693,7 +690,7 @@ class RaceCarEnv(gym.Env):
         state = self._get_state()
 
         # 计算奖励
-        reward, done = self._compute_reward(state)
+        external_reward, done = self._compute_reward(state)
         #记录回合结束的时候的位置
         if done:
             self.writer.add_scalar("steps/pos_x", state[0], self.total_step)
@@ -711,15 +708,16 @@ class RaceCarEnv(gym.Env):
 
         # 计算ICM的内部激励
         inner_reward = self._calc_inner_reward(self.prev_state, state, action)
-        reward += inner_reward
+        reward = external_reward + inner_reward
         if self.total_step % 100 == 0:
             self.writer.add_scalar("steps/inner_reward", inner_reward, self.total_step)
+            self.writer.add_scalar("steps/external_reward", external_reward, self.total_step)
 
 
         info = {
             "steps": self.current_step,
-            "position": state,
-            "is_success": done and reward > 0
+            "position": state[:2],
+            "is_success": done and external_reward > 0
         }
 
         # 累计轨迹信息用于ICM训练
@@ -888,5 +886,832 @@ AI说：
         """关闭环境"""
         p.disconnect()
 
+```
+
+训练的代码：
+
+```python
+import datetime
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecMonitor
+from stable_baselines3.common.env_checker import check_env
+from racecar_env import RaceCarEnv
+from stable_baselines3 import SAC
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(log_dir=f"logs/RaceCarEnv_{datetime.datetime.now().strftime('%y%m%d_%H%M%S')}")
+env = RaceCarEnv(writer, render=False)
+# It will check your custom environment and output additional warnings if needed
+check_env(env)
+
+env = DummyVecEnv([lambda: env])
+env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0) #对环境的输出（观测、奖励）进行归一化标准化
+env = VecMonitor(env)
+
+# 2. 初始化PPO算法
+model = SAC("MlpPolicy", env, verbose=1, tensorboard_log=f"logs/", ent_coef='auto_0.3',
+            policy_kwargs=dict( log_std_init=0.5) )
+
+# 3. 训练10,000步
+model.learn(total_timesteps=5_000_000)
+
+env.close()
+```
+
+
+
+#### FetchReach （失败）
+
+2400多个episode下来，success rate也没有起色，而HER算法在200多episode的时候成功率开始上升。
+
+![image-20250606175018597](img/image-20250606175018597.png)
+
+```python
+import datetime
+
+import gymnasium as gym
+from gymnasium import spaces
+import gymnasium_robotics
+import numpy as np
+
+
+from torch.utils.tensorboard import SummaryWriter
+import math
+import imageio
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Categorical
+import random
+
+# 全局超参数（来自论文Section 3）
+class Config:
+
+    # ICM网络参数
+    ICM_FEATURE_DIM = 288          # 逆模型输出的特征维度
+    ICM_FEATURE_FC_UNITS = 256      # 特征提取网络的FC单元数
+    ICM_FORWARD_FC_UNITS = 256    # 前向模型的FC层单元数
+    ICM_INVERSE_FC_UNITS = 256    # 逆模型的FC层单元数
+    ICM_BETA = 0.2                 # 前向/逆模型损失权重（Equation 7）
+    ICM_LAMBDA = 0.1               # 策略梯度与ICM损失的权重（Equation 7）
+    ICM_ETA = 1000                  # 内在奖励缩放因子（Equation 6）
+
+    # 训练参数
+    LR = 1e-3                      # 学习率（ADAM优化器）
+    GAMMA = 0.99                   # 奖励折扣因子
+    ENTROPY_BETA = 0.01           # 熵正则化系数
+    BATCH_SZ = 64
+
+class InverseModel(nn.Module):
+    def __init__(self):
+        super(InverseModel, self).__init__()
+        self.inverse_model = nn.Sequential(
+            nn.Linear(Config.ICM_FEATURE_DIM * 2, Config.ICM_INVERSE_FC_UNITS),
+            nn.ELU(),
+            nn.Linear(Config.ICM_INVERSE_FC_UNITS, 4)
+        )
+    def forward(self, x):
+        x = self.inverse_model(x)
+        x = F.tanh(x)
+        return x
+
+
+class ICM(nn.Module):
+    def __init__(self):
+        super(ICM, self).__init__()
+        # 共享的特征编码器
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(10, Config.ICM_FEATURE_FC_UNITS),
+            nn.ELU(),
+            nn.Linear(Config.ICM_FEATURE_FC_UNITS, Config.ICM_FEATURE_DIM),
+            nn.ELU()
+        )
+
+        # 逆模型（动作预测）
+        self.inverse_model = InverseModel()
+
+        # 前向模型（状态预测）
+        self.forward_model = nn.Sequential(
+            nn.Linear(Config.ICM_FEATURE_DIM + 4, Config.ICM_FORWARD_FC_UNITS),
+            nn.ELU(),
+            nn.Linear(Config.ICM_FORWARD_FC_UNITS, Config.ICM_FEATURE_DIM)
+        )
+
+    def forward(self, state, next_state, action):
+        # 编码状态特征
+        phi_state = self.feature_encoder(state)
+        phi_state = phi_state.view(phi_state.size(0), -1)  # [batch, 288]
+        phi_next_state = self.feature_encoder(next_state)
+        phi_next_state = phi_next_state.view(phi_next_state.size(0), -1)
+
+        # 逆模型损失
+        inverse_input = torch.cat([phi_state, phi_next_state], dim=1)
+        pred_action = self.inverse_model(inverse_input)
+        inverse_loss = nn.MSELoss()(pred_action, action)
+
+        # 前向模型损失
+        forward_input = torch.cat([phi_state, action], dim=1)
+        pred_phi_next_state = self.forward_model(forward_input)
+        forward_loss = 0.5 * (pred_phi_next_state - phi_next_state.detach()).pow(2).mean()
+
+        # 内在奖励（特征空间的预测误差）
+        intrinsic_reward = Config.ICM_ETA * 0.5 * (pred_phi_next_state - phi_next_state).pow(2).mean(dim=1)
+
+        return intrinsic_reward, inverse_loss, forward_loss
+
+
+class CustomFetchReachEnv(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        # 检测是否在并行环境中运行
+        if hasattr(self, 'metadata') and 'is_vector_env' in self.metadata and self.metadata['is_vector_env']:
+            raise RuntimeError(
+                "RaceCarEnv does not support parallel execution with SB3 VecEnv. "
+                "Please use a single instance of the environment."
+            )
+        super().__init__()
+
+        self.writer = SummaryWriter(log_dir=f'logs/fetchreach/fetchreach_env_{datetime.datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10,)) # 简化后的状态
+
+        self.icm = ICM()
+        self.buffer = []
+        self.adm = torch.optim.Adam(self.icm.parameters(), lr=Config.LR)
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+
+    def _train_icm(self, it:int):
+        batchsz = Config.BATCH_SZ
+        sample_num = len(self.buffer)
+        if sample_num <= 1:
+            return
+        random_indices = random.sample(range(sample_num), sample_num)  # 生成不重复的随机序列
+        for i in range(0, sample_num, batchsz):
+            start = i
+            end = min(i+batchsz, sample_num)
+
+            batch_idx = random_indices[start:end]
+            batch = [self.buffer[i] for i in batch_idx]
+            # 拆分三元组
+            states, next_states, actions = zip(*batch)
+
+            # 转换为NumPy数组（可选）
+            states = np.stack(states)  # shape: (B, 9)
+            next_states = np.stack(next_states)  # shape: (B, 9)
+            actions = np.stack(actions)  # shape: (B, 1)
+
+            states_tensor = torch.FloatTensor(states)
+            next_states_tensor = torch.FloatTensor(next_states)
+            actions_tensor = torch.FloatTensor(actions)
+
+            intrinsic_reward, inverse_loss, forward_loss = self.icm.forward(states_tensor, next_states_tensor, actions_tensor)
+            if i == 0 and it == 0:
+                self.writer.add_scalar("steps/inverse_loss", inverse_loss.mean(), self.total_step)
+                self.writer.add_scalar("steps/forward_loss", forward_loss.mean(), self.total_step)
+            loss = ( (1-Config.ICM_BETA) * inverse_loss + Config.ICM_BETA * forward_loss).mean()
+            self.adm.zero_grad()
+            loss.backward()
+            self.adm.step()
+
+    def _calc_inner_reward(self, state, next_state, action):
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+        action_tensor = torch.FloatTensor(action).unsqueeze(0)
+        with torch.no_grad():
+            intrinsic_reward, inverse_loss, forward_loss = self.icm.forward(state_tensor, next_state_tensor, action_tensor)
+        return intrinsic_reward.item()
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+        obs, info = self._env.reset(seed=seed, options=options)
+        state = obs['observation']
+        info['desired_goal'] = obs['desired_goal']
+
+        # 训练ICM
+        if len(self.buffer) > Config.BATCH_SZ*2:
+            for it in range(10):
+                self._train_icm(it)
+            self.buffer = []
+
+        self.prev_state = state
+
+        return state, info
+
+    def step(self, action):
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        state = obs['observation']
+        info['desired_goal'] = obs['desired_goal']
+
+        if self.total_step % 997 == 0:
+            print(f"state sample:{state}")
+
+        #我自行判断是否成功了，并修改外部reward
+        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+        if success:
+            external_reward = 1
+            terminated = True
+        else:
+            external_reward = 0
+
+        # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
+        info["is_success"] = success
+
+        # 计算ICM的内部激励
+        inner_reward = self._calc_inner_reward(self.prev_state, state, action)
+        reward = external_reward + inner_reward
+        if self.total_step % 100 == 0:
+            self.writer.add_scalar("steps/inner_reward", inner_reward, self.total_step)
+            self.writer.add_scalar("steps/external_reward", external_reward, self.total_step)
+
+        # 累计轨迹信息用于ICM训练
+        self.buffer.append( (self.prev_state, state, action))
+        self.prev_state = state
+
+
+        return state, reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+```
+
+训练的代码：
+
+```python
+
+import gymnasium as gym
+import torch
+
+from CustomFetchReach import CustomFetchReachEnv
+from stable_baselines3 import SAC
+
+
+env = CustomFetchReachEnv()
+
+model = SAC(
+        policy="MlpPolicy",
+        env=env,
+
+        learning_starts=1000,
+        tensorboard_log='logs/fetchreach',
+        verbose=1,
+        batch_size=256,
+        gamma=0.98,
+        learning_rate=3e-4,
+        buffer_size=int(1e6),
+        train_freq=1,
+        gradient_steps=1,
+        policy_kwargs=dict(net_arch=[256, 256]),
+    )
+
+model.learn(total_timesteps=1_000_000)
+
+env.close()
+test_env = CustomFetchReachEnv(render_mode='human')
+obs, _ = test_env.reset()
+done = False
+torch.save(model, "./CustomFetchReach.pth")
+
+while not done:
+    action,_ = model.predict(observation=obs)
+    obs, reward, terminated, truncated, info = test_env.step(action)
+    test_env.render()
+    done = terminated or truncated
+
+
+```
+
+#### 一个文件的FetchReach (失败)
+
+![image-20250606205142531](img/image-20250606205142531.png)
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal
+from collections import deque, namedtuple
+import random
+import gymnasium as gym
+import gymnasium_robotics
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# 定义设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+writer = SummaryWriter(log_dir=f'logs/fetchreach2_{datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+# 经验回放缓冲区
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done'))
+
+# 环境的再封装
+class CustomFetchReachEnv(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        # 检测是否在并行环境中运行
+        if hasattr(self, 'metadata') and 'is_vector_env' in self.metadata and self.metadata['is_vector_env']:
+            raise RuntimeError(
+                "RaceCarEnv does not support parallel execution with SB3 VecEnv. "
+                "Please use a single instance of the environment."
+            )
+        super().__init__()
+
+
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10,))  # 简化后的状态
+
+
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+        obs, info = self._env.reset(seed=seed, options=options)
+        state = obs['observation']
+        info['desired_goal'] = obs['desired_goal']
+
+        return state, info
+
+    def step(self, action):
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        state = obs['observation']
+        info['desired_goal'] = obs['desired_goal']
+
+
+
+        # 我自行判断是否成功了，并修改外部reward
+        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+        if success:
+            external_reward = 1
+            terminated = True
+        else:
+            external_reward = 0
+
+        # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
+        info["is_success"] = success
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, *args):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = Transition(*args)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# ICM模块实现
+class ICM(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, eta=1000):
+        super(ICM, self).__init__()
+        self.eta = eta  # 内在奖励缩放因子
+
+        # 逆动力学模型: 预测动作 (phi(s_t), phi(s_t+1)) -> a_t
+        self.inverse_model = nn.Sequential(
+            nn.Linear(state_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+        # 前向动力学模型: 预测下一状态特征 (phi(s_t), a_t) -> phi(s_t+1)
+        self.forward_model = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, state_dim)
+        )
+
+        # 状态编码器: s_t -> phi(s_t)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, state_dim)
+        )
+
+    def forward(self, state, next_state, action):
+        # 编码状态
+        phi_state = self.state_encoder(state)
+        phi_next_state = self.state_encoder(next_state)
+
+        # 逆动力学预测
+        inverse_input = torch.cat([phi_state, phi_next_state], dim=1)
+        pred_action = self.inverse_model(inverse_input)
+
+        # 前向动力学预测
+        forward_input = torch.cat([phi_state, action], dim=1)
+        pred_next_state = self.forward_model(forward_input)
+
+        return phi_state, phi_next_state, pred_action, pred_next_state
+
+    def compute_intrinsic_reward(self, state, next_state, action):
+        with torch.no_grad():
+            # 编码状态
+            phi_state = self.state_encoder(state)
+            phi_next_state = self.state_encoder(next_state)
+
+            # 前向预测
+            forward_input = torch.cat([phi_state, action], dim=1)
+            pred_next_state = self.forward_model(forward_input)
+
+            # 计算内在奖励 (前向预测误差)
+            intrinsic_reward = self.eta * 0.5 * F.mse_loss(pred_next_state, phi_next_state, reduction='none').mean(
+                dim=1, keepdim=True)
+
+        return intrinsic_reward
+
+
+# SAC Actor网络
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, max_action, hidden_dim=256):
+        super(Actor, self).__init__()
+        self.max_action = max_action
+
+        self.l1 = nn.Linear(state_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, state):
+        x = F.relu(self.l1(state))
+        x = F.relu(self.l2(x))
+
+        mean = self.mean(x)
+        log_std = self.log_std(x)
+        log_std = torch.clamp(log_std, min=-20, max=2)
+
+        return mean, log_std
+
+    def sample(self, state):
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+        normal = Normal(mean, std)
+
+        # 重参数化技巧
+        z = normal.rsample()
+        action = torch.tanh(z)
+        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+
+        action = action * self.max_action
+
+        return action, log_prob, z, mean, log_std
+
+
+# SAC Critic网络
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super(Critic, self).__init__()
+
+        # Q1网络
+        self.l1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim, 1)
+
+        # Q2网络
+        self.l4 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.l5 = nn.Linear(hidden_dim, hidden_dim)
+        self.l6 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, state, action):
+        sa = torch.cat([state, action], dim=1)
+
+        q1 = F.relu(self.l1(sa))
+        q1 = F.relu(self.l2(q1))
+        q1 = self.l3(q1)
+
+        q2 = F.relu(self.l4(sa))
+        q2 = F.relu(self.l5(q2))
+        q2 = self.l6(q2)
+
+        return q1, q2
+
+
+# SAC+ICM算法
+class SAC_ICM:
+    def __init__(self, state_dim, action_dim, max_action):
+        self.max_action = max_action
+        self.gamma = 0.99  # 折扣因子
+        self.tau = 0.005  # 软更新系数
+        self.alpha = 0.2  # 温度系数
+
+        # 初始化网络
+        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic_target = Critic(state_dim, action_dim).to(device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+        # ICM模块
+        self.icm = ICM(state_dim, action_dim).to(device)
+
+        # 优化器
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
+        self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=3e-4)
+
+        # 经验回放
+        self.replay_buffer = ReplayBuffer(1000000)
+
+        # 自动调整温度系数
+        self.target_entropy = -torch.prod(torch.Tensor(action_dim).to(device)).item()
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        self.total_step = 1
+
+    def select_action(self, state, evaluate=False):
+        state = torch.FloatTensor(state).to(device).unsqueeze(0)
+        if evaluate:
+            with torch.no_grad():
+                _, _, action, _, _ = self.actor.sample(state)
+            return action.cpu().data.numpy().flatten()
+        else:
+            with torch.no_grad():
+                action, _, _, _, _ = self.actor.sample(state)
+            return action.cpu().data.numpy().flatten()
+
+    def update(self, batch_size):
+        if len(self.replay_buffer) < batch_size:
+            return
+
+        # 从回放缓冲区采样
+        transitions = self.replay_buffer.sample(batch_size)
+        batch = Transition(*zip(*transitions))
+
+        state = torch.FloatTensor(np.array(batch.state)).to(device)
+        action = torch.FloatTensor(np.array(batch.action)).to(device)
+        next_state = torch.FloatTensor(np.array(batch.next_state)).to(device)
+        reward = torch.FloatTensor(np.array(batch.reward)).unsqueeze(1).to(device)
+        done = torch.FloatTensor(np.array(batch.done)).unsqueeze(1).to(device)
+
+        # 计算内在奖励
+        intrinsic_reward = self.icm.compute_intrinsic_reward(state, next_state, action)
+        total_reward = reward + intrinsic_reward
+        if self.total_step % 100 == 0: writer.add_scalar('steps/intrinsic_reward', intrinsic_reward.mean().item(), self.total_step)
+        if self.total_step % 100 == 0: writer.add_scalar('steps/external_reward', reward.mean().item(), self.total_step)
+
+
+        # 更新ICM模块
+        phi_state, phi_next_state, pred_action, pred_next_state = self.icm(state, next_state, action)
+
+        # 逆动力学损失
+        inverse_loss = F.mse_loss(pred_action, action)
+
+        # 前向动力学损失
+        forward_loss = F.mse_loss(pred_next_state, phi_next_state.detach())
+
+        if self.total_step % 100 == 0: writer.add_scalar('steps/inverse_loss', inverse_loss.item(), self.total_step)
+        if self.total_step % 100 == 0: writer.add_scalar('steps/forward_loss', forward_loss.item(), self.total_step)
+
+        # 总ICM损失
+        icm_loss = (1 - 0.2) * inverse_loss + 0.2 * forward_loss
+
+        self.icm_optimizer.zero_grad()
+        icm_loss.backward()
+        self.icm_optimizer.step()
+
+        # 更新Critic
+        with torch.no_grad():
+            next_action, next_log_prob, _, _, _ = self.actor.sample(next_state)
+            q1_next, q2_next = self.critic_target(next_state, next_action)
+            q_next = torch.min(q1_next, q2_next) - self.alpha * next_log_prob
+            target_q = total_reward + (1 - done) * self.gamma * q_next
+
+        current_q1, current_q2 = self.critic(state, action)
+        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+        if self.total_step % 100 == 0: writer.add_scalar('steps/critic_loss', critic_loss.item(), self.total_step)
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # 更新Actor
+        pi, log_pi, _, _, _ = self.actor.sample(state)
+        q1_pi, q2_pi = self.critic(state, pi)
+        q_pi = torch.min(q1_pi, q2_pi)
+
+        actor_loss = (self.alpha * log_pi - q_pi).mean()
+        if self.total_step % 100 == 0: writer.add_scalar('steps/actor_loss', actor_loss.item(), self.total_step)
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # 更新温度系数
+        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+        if self.total_step % 100 == 0: writer.add_scalar('steps/alpha_loss', alpha_loss.item(), self.total_step)
+
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
+        self.alpha = self.log_alpha.exp()
+        if self.total_step % 100 == 0: writer.add_scalar('steps/alpha', self.alpha, self.total_step)
+
+        # 软更新目标网络
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+    def save(self, filename):
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'icm': self.icm.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+            'icm_optimizer': self.icm_optimizer.state_dict(),
+            'log_alpha': self.log_alpha,
+            'alpha_optimizer': self.alpha_optimizer.state_dict(),
+        }, filename)
+
+    def load(self, filename):
+        checkpoint = torch.load(filename)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
+        self.critic_target.load_state_dict(checkpoint['critic_target'])
+        self.icm.load_state_dict(checkpoint['icm'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
+        self.log_alpha = checkpoint['log_alpha']
+        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
+
+
+# 训练函数
+def train(env, agent, max_episodes, max_steps, batch_size):
+    episode_rewards = []
+
+    results = deque(maxlen=100)
+
+    for episode in tqdm(range(max_episodes), 'train'):
+        state,_ = env.reset()
+        episode_reward = 0
+
+        for step in range(max_steps):
+            action = agent.select_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            agent.total_step += 1
+            if reward > 0:
+                results.append(1)
+            else:
+                results.append(0)
+
+            # 存储经验
+            agent.replay_buffer.push(state, action, next_state, reward, done)
+
+            state = next_state
+            episode_reward += reward
+
+            # 更新网络
+            if len(agent.replay_buffer) > batch_size:
+                agent.update(batch_size)
+
+            if done:
+                break
+
+        episode_rewards.append(episode_reward)
+        writer.add_scalar('steps/success_rate', results.count(1) / 100, agent.total_step)
+
+
+        # 每100个episode保存一次模型
+        if (episode + 1) % 1000 == 0:
+            agent.save(f"sac_icm_checkpoint_{episode + 1}.pth")
+
+    return episode_rewards
+
+
+# 主函数
+if __name__ == "__main__":
+    # 创建环境
+    env = CustomFetchReachEnv()
+
+    # 获取环境参数
+    state_dim = env.observation_space.shape[0]  # 10维状态
+    action_dim = env.action_space.shape[0]  # 动作维度
+    max_action = float(env.action_space.high[0])  # 最大动作值
+
+    # 初始化SAC+ICM智能体
+    agent = SAC_ICM(state_dim, action_dim, max_action)
+
+    # 训练参数
+    max_episodes = 1000  # 最大训练episode数
+    max_steps = 100  # 每个episode最大步数
+    batch_size = 256  # 批量大小
+
+    # 开始训练
+    episode_rewards = train(env, agent, max_episodes, max_steps, batch_size)
+
+    # 保存最终模型
+    agent.save("sac_icm_final.pth")
+
+    # 关闭环境
+    env.close()
 ```
 
