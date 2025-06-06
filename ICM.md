@@ -379,8 +379,8 @@ class InverseModel(nn.Module):
     def forward(self, x):
         x = self.inverse_model(x)
         # 输出一个确定的动作，包括两个维度
-        action1 = F.tanh(x[:, 0])
-        action2 = F.sigmoid(x[:,1])
+        action1 = F.tanh(x[:, [0]])
+        action2 = F.sigmoid(x[:,[1]])
         return torch.cat([action1, action2], dim=1)
 
 
@@ -585,12 +585,15 @@ class RaceCarEnv(gym.Env):
     def _train_icm(self):
         batchsz = 64
         sample_num = len(self.buffer)
+        if batchsz > sample_num:
+            return
         random_indices = random.sample(range(sample_num), sample_num)  # 生成不重复的随机序列
         for i in range(0, sample_num, batchsz):
             start = i
             end = min(i+batchsz, sample_num)
+
             batch_idx = random_indices[start:end]
-            batch = self.buffer[batch_idx]
+            batch = [self.buffer[i] for i in batch_idx]
             # 拆分三元组
             states, next_states, actions = zip(*batch)
 
@@ -604,9 +607,10 @@ class RaceCarEnv(gym.Env):
             actions_tensor = torch.FloatTensor(actions)
 
             intrinsic_reward, inverse_loss, forward_loss = self.icm.forward(states_tensor, next_states_tensor, actions_tensor)
-            self.writer.add_scalar("steps/inverse_loss", inverse_loss.mean(), self.total_step)
-            self.writer.add_scalar("steps/forward_loss", forward_loss.mean(), self.total_step)
-            loss = (Config.ICM_BETA * inverse_loss + (1-Config.ICM_BETA) * forward_loss).mean()
+            if i == 0:
+                self.writer.add_scalar("steps/inverse_loss", inverse_loss.mean(), self.total_step)
+                self.writer.add_scalar("steps/forward_loss", forward_loss.mean(), self.total_step)
+            loss = ( (1-Config.ICM_BETA) * inverse_loss + Config.ICM_BETA * forward_loss).mean()
             self.adm.zero_grad()
             loss.backward()
             self.adm.step()
@@ -617,7 +621,8 @@ class RaceCarEnv(gym.Env):
         action_tensor = torch.FloatTensor(action).unsqueeze(0)
         with torch.no_grad():
             intrinsic_reward, inverse_loss, forward_loss = self.icm.forward(state_tensor, next_state_tensor, action_tensor)
-        return intrinsic_reward
+        return intrinsic_reward.item()
+
 
     def reset(self, seed=None):
         """重置环境到初始状态"""
@@ -641,22 +646,20 @@ class RaceCarEnv(gym.Env):
 
         #抽样录一个回合视频
         if self.recordVedio and len(self.frames) > 10:
-            imageio.mimsave(f"./racecar_{datetime.datetime.now().strftime('%H%M%S')}.mp4", self.frames, format='FFMPEG', fps=self.fps)
+            imageio.mimsave(f"./logs/racecar_{datetime.datetime.now().strftime('%H%M%S')}.mp4", self.frames, format='FFMPEG', fps=self.fps)
             self.writer.add_scalar("steps/saveMP4", 1, self.total_step)
 
         self.frames = []
-        if random.randint(0, 10) < 1:
+        if random.randint(0, 40) < 1:
             self.recordVedio = True
         else:
             self.recordVedio = False
 
-
+        # 训练ICM
         if self.buffer:
-            self.train_icm()
+            for _ in range(4):
+                self._train_icm()
             self.buffer = []
-
-
-
 
         # 获取初始状态
         state = self._get_state()
@@ -706,6 +709,7 @@ class RaceCarEnv(gym.Env):
             rgb = self._render_camera_frame()
             self.frames.append(rgb)
 
+        # 计算ICM的内部激励
         inner_reward = self._calc_inner_reward(self.prev_state, state, action)
         reward += inner_reward
         if self.total_step % 100 == 0:
@@ -718,12 +722,11 @@ class RaceCarEnv(gym.Env):
             "is_success": done and reward > 0
         }
 
-        # 更新最后位置
-        self.last_pos = state[:2]
-
-
+        # 累计轨迹信息用于ICM训练
         self.buffer.append( (self.prev_state, state, action))
         self.prev_state = state
+        # 更新最后位置
+        self.last_pos = state[:2]
 
         return state, reward, done, truncated, info
 
@@ -873,36 +876,7 @@ AI说：
             self.writer.add_scalar("steps/reachGoal", 1, self.total_step)
             return  reward, done
 
-        '''# 3. 检查是否获得金币
-        if self.coins:
-            for coin in self.coins:
-                distance = np.linalg.norm(state[:2] - np.array(coin))
-                if distance <  1.0:
-                    reward += 0.3
-                    self.coins.remove(coin)
-                    self.writer.add_scalar("steps/hitCoin", 1, self.total_step)
-                    break'''
 
-        # 4. 移动距离奖励 (鼓励远离出发点)
-        # 这里的计算不具备普适性，是利用了地图上赛道的特别形状，只适用于特例
-        distance_new = np.linalg.norm(state[:2] - np.array([0,0]) )
-        distance_prev = np.linalg.norm(self.last_pos - np.array([0, 0]))
-        if abs(distance_new - distance_prev) < (5e-3): #不动或者很低速度的移动，处罚
-            distance_penalty = -0.1
-        else:
-            distance_penalty = (distance_new - distance_prev) #鼓励远离出发点
-        reward += distance_penalty
-        if self.total_step % 100 == 0:
-            self.writer.add_scalar("steps/distancePenalty", distance_penalty, self.total_step)
-
-        '''
-        # 5. 耗时负奖励（鼓励最快到达终点，时间要短）
-        # 60s内到达的话，那么每个step
-        time_penalty = -3.0 / (60*self.fps)
-        reward += time_penalty
-        if self.total_step % 100 == 0:
-            self.writer.add_scalar("steps/timePenalty", time_penalty, self.total_step)
-        '''
 
         return reward, done
 
