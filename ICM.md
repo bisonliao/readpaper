@@ -956,7 +956,7 @@ fetchReach这个任务，除了奖励稀疏，和以往的任务不同的地方�
 
 
 
-5000个回合下来，偶尔有零星的成功的回合，没有收敛，失败：
+5000个回合下来，偶尔有零星的成功的回合，没有收敛，失败了。 其中SAC的代码是没有明显问题的，因为我修改一下env就可以再BipedalWalker任务上很好的收敛，见下图右下角的橘色曲线。
 
 ![image-20250607222643686](img/image-20250607222643686.png)
 
@@ -1049,15 +1049,15 @@ class CustomFetchReachEnv(gym.Env):
         state = np.concat( [obs['observation'],obs['desired_goal'] ] )
         info['desired_goal'] = obs['desired_goal']
 
-        # 我自行构造一些奖励，看能否引导收敛
-        current_dist = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal'])
-        prev_dist = np.linalg.norm(self.prev_achieved - obs['desired_goal'])
-        if current_dist + 0.02 < prev_dist : #到目标位置的距离缩小了2cm
-            handcrafted_reward = 0.3
-        elif prev_dist + 0.02 < current_dist: # 到目标位置的距离变大了
-            handcrafted_reward = -0.3
-        else:
-            handcrafted_reward = 0.0
+        # 获取 gripper 位置和目标位置（FetchReach 的 obs 包含这些信息）
+        gripper_pos = obs["observation"][:3]  # 前 3 维是 gripper 的 (x, y, z)
+        target_pos = obs["desired_goal"]  # 目标位置
+
+        # 计算 gripper 到目标的欧氏距离
+        distance = np.linalg.norm(gripper_pos - target_pos)
+
+        # 设计密集奖励（距离越小，奖励越大）
+        handcrafted_reward = -distance  # 可以加一个缩放系数，如 -0.1 * distance
 
 
 
@@ -1183,7 +1183,7 @@ class Critic(nn.Module):
 
 
 # SAC+ICM算法
-class SAC_ICM:
+class SAC:
     def __init__(self, state_dim, action_dim, max_action):
         self.max_action = max_action
         self.gamma = 0.98  # 折扣因子
@@ -1236,8 +1236,6 @@ class SAC_ICM:
         next_state = torch.FloatTensor(np.array(batch.next_state)).to(device)
         reward = torch.FloatTensor(np.array(batch.reward)).unsqueeze(1).to(device)
         done = torch.FloatTensor(np.array(batch.done)).unsqueeze(1).to(device)
-
-
 
         total_reward = reward
         if self.total_step % 100 == 0: writer.add_scalar('steps/external_reward', reward.mean().item(), self.total_step)
@@ -1322,12 +1320,14 @@ def train(env, agent, max_episodes, max_steps, batch_size):
     for episode in tqdm(range(max_episodes), 'train'):
         state,_ = env.reset()
         episode_reward = 0
+        episode_len = 0
 
         for step in range(max_steps):
             action = agent.select_action(state)
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             agent.total_step += 1
+
             if info['is_success']:
                 results.append(1)
                 writer.add_scalar('steps/success', results.count(1), agent.total_step)
@@ -1339,6 +1339,7 @@ def train(env, agent, max_episodes, max_steps, batch_size):
 
             state = next_state
             episode_reward += reward
+            episode_len += 1
 
             # 更新网络
             if len(agent.replay_buffer) > batch_size:
@@ -1349,6 +1350,8 @@ def train(env, agent, max_episodes, max_steps, batch_size):
 
         episode_rewards.append(episode_reward)
         writer.add_scalar('steps/success_rate', results.count(1) / 100, agent.total_step)
+        writer.add_scalar('steps/episode_rew', episode_reward, agent.total_step)
+        writer.add_scalar('steps/episode_len', episode_len, agent.total_step)
 
 
         # 每100个episode保存一次模型
@@ -1369,7 +1372,7 @@ if __name__ == "__main__":
     max_action = float(env.action_space.high[0])  # 最大动作值
 
     # 初始化SAC+ICM智能体
-    agent = SAC_ICM(state_dim, action_dim, max_action)
+    agent = SAC(state_dim, action_dim, max_action)
 
     # 训练参数
     max_episodes = 5000  # 最大训练episode数
