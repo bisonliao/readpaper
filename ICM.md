@@ -293,6 +293,16 @@ the case of 3-D navigation, we expect a good exploration policy to cover as much
 
 未来研究的一个有趣方向是将学习到的探索行为/技能作为更复杂、分层系统中的运动原始/低级策略。例如，我们的VizDoom代理学会沿着走廊行走，而不是撞到墙上。这可能是导航系统的有用基础。
 
+### 内部奖励机制实现汇总
+
+有网友把RND、ICM等内部奖励机制提炼出框架，统一实现了：
+
+```
+https://github.com/RLE-Foundation/RLeXplore
+```
+
+
+
 ### bison的实验
 
 github上的有关ICM的开源实现：
@@ -314,6 +324,12 @@ https://github.com/chagmgang/pytorch_ppo_rl
 2. 通过SB3的训练回调，应该不可行，毕竟不能影响训练的reward值，除非通过外部存储系统交换信息，这样不太优雅
 3. 自定义Policy，也就是将ICM作为策略的一部分，通过重写`predict()`和`learn()`方法集成。适合与SAC等既有策略共享特征提取层
 4. 直接继承Gym的Env类，定制化修改环境的reward，插入自己的ICM结构和训练过程，也是一个方案。但它类似1，在VecEnv下怎么搞？是一个环境一套ICM，还是要共用一套
+
+
+
+论文中，ICM搭配了A3C和TRPO（均为on-policy），我下面的实验是ICM搭配SAC算法（off-policy），论文中并未明确指出有什么限制，应该是可以这样做的。
+
+
 
 #### 疯狂的赛车 （失败）
 
@@ -919,9 +935,470 @@ env.close()
 
 
 
-#### FetchReach （失败）
+#### FetchReach 
 
-2400多个episode下来，success rate也没有起色，而HER算法在200多episode的时候成功率开始上升。
+##### 环境的特殊性
+
+fetchReach这个任务，除了奖励稀疏，和以往的任务不同的地方在于：
+
+1. 目标位置每个回合都随机的变化，所以RL的策略模型/价值模型是需要输入目标位置信息的，也就是目标位置信息要作为state的一部分输入，否则怎么可能指导agent把手臂移动到目标位置呢
+2. reset()/step()函数以dict的形式，返回了通常的观测信息、achieved_goal、desired_goal
+
+不注意上面这个特殊情况，很容易就实验失败而不自知原因。
+
+##### 手动构造reward+手搓SAC，不使用ICM （失败了）
+
+环境的再封装，实现：
+
+1. 环境返回的state里要包含desired_goal
+2. 环境的observation_space需要相应的改动
+3. 手动构造reward，根据到desired_goal的距离变化，返回reward
+
+
+
+5000个回合下来，偶尔有零星的成功的回合，没有收敛，失败：
+
+![image-20250607222643686](img/image-20250607222643686.png)
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal
+from collections import deque, namedtuple
+import random
+import gymnasium as gym
+import gymnasium_robotics
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# 定义设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+writer = SummaryWriter(log_dir=f'logs/SAC_fetchreach_{datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+# 经验回放缓冲区
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done'))
+
+# 环境的再封装
+# 环境返回的state里要包含desired_goal
+# 环境的observation_space需要相应的改动
+# 手动构造reward，根据举例desired_goal的距离变化，返回reward
+class CustomFetchReachEnv(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        # 检测是否在并行环境中运行
+        if hasattr(self, 'metadata') and 'is_vector_env' in self.metadata and self.metadata['is_vector_env']:
+            raise RuntimeError(
+                "RaceCarEnv does not support parallel execution with SB3 VecEnv. "
+                "Please use a single instance of the environment."
+            )
+        super().__init__()
+
+        self.prev_achieved = None
+
+
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10+3,))  # 简化后的状态, 10个observe，3个desired_goal，一起拼接为state返回
+
+
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+        obs, info = self._env.reset(seed=seed, options=options)
+        state = np.concat( [obs['observation'],obs['desired_goal'] ] )
+
+        info['desired_goal'] = obs['desired_goal']
+
+        self.prev_achieved = obs['achieved_goal']
+
+        return state, info
+
+    def step(self, action):
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        state = np.concat( [obs['observation'],obs['desired_goal'] ] )
+        info['desired_goal'] = obs['desired_goal']
+
+        # 我自行构造一些奖励，看能否引导收敛
+        current_dist = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal'])
+        prev_dist = np.linalg.norm(self.prev_achieved - obs['desired_goal'])
+        if current_dist + 0.02 < prev_dist : #到目标位置的距离缩小了2cm
+            handcrafted_reward = 0.3
+        elif prev_dist + 0.02 < current_dist: # 到目标位置的距离变大了
+            handcrafted_reward = -0.3
+        else:
+            handcrafted_reward = 0.0
+
+
+
+        # 我自行判断是否成功了，并修改外部reward
+        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+        if success:
+            external_reward = 1
+            terminated = True
+        else:
+            external_reward = handcrafted_reward
+
+        # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
+        info["is_success"] = success
+
+        self.prev_achieved = obs['achieved_goal'] # 记录这次到达的位置
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, *args):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = Transition(*args)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+
+# SAC Actor网络
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, max_action, hidden_dim=256):
+        super(Actor, self).__init__()
+        self.max_action = max_action
+
+        self.l1 = nn.Linear(state_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, state):
+        x = F.relu(self.l1(state))
+        x = F.relu(self.l2(x))
+
+        mean = self.mean(x)
+        log_std = self.log_std(x)
+        log_std = torch.clamp(log_std, min=-20, max=2)
+
+        return mean, log_std
+
+    def sample(self, state):
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+        normal = Normal(mean, std)
+
+        # 重参数化技巧
+        z = normal.rsample()
+        action = torch.tanh(z)
+        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+
+        action = action * self.max_action
+
+        return action, log_prob, z, mean, log_std
+
+
+# SAC Critic网络
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super(Critic, self).__init__()
+
+        # Q1网络
+        self.l1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim, 1)
+
+        # Q2网络
+        self.l4 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.l5 = nn.Linear(hidden_dim, hidden_dim)
+        self.l6 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, state, action):
+        sa = torch.cat([state, action], dim=1)
+
+        q1 = F.relu(self.l1(sa))
+        q1 = F.relu(self.l2(q1))
+        q1 = self.l3(q1)
+
+        q2 = F.relu(self.l4(sa))
+        q2 = F.relu(self.l5(q2))
+        q2 = self.l6(q2)
+
+        return q1, q2
+
+
+# SAC+ICM算法
+class SAC_ICM:
+    def __init__(self, state_dim, action_dim, max_action):
+        self.max_action = max_action
+        self.gamma = 0.98  # 折扣因子
+        self.tau = 0.005  # 软更新系数
+        self.alpha = 0.2  # 温度系数
+
+        # 初始化网络
+        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic_target = Critic(state_dim, action_dim).to(device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+
+
+        # 优化器
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
+
+
+        # 经验回放
+        self.replay_buffer = ReplayBuffer(1000000)
+
+        # 自动调整温度系数
+        self.target_entropy = -torch.prod(torch.Tensor(action_dim).to(device)).item()
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        self.total_step = 1
+
+    def select_action(self, state, evaluate=False):
+        state = torch.FloatTensor(state).to(device).unsqueeze(0)
+        if evaluate:
+            with torch.no_grad():
+                _, _, action, _, _ = self.actor.sample(state)
+            return action.cpu().data.numpy().flatten()
+        else:
+            with torch.no_grad():
+                action, _, _, _, _ = self.actor.sample(state)
+            return action.cpu().data.numpy().flatten()
+
+    def update(self, batch_size):
+        if len(self.replay_buffer) < batch_size:
+            return
+
+        # 从回放缓冲区采样
+        transitions = self.replay_buffer.sample(batch_size)
+        batch = Transition(*zip(*transitions))
+
+        state = torch.FloatTensor(np.array(batch.state)).to(device)
+        action = torch.FloatTensor(np.array(batch.action)).to(device)
+        next_state = torch.FloatTensor(np.array(batch.next_state)).to(device)
+        reward = torch.FloatTensor(np.array(batch.reward)).unsqueeze(1).to(device)
+        done = torch.FloatTensor(np.array(batch.done)).unsqueeze(1).to(device)
+
+
+
+        total_reward = reward
+        if self.total_step % 100 == 0: writer.add_scalar('steps/external_reward', reward.mean().item(), self.total_step)
+
+
+
+
+        # 更新Critic
+        with torch.no_grad():
+            next_action, next_log_prob, _, _, _ = self.actor.sample(next_state)
+            q1_next, q2_next = self.critic_target(next_state, next_action)
+            q_next = torch.min(q1_next, q2_next) - self.alpha * next_log_prob
+            target_q = total_reward + (1 - done) * self.gamma * q_next
+
+        current_q1, current_q2 = self.critic(state, action)
+        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+        if self.total_step % 100 == 0: writer.add_scalar('steps/critic_loss', critic_loss.item(), self.total_step)
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # 更新Actor
+        pi, log_pi, _, _, _ = self.actor.sample(state)
+        q1_pi, q2_pi = self.critic(state, pi)
+        q_pi = torch.min(q1_pi, q2_pi)
+
+        actor_loss = (self.alpha * log_pi - q_pi).mean()
+        if self.total_step % 100 == 0: writer.add_scalar('steps/actor_loss', actor_loss.item(), self.total_step)
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # 更新温度系数
+        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+        if self.total_step % 100 == 0: writer.add_scalar('steps/alpha_loss', alpha_loss.item(), self.total_step)
+
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
+        self.alpha = self.log_alpha.exp()
+        if self.total_step % 100 == 0: writer.add_scalar('steps/alpha', self.alpha, self.total_step)
+
+        # 软更新目标网络
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+    def save(self, filename):
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+
+            'log_alpha': self.log_alpha,
+            'alpha_optimizer': self.alpha_optimizer.state_dict(),
+        }, filename)
+
+    def load(self, filename):
+        checkpoint = torch.load(filename)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
+        self.critic_target.load_state_dict(checkpoint['critic_target'])
+
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+
+        self.log_alpha = checkpoint['log_alpha']
+        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
+
+
+# 训练函数
+def train(env, agent, max_episodes, max_steps, batch_size):
+    episode_rewards = []
+
+    results = deque(maxlen=100)
+
+    for episode in tqdm(range(max_episodes), 'train'):
+        state,_ = env.reset()
+        episode_reward = 0
+
+        for step in range(max_steps):
+            action = agent.select_action(state)
+            next_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            agent.total_step += 1
+            if info['is_success']:
+                results.append(1)
+                writer.add_scalar('steps/success', results.count(1), agent.total_step)
+            else:
+                results.append(0)
+
+            # 存储经验
+            agent.replay_buffer.push(state, action, next_state, reward, done)
+
+            state = next_state
+            episode_reward += reward
+
+            # 更新网络
+            if len(agent.replay_buffer) > batch_size:
+                agent.update(batch_size)
+
+            if done:
+                break
+
+        episode_rewards.append(episode_reward)
+        writer.add_scalar('steps/success_rate', results.count(1) / 100, agent.total_step)
+
+
+        # 每100个episode保存一次模型
+        if (episode + 1) % 1000 == 0:
+            agent.save(f"sac_icm_checkpoint_{episode + 1}.pth")
+
+    return episode_rewards
+
+
+# 主函数
+if __name__ == "__main__":
+    # 创建环境
+    env = CustomFetchReachEnv()
+
+    # 获取环境参数
+    state_dim = env.observation_space.shape[0]  # 13维状态
+    action_dim = env.action_space.shape[0]  # 动作维度
+    max_action = float(env.action_space.high[0])  # 最大动作值
+
+    # 初始化SAC+ICM智能体
+    agent = SAC_ICM(state_dim, action_dim, max_action)
+
+    # 训练参数
+    max_episodes = 5000  # 最大训练episode数
+    max_steps = 100  # 每个episode最大步数
+    batch_size = 256  # 批量大小
+
+    # 开始训练
+    episode_rewards = train(env, agent, max_episodes, max_steps, batch_size)
+
+    # 保存最终模型
+    agent.save("sac_icm_final.pth")
+
+    # 关闭环境
+    env.close()
+```
+
+
+
+##### Env里实现ICM + SB3的SAC （失败了）
+
+环境的再封装，实现：
+
+1. 环境返回的state里要包含desired_goal
+2. 环境的observation_space需要相应的改动
+3. 使用ICM机制构造内部奖励
+
+   
+
+6800多个episode下来，success rate也没有起色，而HER算法在200多episode的时候成功率开始上升。
 
 ![image-20250606175018597](img/image-20250606175018597.png)
 
@@ -981,7 +1458,7 @@ class ICM(nn.Module):
         super(ICM, self).__init__()
         # 共享的特征编码器
         self.feature_encoder = nn.Sequential(
-            nn.Linear(10, Config.ICM_FEATURE_FC_UNITS),
+            nn.Linear(13, Config.ICM_FEATURE_FC_UNITS),
             nn.ELU(),
             nn.Linear(Config.ICM_FEATURE_FC_UNITS, Config.ICM_FEATURE_DIM),
             nn.ELU()
@@ -1047,7 +1524,7 @@ class CustomFetchReachEnv(gym.Env):
 
         # 继承原始的动作和观测空间
         self.action_space = self._env.action_space
-        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10,)) # 简化后的状态
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(13,)) # 简化后的状态
 
         self.icm = ICM()
         self.buffer = []
@@ -1104,7 +1581,7 @@ class CustomFetchReachEnv(gym.Env):
         重置环境，返回初始观测和 info。
         """
         obs, info = self._env.reset(seed=seed, options=options)
-        state = obs['observation']
+        state = np.concat( [obs['observation'],obs['desired_goal'] ] )
         info['desired_goal'] = obs['desired_goal']
 
         # 训练ICM
@@ -1124,7 +1601,7 @@ class CustomFetchReachEnv(gym.Env):
         """
         obs, external_reward, terminated, truncated, info = self._env.step(action)
         self.total_step += 1
-        state = obs['observation']
+        state = np.concat( [obs['observation'],obs['desired_goal'] ] )
         info['desired_goal'] = obs['desired_goal']
 
         if self.total_step % 997 == 0:
@@ -1223,7 +1700,11 @@ while not done:
 
 ```
 
-#### 一个文件的FetchReach (失败)
+
+
+##### ICM+手搓SAC (失败了)
+
+失败了，一次成功的回合都没有。
 
 ![image-20250606205142531](img/image-20250606205142531.png)
 
@@ -1715,3 +2196,4 @@ if __name__ == "__main__":
     env.close()
 ```
 
+##### 用网友的RLeXplore库
