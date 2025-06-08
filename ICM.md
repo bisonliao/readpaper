@@ -2494,7 +2494,7 @@ class CustomFetchReachEnv(gym.Env):
 
 # ICM模块 (保持不变)
 class ICM(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, eta=1000, feature_dim=288):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, eta=1, feature_dim=288):
         super(ICM, self).__init__()
         self.eta = eta
 
