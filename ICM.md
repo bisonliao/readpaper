@@ -299,6 +299,7 @@ the case of 3-D navigation, we expect a good exploration policy to cover as much
 
 ```
 https://github.com/RLE-Foundation/RLeXplore
+# 这个库很多bug，牛屎外面光
 ```
 
 
@@ -2200,4 +2201,208 @@ if __name__ == "__main__":
     env.close()
 ```
 
-##### 用网友的RLeXplore库
+##### 用网友的RLeXplore库（失败了）
+
+![image-20250608140745145](img/image-20250608140745145.png)
+
+
+
+```python
+import gymnasium as gym
+import numpy as np
+import torch as th
+
+
+import gymnasium_robotics
+from stable_baselines3.common.base_class import BaseAlgorithm
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3 import PPO, SAC
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
+
+from rllte.xplore.reward import ICM
+
+
+# 环境的再封装
+# 环境返回的state里要包含desired_goal
+# 环境的observation_space需要相应的改动
+# 手动构造reward，根据举例desired_goal的距离变化，返回reward
+class CustomFetchReachEnv(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        # 检测是否在并行环境中运行
+        if hasattr(self, 'metadata') and 'is_vector_env' in self.metadata and self.metadata['is_vector_env']:
+            raise RuntimeError(
+                "RaceCarEnv does not support parallel execution with SB3 VecEnv. "
+                "Please use a single instance of the environment."
+            )
+        super().__init__()
+
+
+
+
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10+3,))  # 简化后的状态, 10个observe，3个desired_goal，一起拼接为state返回
+
+
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+        obs, info = self._env.reset(seed=seed, options=options)
+        state = np.concatenate( [obs['observation'],obs['desired_goal'] ] )
+
+        info['desired_goal'] = obs['desired_goal']
+
+
+
+        return state, info
+
+    def step(self, action):
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        state = np.concatenate( [obs['observation'],obs['desired_goal'] ] )
+        info['desired_goal'] = obs['desired_goal']
+
+
+
+
+
+        # 我自行判断是否成功了，并修改外部reward
+        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+        if success:
+            external_reward = 1
+            terminated = True
+        else:
+            external_reward = 0
+
+        # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
+        info["is_success"] = success
+
+
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+
+class RLeXploreWithOnPolicyRL(BaseCallback):
+    """
+    A custom callback for combining RLeXplore and on-policy algorithms from SB3.
+    """
+    def __init__(self, irs, verbose=0):
+        super(RLeXploreWithOnPolicyRL, self).__init__(verbose)
+        self.irs = irs
+        self.buffer = None
+
+    def init_callback(self, model: BaseAlgorithm) -> None:
+        super().init_callback(model)
+        self.buffer = self.model.rollout_buffer
+        
+
+    def _on_step(self) -> bool:
+        """
+        This method will be called by the model after each call to `env.step()`.
+
+        :return: (bool) If the callback returns False, training is aborted early.
+        """
+        observations = self.locals["obs_tensor"]
+        device = observations.device
+        actions = th.as_tensor(self.locals["actions"], device=device)
+        rewards = th.as_tensor(self.locals["rewards"], device=device)
+        dones = th.as_tensor(self.locals["dones"], device=device)
+        next_observations = th.as_tensor(self.locals["new_obs"], device=device)
+
+        # ===================== watch the interaction ===================== #
+        self.irs.watch(observations, actions, rewards, dones, dones, next_observations)
+        # ===================== watch the interaction ===================== #
+        return True
+
+    def _on_rollout_end(self) -> None:
+        # ===================== compute the intrinsic rewards ===================== #
+        # prepare the data samples
+        obs = th.as_tensor(self.buffer.observations)
+        # get the new observations
+        new_obs = obs.clone()
+        new_obs[:-1] = obs[1:]
+        new_obs[-1] = th.as_tensor(self.locals["new_obs"])
+        actions = th.as_tensor(self.buffer.actions)
+        rewards = th.as_tensor(self.buffer.rewards)
+        dones = th.as_tensor(self.buffer.episode_starts)
+        print(obs.shape, actions.shape, rewards.shape, dones.shape, obs.shape)
+        # compute the intrinsic rewards
+        intrinsic_rewards = irs.compute(
+            samples=dict(observations=obs, actions=actions,
+                         rewards=rewards, terminateds=dones,
+                         truncateds=dones, next_observations=new_obs),
+            sync=True)
+        # add the intrinsic rewards to the buffer
+        self.buffer.advantages += intrinsic_rewards.cpu().numpy()
+        self.buffer.returns += intrinsic_rewards.cpu().numpy()
+        # ===================== compute the intrinsic rewards ===================== #
+
+if __name__ == '__main__':
+    # Parallel environments
+    device = 'cpu'
+    n_envs = 4
+    #envs = make_vec_env("Pendulum-v1", n_envs=n_envs)
+    envs = make_vec_env(
+        lambda: CustomFetchReachEnv(),  # 必须用 lambda 包装
+        n_envs=4,
+        seed=42
+        #vec_env_cls=AsyncVectorEnv  # 或 SyncVectorEnv
+    )
+
+    # ===================== build the reward ===================== #
+    irs = ICM(envs, device=device)
+    # ===================== build the reward ===================== #
+
+    model = PPO("MlpPolicy", envs, verbose=1, device=device, batch_size=256, tensorboard_log='./logs')
+    model.learn(total_timesteps=2_000_000, callback=RLeXploreWithOnPolicyRL(irs))
+```
+
+尝试SAC这样的off-policy的时候，回调没有搞定获取当前步的state数据，SB3的回调没有合适的时机。
