@@ -947,7 +947,7 @@ fetchReach这个任务，除了奖励稀疏，和以往的任务不同的地方�
 
 不注意上面这个特殊情况，很容易就实验失败而不自知原因。
 
-##### 手动构造reward+手搓SAC，不使用ICM （失败了）
+##### 手动构造reward+SAC，不使用ICM （失败了）
 
 环境的再封装，实现：
 
@@ -1387,7 +1387,7 @@ if __name__ == "__main__":
 
 
 
-##### Env里实现ICM + SB3的SAC （失败了）
+##### ICM in Env + SAC in SB3 （失败了）
 
 环境的再封装，实现：
 
@@ -1701,7 +1701,7 @@ while not done:
 
 
 
-##### ICM+手搓SAC (失败了)
+##### ICM + SAC (失败了)
 
 失败了，一次成功的回合都没有。
 
@@ -2189,7 +2189,7 @@ if __name__ == "__main__":
     env.close()
 ```
 
-##### 用网友的RLeXplore库（失败了）
+##### RLeXplore （失败了）
 
 只能到40%左右的成功率，让我想起了HER算法的FetchReach任务，也是只有40%成功率
 
@@ -2384,9 +2384,9 @@ if __name__ == '__main__':
 
 尝试SAC这样的off-policy的时候，回调没有搞定获取当前步的state数据，SB3的回调没有合适的时机。
 
-##### ICM + 手搓PPO（失败了）
+##### ICM + PPO（失败了）
 
-
+![image-20250608195910950](img/image-20250608195910950.png)
 
 ```python
 import numpy as np
