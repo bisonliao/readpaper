@@ -2388,9 +2388,9 @@ if __name__ == '__main__':
 
 经过前面那么多失败，浪费了半个星期的时间后，我开始梳理思路稳打稳扎：
 
-1. 首先，我找到一个在代码结构优雅、已经在pendulum和BipedalWalker上都验证可以收敛的PPO代码，见PPO论文笔记
-2. 然后我修改PPO代码，识别CustomFetchReachEnv环境，先不用ICM，只使用外部的成功时刻的奖励
-3. 第三步，我在继续追加ICM机制
+1. 首先，我找到一个代码结构优雅、已经在pendulum和BipedalWalker上都验证可以收敛的PPO代码，见PPO论文笔记
+2. 然后我修改PPO代码，适配CustomFetchReachEnv环境，先不用ICM，只使用外部的成功时刻返回的奖励
+3. 第三步，我再继续追加ICM机制
 
 只使用PPO不启用ICM的运行情况如下，有30%的回合是成功的：
 
