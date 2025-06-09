@@ -510,6 +510,8 @@ if __name__ == "__main__":
 
 #### 连续动作空间
 
+##### pendulum 1
+
 能够很好的收敛：
 
 ![image-20250524162218274](img\image-20250524162218274.png)
@@ -570,6 +572,7 @@ class ValueNetwork(nn.Module):
         )
 
     def forward(self, x):
+        x = x / torch.tensor([1.0, 1.0, 8.0], device=x.device)  # normalize
         return self.net(x).squeeze(-1)
 
 
@@ -698,5 +701,798 @@ if __name__ == "__main__":
     train()
     show("./checkpoints/Pendulum_RPO.pth")
 
+```
+
+##### pendulum 2
+
+最近状态跟吃了屎一样的，连pendulum都搞不定，明明代码看着和上面的没有什么区别，就是不收敛，但老子还是把它记录下来。
+
+之所以重写，是因为在搞ICM + PPO不能收敛，就想着先把PPO搞收敛确保基础算法没有问题，然后就搞了一整天也不收敛。
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal, Independent
+from collections import deque
+import random
+import gymnasium as gym
+import gymnasium_robotics
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# 定义设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# todo: 这个跟RL环境强相关，需要根据情况修改
+writer = SummaryWriter(log_dir=f'logs/pendulum_ppo_{datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+
+# 轨迹存储
+class TrajectoryBuffer:
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.next_states = []
+
+    def clear(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.next_states = []
+
+    def store(self, state, action, reward, done, log_prob, value, next_state):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.next_states.append(next_state)
+
+    def get_trajectory(self):
+        return (
+            np.array(self.states),
+            np.array(self.actions),
+            np.array(self.rewards),
+            np.array(self.dones),
+            np.array(self.log_probs),
+            np.array(self.values),
+            np.array(self.next_states)
+        )
+
+
+
+# PPO Actor网络 (保持不变)
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, max_action, min_action, hidden_dim=256):
+        super(Actor, self).__init__()
+        self.max_action = max_action
+        self.min_action = min_action
+
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+
+        )
+
+        self.mean = nn.Linear(hidden_dim , action_dim)
+        #self.log_std = nn.Linear(hidden_dim , action_dim)
+        self.log_std = nn.Parameter(torch.zeros(1))
+
+    def forward(self, state):
+        x = self.net(state)
+        mean = self.mean(x)
+        std = self.log_std.exp().expand_as(mean)
+        return mean, std
+
+    def get_action(self, state):
+        mean, std = self.forward(state)
+        dist = Independent(Normal(mean, std), 1)
+        action_raw = dist.rsample()
+        action = torch.tanh(action_raw) * self.max_action
+        log_prob = dist.log_prob(action_raw)
+
+        return action, log_prob, dist.entropy().mean()
+
+
+# PPO Critic网络 (保持不变)
+class Critic(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256):
+        super(Critic, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+
+        )
+
+    def forward(self, state):
+        return self.net(state)
+
+
+# 标准PPO算法
+class PPO:
+    def __init__(self, state_dim, action_dim, max_action, min_action):
+        self.max_action = max_action
+        self.gamma = 0.99
+        self.gae_lambda = 0.95
+        self.ppo_eps = 0.2
+        self.entropy_coef = 0.001
+        self.value_loss_coef = 1.0
+        self.max_grad_norm = 5
+        self.ppo_epochs = 10
+        self.mini_batch_size = 2048
+        # todo: 这个跟RL环境强相关，需要根据情况修改
+        self.trajectory_length = 2048  # 每个轨迹收集的步数
+
+        self.actor = Actor(state_dim, action_dim, max_action, min_action).to(device)
+        self.critic = Critic(state_dim).to(device)
+
+
+        self.optimizer_actor = optim.Adam( self.actor.parameters(), lr=3e-4)
+        self.optimizer_critic = optim.Adam(self.critic.parameters(), lr=1e-3)
+
+        self.trajectory_buffer = TrajectoryBuffer()
+        self.total_step = 1
+        self.update_cnt = 0
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(device).unsqueeze(0)
+        with torch.no_grad():
+            action, log_prob, _ = self.actor.get_action(state)
+            value = self.critic(state)
+        return action.cpu().numpy().flatten(), log_prob.cpu().item(), value.cpu().item()
+
+    def compute_gae(self, rewards, dones, values):
+        '''
+        # 输入：
+        # - rewards:       [r_0, r_1, ..., r_{T-1}]           当前 episode 或 trajectory 的即时奖励
+        # - values:        [V(s_0), V(s_1), ..., V(s_T)]      每个状态的值函数估计，包括最后一个 bootstrap 值
+        # - dones:         [done_0, done_1, ..., done_{T-1}]  终止标志，1 表示 episode 结束（用于mask）
+        # - gamma:         折扣因子（例如 0.99）
+        # - lambda_:       GAE 的平滑参数（例如 0.95）
+        # 输出：
+        # - returns:       每个时间步的总期望回报，用于训练 Critic
+        # - advantages:    每个时间步的优势估计，用于训练 Actor
+
+        T = len(rewards)
+        advantages = zeros_like(rewards)
+        returns = zeros_like(rewards)
+        gae = 0
+
+        for t in reversed(range(T)):
+            # 如果当前 step 是终止状态，则未来无回报
+            if dones[t]:
+                delta = rewards[t] - values[t]
+                gae = delta
+            else:
+                delta = rewards[t] + gamma * values[t+1] - values[t]  # TD误差
+                gae = delta + gamma * lambda_ * gae
+
+            advantages[t] = gae
+            returns[t] = advantages[t] + values[t]  # return = advantage + value  ==> bootstrapped return
+        return returns, advantages
+        '''
+        returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
+
+        gae = 0.0
+        masks = 1 - dones
+
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + self.gamma * masks[t] * values[t+1] - values[t]
+            gae = delta + self.gamma * self.gae_lambda * gae
+
+            returns[t] = gae + values[t]
+            advantages[t] = gae
+
+        return returns, advantages
+
+    def update(self, last_state):
+        # 获取完整轨迹数据
+        states, actions, rewards, dones, old_log_probs, values, next_states = self.trajectory_buffer.get_trajectory()
+
+        # 转换为tensor
+        states = torch.FloatTensor(states).to(device)
+        actions = torch.FloatTensor(actions).to(device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
+        old_log_probs = torch.FloatTensor(old_log_probs).unsqueeze(1).to(device)
+        values = torch.FloatTensor(values).unsqueeze(1).to(device)
+        next_states = torch.FloatTensor(next_states).to(device)
+
+        #rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8) # 后面有对advantages做归一化，这里不用做
+
+        total_rewards = rewards
+
+
+        # 记录指标
+        writer.add_scalar('train/external_reward', rewards.mean().item(), self.total_step)
+
+        # 计算最后一个状态的值
+        with torch.no_grad():
+            last_state = torch.FloatTensor(last_state).unsqueeze(0).to(device)
+            last_values = self.critic(last_state)
+            values_for_gae = torch.cat([values, last_values])
+
+
+
+        # 计算GAE和returns
+        returns, advantages = self.compute_gae(total_rewards, dones, values_for_gae)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 准备批量数据
+        batch_size = states.size(0)
+        indices = np.arange(batch_size)
+
+        # PPO多epoch更新
+        update_times = 0 # 用于抽样上报tb
+        for _ in range(self.ppo_epochs):
+            np.random.shuffle(indices)
+
+            for start in range(0, batch_size, self.mini_batch_size):
+                update_times += 1
+                end = start + self.mini_batch_size
+                idx = indices[start:end]
+
+                # 获取mini-batch数据
+                mb_states = states[idx]
+                mb_next_states = next_states[idx]
+                mb_actions = actions[idx]
+                mb_old_log_probs = old_log_probs[idx]
+                mb_advantages = advantages[idx]
+                mb_returns = returns[idx]
+
+
+                # 计算新的动作概率和值
+                new_actions, new_log_probs, entropy = self.actor.get_action(mb_states)
+                new_values = self.critic(mb_states)
+
+                # 计算比率
+                ratio = (new_log_probs - mb_old_log_probs).exp()
+                approx_kl = (mb_old_log_probs - new_log_probs).mean()
+
+
+                # 计算策略损失
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.ppo_eps, 1.0 + self.ppo_eps) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+
+                self.optimizer_actor.zero_grad()
+                policy_loss.backward()
+                self.optimizer_actor.step()
+
+                # 计算值函数损失
+                value_loss = F.mse_loss(new_values, mb_returns)
+                self.optimizer_critic.zero_grad()
+                value_loss.backward()
+                self.optimizer_critic.step()
+
+
+                '''# 计算总损失
+                #loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+
+                # 更新网络
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()), self.max_grad_norm)
+                self.optimizer.step()'''
+                self.update_cnt += 1
+
+                # 记录指标
+                if update_times == 1:
+                    writer.add_scalar('train/policy_loss', policy_loss.item(), self.total_step)
+                    writer.add_scalar('train/value_loss', value_loss.item(), self.total_step)
+                    writer.add_scalar('train/entropy', entropy.item(), self.total_step)
+                    #writer.add_scalar('train/total_loss', loss.item(), self.total_step)
+                    writer.add_scalar('train/kl', approx_kl.item(), self.total_step)
+                    writer.add_scalar('train/updates', self.update_cnt, self.total_step)
+
+        self.trajectory_buffer.clear()
+
+    def save(self, filename):
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+        }, filename)
+
+    def load(self, filename):
+        checkpoint = torch.load(filename)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+
+def normalize_state(state:np.ndarray):
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+    #upper = np.array([ 3.1415927, 5.0, 5.0, 5.0, 3.1415927, 5.0, 3.1415927, 5.0, 5.0, 3.1415927, 5.0, 3.1415927, 5.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 ])
+    upper = np.array([1.0, 1.0, 8.0])
+    return state / upper
+# 训练函数
+def train(env, agent, max_epoch, max_steps):
+    results = deque(maxlen=100)
+    for epoch in tqdm(range(max_epoch), 'train'):
+        state, _ = env.reset()
+        state = normalize_state(state)
+        episode_reward = 0
+        episode_steps = 0
+        # 收集轨迹数据
+        for _ in range(agent.trajectory_length):
+            action, log_prob, value = agent.select_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state = normalize_state(next_state)
+            done = terminated or truncated
+
+            agent.trajectory_buffer.store(
+                state, action, reward, done, log_prob, value, next_state
+            )
+
+            state = next_state
+            episode_reward += reward
+            episode_steps += 1
+            agent.total_step += 1
+
+            # todo: 这个跟RL环境强相关，需要根据情况修改
+            if done or episode_steps >= max_steps:
+                writer.add_scalar('train/episode_reward', episode_reward, agent.total_step)
+                results.append(0)
+
+                state, _ = env.reset()
+                state = normalize_state(state)
+                episode_reward = 0
+                episode_steps = 0
+
+
+        # 更新网络
+        agent.update(next_state)
+        # 记录指标
+        writer.add_scalar('train/success_rate', results.count(1) / 100, agent.total_step)
+
+        # 定期保存模型
+        if (epoch + 1) % 1000 == 0:
+            agent.save(f"ppo_icm_checkpoint_{epoch + 1}.pth")
+
+
+# 主函数
+if __name__ == "__main__":
+    # 创建环境
+    #env = CustomFetchReachEnv()
+    env = gym.make('Pendulum-v1')
+
+    # 获取环境参数
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    min_action = float(env.action_space.low[0])
+    print(f"action range:{min_action}~{max_action}")
+
+    # 初始化PPO+ICM智能体
+    agent = PPO(state_dim, action_dim, max_action, min_action)
+
+    # 训练参数
+    max_epoches = 1000
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+    max_steps = 1000  # 每个episode最大步数
+
+    # 开始训练
+    train(env, agent, max_epoches, max_steps)
+
+    # 保存最终模型
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+    agent.save("ppo_pendulum_final.pth")
+
+    # 关闭环境
+    env.close()
+```
+
+##### BipedalWalker
+
+不能收敛，但不知道问题在哪里。SAC是能够很快收敛的
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal
+from collections import deque
+import random
+import gymnasium as gym
+import gymnasium_robotics
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# 定义设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+writer = SummaryWriter(log_dir=f'logs/walker_ppo_{datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+
+# 轨迹存储
+class TrajectoryBuffer:
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.next_states = []
+
+    def clear(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.next_states = []
+
+    def store(self, state, action, reward, done, log_prob, value, next_state):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.next_states.append(next_state)
+
+    def get_trajectory(self):
+        return (
+            np.array(self.states),
+            np.array(self.actions),
+            np.array(self.rewards),
+            np.array(self.dones),
+            np.array(self.log_probs),
+            np.array(self.values),
+            np.array(self.next_states)
+        )
+
+
+
+# PPO Actor网络 (保持不变)
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, max_action, min_action, hidden_dim=256):
+        super(Actor, self).__init__()
+        self.max_action = max_action
+        self.min_action = min_action
+
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU()
+        )
+
+        self.mean = nn.Linear(hidden_dim // 2, action_dim)
+        self.log_std = nn.Linear(hidden_dim // 2, action_dim)
+
+        self.log_std.weight.data.fill_(0.0)
+        self.log_std.bias.data.fill_(-1.0)
+
+    def forward(self, state):
+        x = self.net(state)
+        mean = self.mean(x)
+        log_std = self.log_std(x)
+        log_std = torch.clamp(log_std, min=-20, max=2)
+        std = log_std.exp()
+        return mean, std
+
+    def get_action(self, state):
+        mean, std = self.forward(state)
+        dist = Normal(mean, std)
+        raw_action = dist.rsample()
+
+        action = torch.tanh(raw_action)
+        log_prob = dist.log_prob(raw_action).sum(-1, keepdim=True)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6).sum(-1, keepdim=True)
+        action = action * self.max_action
+
+        return action, log_prob, dist.entropy().mean()
+
+
+# PPO Critic网络 (保持不变)
+class Critic(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256):
+        super(Critic, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, 1)
+        )
+
+    def forward(self, state):
+        return self.net(state)
+
+
+# 标准PPO算法
+class PPO:
+    def __init__(self, state_dim, action_dim, max_action, min_action):
+        self.max_action = max_action
+        self.gamma = 0.99
+        self.gae_lambda = 0.95
+        self.ppo_eps = 0.2
+        self.entropy_coef = 0.03
+        self.value_loss_coef = 0.5
+        self.max_grad_norm = 0.5
+        self.ppo_epochs = 10
+        self.mini_batch_size = 128
+        # todo: 这个跟RL环境强相关，需要根据情况修改
+        self.trajectory_length = 8192  # 每个轨迹收集的步数
+
+        self.actor = Actor(state_dim, action_dim, max_action, min_action).to(device)
+        self.critic = Critic(state_dim).to(device)
+
+
+        self.optimizer = optim.Adam([
+            {'params': self.actor.parameters()},
+            {'params': self.critic.parameters()},
+        ], lr=3e-4)
+
+        self.trajectory_buffer = TrajectoryBuffer()
+        self.total_step = 1
+        self.update_cnt = 0
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(device).unsqueeze(0)
+        with torch.no_grad():
+            action, log_prob, _ = self.actor.get_action(state)
+            value = self.critic(state)
+        return action.cpu().numpy().flatten(), log_prob.cpu().item(), value.cpu().item()
+
+    def compute_gae(self, rewards, dones, values):
+        '''
+        # 输入：
+        # - rewards:       [r_0, r_1, ..., r_{T-1}]           当前 episode 或 trajectory 的即时奖励
+        # - values:        [V(s_0), V(s_1), ..., V(s_T)]      每个状态的值函数估计，包括最后一个 bootstrap 值
+        # - dones:         [done_0, done_1, ..., done_{T-1}]  终止标志，1 表示 episode 结束（用于mask）
+        # - gamma:         折扣因子（例如 0.99）
+        # - lambda_:       GAE 的平滑参数（例如 0.95）
+        # 输出：
+        # - returns:       每个时间步的总期望回报，用于训练 Critic
+        # - advantages:    每个时间步的优势估计，用于训练 Actor
+
+        T = len(rewards)
+        advantages = zeros_like(rewards)
+        returns = zeros_like(rewards)
+        gae = 0
+
+        for t in reversed(range(T)):
+            # 如果当前 step 是终止状态，则未来无回报
+            if dones[t]:
+                delta = rewards[t] - values[t]
+                gae = delta
+            else:
+                delta = rewards[t] + gamma * values[t+1] - values[t]  # TD误差
+                gae = delta + gamma * lambda_ * gae
+
+            advantages[t] = gae
+            returns[t] = advantages[t] + values[t]  # return = advantage + value  ==> bootstrapped return
+        return returns, advantages
+        '''
+        returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
+
+        gae = 0.0
+        masks = 1 - dones
+
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + self.gamma * masks[t] * values[t+1] - values[t]
+            gae = delta + self.gamma * self.gae_lambda * gae
+
+            returns[t] = gae + values[t]
+            advantages[t] = gae
+
+        return returns, advantages
+
+    def update(self, last_state):
+        # 获取完整轨迹数据
+        states, actions, rewards, dones, old_log_probs, values, next_states = self.trajectory_buffer.get_trajectory()
+
+        # 转换为tensor
+        states = torch.FloatTensor(states).to(device)
+        actions = torch.FloatTensor(actions).to(device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
+        old_log_probs = torch.FloatTensor(old_log_probs).unsqueeze(1).to(device)
+        values = torch.FloatTensor(values).unsqueeze(1).to(device)
+        next_states = torch.FloatTensor(next_states).to(device)
+
+        #rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8) # 后面有对advantages做归一化，这里不用做
+
+        total_rewards = rewards
+
+
+        # 记录指标
+        writer.add_scalar('train/external_reward', rewards.mean().item(), self.total_step)
+
+        # 计算最后一个状态的值
+        with torch.no_grad():
+            last_state = torch.FloatTensor(last_state).unsqueeze(0).to(device)
+            last_values = self.critic(last_state)
+            values_for_gae = torch.cat([values, last_values])
+
+
+
+        # 计算GAE和returns
+        returns, advantages = self.compute_gae(total_rewards, dones, values_for_gae)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 准备批量数据
+        batch_size = states.size(0)
+        indices = np.arange(batch_size)
+
+        # PPO多epoch更新
+        update_times = 0 # 用于抽样上报tb
+        for _ in range(self.ppo_epochs):
+            np.random.shuffle(indices)
+
+            for start in range(0, batch_size, self.mini_batch_size):
+                update_times += 1
+                end = start + self.mini_batch_size
+                idx = indices[start:end]
+
+                # 获取mini-batch数据
+                mb_states = states[idx]
+                mb_next_states = next_states[idx]
+                mb_actions = actions[idx]
+                mb_old_log_probs = old_log_probs[idx]
+                mb_advantages = advantages[idx]
+                mb_returns = returns[idx]
+
+
+                # 计算新的动作概率和值
+                new_actions, new_log_probs, entropy = self.actor.get_action(mb_states)
+                new_values = self.critic(mb_states)
+
+                # 计算比率
+                ratio = (new_log_probs - mb_old_log_probs).exp()
+                approx_kl = (mb_old_log_probs - new_log_probs).mean()
+
+
+                # 计算策略损失
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.ppo_eps, 1.0 + self.ppo_eps) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # 计算值函数损失
+                value_loss = F.mse_loss(new_values, mb_returns)
+
+                # 计算总损失
+                loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+
+                # 更新网络
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()), self.max_grad_norm)
+                self.optimizer.step()
+                self.update_cnt += 1
+
+                # 记录指标
+                if update_times == 1:
+                    writer.add_scalar('train/policy_loss', policy_loss.item(), self.total_step)
+                    writer.add_scalar('train/value_loss', value_loss.item(), self.total_step)
+                    writer.add_scalar('train/entropy', entropy.item(), self.total_step)
+                    writer.add_scalar('train/total_loss', loss.item(), self.total_step)
+                    writer.add_scalar('train/kl', approx_kl.item(), self.total_step)
+                    writer.add_scalar('train/updates', self.update_cnt, self.total_step)
+
+        self.trajectory_buffer.clear()
+
+    def save(self, filename):
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+        }, filename)
+
+    def load(self, filename):
+        checkpoint = torch.load(filename)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+
+def normalize_state(state:np.ndarray):
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+    upper = np.array([ 3.1415927, 5.0, 5.0, 5.0, 3.1415927, 5.0, 3.1415927, 5.0, 5.0, 3.1415927, 5.0, 3.1415927, 5.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 ])
+    return state / upper
+# 训练函数
+def train(env, agent, max_epoch, max_steps):
+    results = deque(maxlen=100)
+    for epoch in tqdm(range(max_epoch), 'train'):
+        state, _ = env.reset()
+        state = normalize_state(state)
+        episode_reward = 0
+        episode_steps = 0
+        # 收集轨迹数据
+        for _ in range(agent.trajectory_length):
+            action, log_prob, value = agent.select_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state = normalize_state(next_state)
+            done = terminated or truncated
+
+            agent.trajectory_buffer.store(
+                state, action, reward, done, log_prob, value, next_state
+            )
+
+            state = next_state
+            episode_reward += reward
+            episode_steps += 1
+            agent.total_step += 1
+
+            # todo: 这个跟RL环境强相关，需要根据情况修改
+            if done or episode_steps >= max_steps:
+                writer.add_scalar('train/episode_reward', episode_reward, agent.total_step)
+                if episode_reward > 0:
+                    results.append(1)
+                else:
+                    results.append(0)
+
+                state, _ = env.reset()
+                episode_reward = 0
+                episode_steps = 0
+
+
+        # 更新网络
+        agent.update(next_state)
+        # 记录指标
+        writer.add_scalar('train/success_rate', results.count(1) / 100, agent.total_step)
+
+        # 定期保存模型
+        if (epoch + 1) % 1000 == 0:
+            agent.save(f"ppo_icm_checkpoint_{epoch + 1}.pth")
+
+
+# 主函数
+if __name__ == "__main__":
+    # 创建环境
+    #env = CustomFetchReachEnv()
+    env = gym.make('BipedalWalker-v3')
+
+    # 获取环境参数
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    min_action = float(env.action_space.low[0])
+    print(f"action range:{min_action}~{max_action}")
+
+    # 初始化PPO+ICM智能体
+    agent = PPO(state_dim, action_dim, max_action, min_action)
+
+    # 训练参数
+    max_epoches = 1000
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+    max_steps = 1600  # 每个episode最大步数
+
+    # 开始训练
+    train(env, agent, max_epoches, max_steps)
+
+    # 保存最终模型
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+    agent.save("ppo_walker_final.pth")
+
+    # 关闭环境
+    env.close()
 ```
 
