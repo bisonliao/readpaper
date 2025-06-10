@@ -121,9 +121,7 @@ PPO算法，收集一次固定步数的数据，就利用这些数据若干次�
 
 #### 挤压函数的矫正
 
-我吐血的经验就是：不要信什么PPO的鲁棒性可以不用考虑挤压函数的矫正，PPO实现的时候一定要做好动作的挤压、缩放、平移，并对这些变换做好矫正！！！
-
-虽然实验部分的pendulum 1和pendulum 3都没有做矫正也收敛，但pendulum 2做了矫正就由不收敛变成收敛了。在这里花了三天时间！！！
+笔记的实验部分，pendulum 1 和 3都没有做挤压矫正，PPO也work了，但还是要注意action_raw和action_taken的区分，而log_prob是基于action_raw计算的。
 
 
 
@@ -728,7 +726,16 @@ if __name__ == "__main__":
 
 之所以重写，是因为在搞ICM + PPO不能收敛，就想着先把PPO搞收敛确保基础算法没有问题，然后就搞了一整天也不收敛，我要被搞哭了。
 
-**后来做了对挤压函数的矫正，才收敛**。但pendulum 1 和 3 都没有做矫正也可以收敛呀。
+**整整搞了两天：定位到了问题，是update函数里面，rewards和old_log_probs 的shape的问题引起了广播，他们都是(batchsz, )形状时候就会收敛，如果是(batchsz, 1)就不会收敛：**
+
+1. reward的形状会最终导致mb_advantages如果是(256,1)，而ratio是(256,)，那么surr1 = ratio * mb_advantages就会得到(256, 256)形状的tensor。surr2也会被这样影响，进一步policy_loss就乱了。其中256是mini-batch的大小
+2. old_log_probs 的形状最终影响了mb_old_log_probs , 如果是(256,1)，而new_log_probs是(256,)， 他们相减(new_log_probs - mb_old_log_probs).exp()的结果是(256, 256)
+
+**这也学到了一个经验：当遇到不收敛问题的时候，从头到尾检查一遍运行中的tensor的形状是否符合预期是非常关键的。**
+
+广播的技术细节：
+
+![image-20250611011242902](img/image-20250611011242902.png)
 
 有问题的代码：
 
@@ -929,7 +936,7 @@ class PPO:
         # 获取完整轨迹数据
         states, actions, rewards, dones, old_log_probs, values, next_states = self.trajectory_buffer.get_trajectory()
 
-        # 转换为tensor
+        # 转换为tensor， BUG在这里！！！！！！
         states = torch.FloatTensor(states).to(device)
         actions = torch.FloatTensor(actions).to(device)
         rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
