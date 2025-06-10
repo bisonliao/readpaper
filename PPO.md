@@ -787,7 +787,7 @@ class Actor(nn.Module):
             nn.ReLU()
         )
         self.max_action = max_action
-        self.mean = nn.Linear(hidden_dim // 2, 1)
+        self.mean = nn.Linear(hidden_dim // 2, action_dim)
         self.log_std = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
@@ -1137,7 +1137,7 @@ class PolicyNetwork(nn.Module):
     为了帮助网络学习，对 theta_dot 进行归一化。
     """
 
-    def __init__(self, state_dim, hidden_dim=128):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
         super().__init__()
         # 定义网络层，输出动作均值
         self.net = nn.Sequential(
@@ -1146,14 +1146,14 @@ class PolicyNetwork(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU()
         )
-        self.mean = nn.Linear(hidden_dim // 2, 1)  # Pendulum-v1 动作空间是 1 维
+        self.mean = nn.Linear(hidden_dim // 2, action_dim)  # Pendulum-v1 动作空间是 1 维
 
         # log_std 是一个可学习的参数，通常初始化为 0 或一个较小的值。
         # exp(log_std) 得到标准差。
         self.log_std = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
-        # 状态归一化 (根据 pendulum.py 的逻辑)
+        # 状态归一化 (根据 pendulum3.py 的逻辑)
         # 注意：这里假设 x 是已经处理过的原始环境观测，且我们知道其范围。
         # cos/sin(theta) 在 [-1, 1]，theta_dot 在 [-8, 8]。
         # 将 theta_dot 除以 8.0 进行归一化。
@@ -1217,13 +1217,13 @@ class PPOAgent:
         self.rollout_length = rollout_length  # 每次收集的轨迹长度
 
         # 网络初始化
-        self.policy = PolicyNetwork(state_dim).to(device)  #
+        self.policy = PolicyNetwork(state_dim, action_dim).to(device)  #
         self.value_fn = ValueNetwork(state_dim).to(device)  #
 
         # 优化器
-        # 策略网络的学习率与 pendulum.py 相同
+        # 策略网络的学习率与 pendulum3.py 相同
         self.optim_policy = optim.Adam(self.policy.parameters(), lr=policy_lr)
-        # 值函数网络的学习率与 pendulum.py 相同，这是关键的修正
+        # 值函数网络的学习率与 pendulum3.py 相同，这是关键的修正
         self.optim_value = optim.Adam(self.value_fn.parameters(), lr=value_lr)
 
         # 用于存储收集到的轨迹数据
@@ -1250,8 +1250,8 @@ class PPOAgent:
 
         state = current_state
         # 在收集数据时，Policy 和 Value 网络都应处于评估模式，避免梯度计算，提高效率。
-        # 这是 `PPO_pendulum.py` 的正确做法，也是 `pendulum.py` 理论上应该做的，
-        # 但 `pendulum.py` 即使不加 `no_grad` 也收敛，说明它没有利用这些梯度。
+        # 这是 `PPO_pendulum.py` 的正确做法，也是 `pendulum3.py` 理论上应该做的，
+        # 但 `pendulum3.py` 即使不加 `no_grad` 也收敛，说明它没有利用这些梯度。
         with torch.no_grad():
             while len(self.states) < self.rollout_length:
                 state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
@@ -1298,10 +1298,10 @@ class PPOAgent:
     def compute_gae_returns(self, rewards, values, dones, next_state_value):
         """
         计算广义优势估计 (GAE) 和回报 (Returns)。
-        参考 pendulum.py 的实现逻辑。
+        参考 pendulum3.py 的实现逻辑。
         """
         # 将最后一个状态的值添加到 values 列表中用于 bootstrapping
-        # 这是 pendulum.py 的做法，并被证实有效
+        # 这是 pendulum3.py 的做法，并被证实有效
         values_with_bootstrap = values + [next_state_value]  #
 
         gae = 0
@@ -1345,7 +1345,7 @@ class PPOAgent:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  #
 
         # --- PPO 更新循环 ---
-        # `pendulum.py` 是全批次更新，为了保持一致性，这里也采用全批次。
+        # `pendulum3.py` 是全批次更新，为了保持一致性，这里也采用全批次。
         # 如果需要 Mini-batch，可以像 `PPO_pendulum.py` 那样添加索引和循环。
         for i in range(self.ppo_epochs):  # PPO_epochs = 10
             # 获取新策略下的均值和标准差
@@ -1374,7 +1374,7 @@ class PPOAgent:
             # 策略网络更新
             self.optim_policy.zero_grad()
             policy_loss.backward()
-            # 注意：pendulum.py 没有梯度裁剪，我们这里也暂时不加，以保持一致性。
+            # 注意：pendulum3.py 没有梯度裁剪，我们这里也暂时不加，以保持一致性。
             self.optim_policy.step()
 
             # 值函数网络更新
@@ -1390,7 +1390,7 @@ class PPOAgent:
 
     def save(self, filename="./checkpoints/Pendulum_PPO_Refactored.pth"):
         """保存策略网络的模型权重。"""
-        # 注意：这里只保存 policy 网络，与 pendulum.py 保持一致。
+        # 注意：这里只保存 policy 网络，与 pendulum3.py 保持一致。
         # 如果需要保存整个 agent 的状态，可以保存 policy 和 value_fn 的 state_dict。
         torch.save(self.policy, filename)
         print(f"Model saved to {filename}")
@@ -1482,7 +1482,7 @@ if __name__ == "__main__":
     min_action = float(env.action_space.low[0])  # -2.0
     env.close()  # 临时关闭，因为 gym.make 可能会创建多个环境实例
 
-    # PPO Agent 初始化，使用与 pendulum.py 相同的超参数
+    # PPO Agent 初始化，使用与 pendulum3.py 相同的超参数
     agent = PPOAgent(state_dim=state_dim,
                      action_dim=action_dim,
                      max_action=max_action,
@@ -1494,7 +1494,7 @@ if __name__ == "__main__":
                      policy_lr=3e-4,
                      value_lr=1e-3,  # 确保这里是 1e-3，这是关键修正点
                      ppo_epochs=10,
-                     rollout_length=2048)  # 与 pendulum.py 相同
+                     rollout_length=2048)  # 与 pendulum3.py 相同
 
     # 训练智能体
     train(agent, env_name=env_name, max_total_steps=600_000)
