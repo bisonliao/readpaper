@@ -708,7 +708,11 @@ if __name__ == "__main__":
 
 最近状态跟吃了屎一样的，连pendulum都搞不定，明明代码看着和上面的没有什么区别，就是不收敛，但老子还是把它记录下来，错误和问题尤其值得记录。
 
-之所以重写，是因为在搞ICM + PPO不能收敛，就想着先把PPO搞收敛确保基础算法没有问题，然后就搞了一整天也不收敛。
+之所以重写，是因为在搞ICM + PPO不能收敛，就想着先把PPO搞收敛确保基础算法没有问题，然后就搞了一整天也不收敛，我要被搞哭了。
+
+后来修改了action采样和log_prob的计算，才收敛。
+
+有问题的代码：
 
 ```python
 import numpy as np
@@ -1091,6 +1095,478 @@ if __name__ == "__main__":
     # 关闭环境
     env.close()
 ```
+
+实在没有办法了，我就把action和log_prob对应起来，而不是action,action_raw和log_prob三个中的后两者对应起来。这样已调整居然就收敛了：
+
+![image-20250610163538767](img/image-20250610163538767.png)
+
+修改后收敛的代码：
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal, Independent
+from collections import deque
+import random
+import gymnasium as gym
+import gymnasium_robotics
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# 定义设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# todo: 这个跟RL环境强相关，需要根据情况修改
+writer = SummaryWriter(log_dir=f'logs/pendulum_ppo_{datetime.now().strftime("%y%m%d_%H%M%S")}')
+
+# 设置随机种子
+torch.manual_seed(42)
+np.random.seed(42)
+
+# 轨迹存储
+class TrajectoryBuffer:
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.next_states = []
+
+    def clear(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.next_states = []
+
+    def store(self, state, action, reward, done, log_prob, value, next_state):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.next_states.append(next_state)
+
+    def get_trajectory(self):
+        return (
+            np.array(self.states),
+            np.array(self.actions),
+            np.array(self.rewards),
+            np.array(self.dones),
+            np.array(self.log_probs),
+            np.array(self.values),
+            np.array(self.next_states)
+        )
+
+
+
+# PPO Actor网络 (保持不变)
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, max_action, min_action, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU()
+        )
+        self.max_action = max_action
+        self.mean = nn.Linear(hidden_dim // 2, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+
+    def forward(self, x):
+        x = x / torch.tensor([1.0, 1.0, 8.0], device=x.device)  # normalize
+        x = self.net(x)
+        mean = self.mean(x)
+        std = self.log_std.exp().expand_as(mean)
+        return mean, std
+
+    def get_distribution(self, state):
+        """
+        返回一个被 Independent 包装的多元正态分布
+        """
+        mean, std = self.forward(state)
+        normal = Normal(mean, std)
+        # 将最后一个维度（action_dim）解释为事件维度
+        return Independent(normal, 1)
+
+    def sample(self, state):
+        dist = self.get_distribution(state)
+
+        # 原始高斯分布采样值 x
+        x = dist.rsample()  # x 的形状是 (batch_size, action_dim)
+
+        # 1. 经过 tanh 变换的动作 (范围在 (-1, 1))
+        action_tanh = torch.tanh(x)
+
+        # 2. 经过缩放的最终动作 (范围在 (-max_action, max_action))
+        action_scaled = action_tanh * self.max_action
+
+        # 3. 计算 log_prob (注意：这里的 log_prob 是 P(x) 的对数概率)
+        # dist.log_prob(x) 已经对 action_dim 进行了求和，形状为 (batch_size,)
+        log_prob_x_summed = dist.log_prob(x).unsqueeze(-1)  # 增加一个维度，使其形状为 (batch_size, 1)
+
+        # 4. 计算修正项 (针对 A = C * tanh(X))
+        # 修正项的每个部分也需要对 action_dim 求和
+        # 修正项1: -log(C)
+        correction_term_C = torch.log(torch.tensor(self.max_action, device=state.device))  # log(C)
+
+        # 修正项2: -log(1 - (a/C)^2)
+        # 注意这里使用的是 action_tanh, 因为 action_tanh = a/C
+        correction_term_tanh_part = torch.log(1 - action_tanh.pow(2) + 1e-6)  # 形状是 (batch_size, action_dim)
+
+        # 对修正项求和（因为 log_prob_x_summed 已经求和了）
+        # 修正项的总和是 -log(C) * action_dim - sum(log(1 - tanh_val^2))
+        # 简化：可以直接用 log(1 - action_tanh.pow(2)) 对每个维度求和。
+        # 最终的修正项为： log(1 - (action_scaled / self.max_action).pow(2) + 1e-6)
+        # 这就是 tanh(x) 的导数修正项。
+
+        # 重新整理修正项的逻辑
+        # log P(action_scaled) = log P(x) - log |d(action_scaled)/dx|
+        # action_scaled = C * tanh(x)
+        # d(action_scaled)/dx = C * (1 - tanh^2(x))
+        # log |d(action_scaled)/dx| = log(C) + log(1 - tanh^2(x))
+        # = log(C) + log(1 - (action_scaled/C)^2)
+
+        # 所以：
+        # log P(action_scaled) = log P(x) - (log(C) + log(1 - (action_scaled/C)^2))
+        #                     = log P(x) - log(C) - log(1 - (action_scaled/C)^2)
+
+        log_prob_scaled_action = log_prob_x_summed \
+                                 - torch.log(torch.tensor(self.max_action, device=state.device)) \
+                                 - torch.log(1 - (action_scaled / self.max_action).pow(2) + 1e-6).sum(dim=-1,
+                                                                                                      keepdim=True)
+
+        # Entropy 也应该使用 dist.entropy()，它会返回整个多元分布的熵
+        return action_scaled, log_prob_scaled_action, dist.entropy().mean()
+
+    def get_new_log_prob(self, state, old_action_scaled):
+        """
+        计算给定状态下，指定动作（old_action_scaled，已缩放）在当前策略下的对数概率。
+        Args:
+            state (torch.Tensor): 输入状态。
+            old_action_scaled (torch.Tensor): 在旧策略下采样的、已缩放的动作。
+                                               这些动作的范围在 (-max_action, max_action)。
+        Returns:
+            torch.Tensor: 指定动作在当前策略下的对数概率，形状为 (batch_size, 1)。
+        """
+        dist = self.get_distribution(state)
+
+        # 1. 将已缩放的动作反向缩放回 (-1, 1) 范围
+        action_tanh = old_action_scaled / self.max_action
+
+        # 2. 将 tanh 变换后的动作反向变换回原始高斯分布的值 x
+        # 注意：这里的 action_tanh 也需要裁剪，因为 atanh 的定义域是 (-1, 1)
+        action_tanh_clipped = torch.clamp(action_tanh, -0.999999, 0.999999)
+        x_from_action = torch.atanh(action_tanh_clipped)
+
+        # 3. 计算 log_prob P(x)
+        log_prob_x_summed = dist.log_prob(x_from_action).unsqueeze(-1)
+
+        # 4. 计算修正项 (与 sample 函数中相同)
+        log_prob_scaled_action = log_prob_x_summed \
+                                 - torch.log(torch.tensor(self.max_action, device=state.device)) \
+                                 - torch.log(1 - action_tanh.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
+
+        return log_prob_scaled_action, dist.entropy().mean()
+
+
+
+# PPO Critic网络 (保持不变)
+class Critic(nn.Module):
+    def __init__(self, state_dim, hidden_dim=128):
+        super(Critic, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, state):
+        # todo: 这个跟RL环境强相关，需要根据情况修改
+        state = state / torch.tensor([1.0, 1.0, 8.0], device=state.device)  # normalize
+        return self.net(state)
+
+
+# 标准PPO算法
+class PPO:
+    def __init__(self, state_dim, action_dim, max_action, min_action):
+        self.max_action = max_action
+        self.gamma = 0.99
+        self.gae_lambda = 0.95
+        self.ppo_eps = 0.2
+        self.entropy_coef = 0.001
+        self.value_loss_coef = 1.0
+        self.max_grad_norm = 0.5
+        self.ppo_epochs = 10
+        self.mini_batch_size = 256
+        # todo: 这个跟RL环境强相关，需要根据情况修改
+        self.trajectory_length = 2048  # 每个轨迹收集的步数
+
+        self.actor = Actor(state_dim, action_dim, max_action, min_action).to(device)
+        self.critic = Critic(state_dim).to(device)
+
+
+        self.optimizer_actor = optim.Adam( self.actor.parameters(), lr=3e-4)
+        self.optimizer_critic = optim.Adam(self.critic.parameters(), lr=1e-3)
+
+        self.trajectory_buffer = TrajectoryBuffer()
+        self.total_step = 1
+        self.update_cnt = 0
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(device).unsqueeze(0)
+        with torch.no_grad():
+            action, log_prob, _ = self.actor.sample(state)
+            value = self.critic(state)
+        return action.cpu().numpy().flatten(), log_prob.cpu().item(), value.cpu().item()
+
+    def compute_gae(self, rewards, dones, values):
+        '''
+        # 输入：
+        # - rewards:       [r_0, r_1, ..., r_{T-1}]           当前 episode 或 trajectory 的即时奖励
+        # - values:        [V(s_0), V(s_1), ..., V(s_T)]      每个状态的值函数估计，包括最后一个 bootstrap 值
+        # - dones:         [done_0, done_1, ..., done_{T-1}]  终止标志，1 表示 episode 结束（用于mask）
+        # - gamma:         折扣因子（例如 0.99）
+        # - lambda_:       GAE 的平滑参数（例如 0.95）
+        # 输出：
+        # - returns:       每个时间步的总期望回报，用于训练 Critic
+        # - advantages:    每个时间步的优势估计，用于训练 Actor
+
+        T = len(rewards)
+        advantages = zeros_like(rewards)
+        returns = zeros_like(rewards)
+        gae = 0
+
+        for t in reversed(range(T)):
+            # 如果当前 step 是终止状态，则未来无回报
+            if dones[t]:
+                delta = rewards[t] - values[t]
+                gae = delta
+            else:
+                delta = rewards[t] + gamma * values[t+1] - values[t]  # TD误差
+                gae = delta + gamma * lambda_ * gae
+
+            advantages[t] = gae
+            returns[t] = advantages[t] + values[t]  # return = advantage + value  ==> bootstrapped return
+        return returns, advantages
+        '''
+        returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
+
+        gae = 0.0
+        masks = 1 - dones
+
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + self.gamma * masks[t] * values[t+1] - values[t]
+            gae = delta + self.gamma * self.gae_lambda * gae
+
+            returns[t] = gae + values[t]
+            advantages[t] = gae
+
+        return returns, advantages
+
+    def update(self, last_state):
+        # 获取完整轨迹数据
+        states, actions, rewards, dones, old_log_probs, values, next_states = self.trajectory_buffer.get_trajectory()
+
+        # 转换为tensor
+        states = torch.FloatTensor(states).to(device)
+        actions = torch.FloatTensor(actions).to(device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
+        old_log_probs = torch.FloatTensor(old_log_probs).unsqueeze(1).to(device)
+        values = torch.FloatTensor(values).unsqueeze(1).to(device)
+        next_states = torch.FloatTensor(next_states).to(device)
+
+
+        total_rewards = rewards
+
+
+        # 记录指标
+        writer.add_scalar('train/step_reward_mean', rewards.mean().item(), self.total_step)
+
+        # 计算最后一个状态的值
+        with torch.no_grad():
+            last_state = torch.FloatTensor(last_state).unsqueeze(0).to(device)
+            last_values = self.critic(last_state)
+            values_for_gae = torch.cat([values, last_values])
+
+        # 计算GAE和returns
+        returns, advantages = self.compute_gae(total_rewards, dones, values_for_gae)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        #writer.add_scalar('train/returns_mean', returns.mean(), self.total_step)
+        #writer.add_scalar('train/advantages_mean', advantages.mean(), self.total_step)
+        #writer.add_scalar('train/advantages_max', advantages.max(), self.total_step)
+        #writer.add_scalar('train/advantages_min', advantages.min(), self.total_step)
+
+
+        # 准备批量数据
+        batch_size = states.size(0)
+        indices = np.arange(batch_size)
+
+        # PPO多epoch更新
+        update_times = 0 # 用于抽样上报tb
+        for _ in range(self.ppo_epochs):
+            np.random.shuffle(indices)
+
+            for start in range(0, batch_size, self.mini_batch_size):
+                update_times += 1
+                end = min(batch_size, start + self.mini_batch_size)
+                idx = indices[start:end]
+
+                # 获取mini-batch数据
+                mb_states = states[idx]
+                mb_next_states = next_states[idx]
+                mb_actions = actions[idx]
+                mb_old_log_probs = old_log_probs[idx]
+                mb_advantages = advantages[idx]
+                mb_returns = returns[idx]
+
+
+                # 计算新的动作概率和值
+
+                new_log_probs, entropy = self.actor.get_new_log_prob(mb_states, mb_actions)
+
+                new_values = self.critic(mb_states)
+
+                # 计算比率
+                ratio = (new_log_probs - mb_old_log_probs).exp()
+                approx_kl = (mb_old_log_probs - new_log_probs).mean()
+
+
+                # 计算策略损失
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.ppo_eps, 1.0 + self.ppo_eps) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+
+                self.optimizer_actor.zero_grad()
+                policy_loss.backward()
+                self.optimizer_actor.step()
+
+                # 计算值函数损失
+                value_loss = F.mse_loss(new_values, mb_returns)
+                self.optimizer_critic.zero_grad()
+                value_loss.backward()
+                self.optimizer_critic.step()
+
+                self.update_cnt += 1
+
+                # 记录指标
+                if update_times == 1:
+                    writer.add_scalar('train/policy_loss', policy_loss.item(), self.total_step)
+                    writer.add_scalar('train/value_loss', value_loss.item(), self.total_step)
+                    writer.add_scalar('train/entropy', entropy.item(), self.total_step)
+                    writer.add_scalar('train/kl', approx_kl.item(), self.total_step)
+                    writer.add_scalar('train/updates', self.update_cnt, self.total_step)
+
+        self.trajectory_buffer.clear()
+
+
+# 训练函数
+def train(env, agent, max_epoch, max_steps):
+
+    for epoch in tqdm(range(max_epoch), 'train'):
+        state, _ = env.reset()
+        episode_reward = 0
+        episode_steps = 0
+        # 收集轨迹数据
+        for _ in range(agent.trajectory_length):
+            action, log_prob, value = agent.select_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+
+            agent.trajectory_buffer.store(
+                state, action, reward, done, log_prob, value, next_state
+            )
+
+            state = next_state
+            episode_reward += reward
+            episode_steps += 1
+            agent.total_step += 1
+
+            # todo: 这个跟RL环境强相关，需要根据情况修改
+            if done or episode_steps >= max_steps:
+                writer.add_scalar('train/episode_reward', episode_reward, agent.total_step)
+                state, _ = env.reset()
+                episode_reward = 0
+                episode_steps = 0
+        # 更新网络
+        agent.update(next_state)
+
+    torch.save(agent.actor, "./ppo_pendulum.pth")
+def show(filename="./ppo_pendulum.pth"):
+
+    env = gym.make("Pendulum-v1", render_mode='human')
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    min_action = float(env.action_space.low[0])
+
+    policy = Actor(state_dim, action_dim,max_action, min_action).to(device)
+    policy = torch.load(filename, weights_only=False)
+    policy.eval()
+    state, _ = env.reset()
+    for i in range(2000):
+        state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
+        with torch.no_grad():
+            mean, std = policy(state_tensor.unsqueeze(0))
+        '''dist = Independent(Normal(mean, std), 1)
+        action_raw = dist.rsample()'''
+        action_raw = mean
+        action = torch.tanh(action_raw) * env.action_space.high[0]
+        action_np = action.squeeze(0).cpu().numpy()
+        next_state, reward, terminated, truncated, _ = env.step(action_np)
+        state = next_state
+        env.render()
+
+
+# 主函数
+if __name__ == "__main__":
+    # 创建环境
+    #env = CustomFetchReachEnv()
+    env = gym.make('Pendulum-v1')
+
+    # 获取环境参数
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    min_action = float(env.action_space.low[0])
+    print(f"action range:{min_action}~{max_action}")
+
+    # 初始化PPO+ICM智能体
+    agent = PPO(state_dim, action_dim, max_action, min_action)
+
+    # 训练参数
+    max_epoches = 400
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+    max_steps = 1000  # 每个episode最大步数
+
+    # 开始训练
+    train(env, agent, max_epoches, max_steps)
+
+    # 保存最终模型
+    # todo: 这个跟RL环境强相关，需要根据情况修改
+
+
+    # 关闭环境
+    env.close()
+
+    show()
+```
+
+
 
 ##### pendulum 3
 
