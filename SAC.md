@@ -147,6 +147,9 @@ class PolicyNetwork(nn.Module):
         action = torch.tanh(x)
 
         log_prob = normal.log_prob(x)
+        # This is the crucial part, known as the "log-derivative of the tanh transformation" or 
+        # the "correction term for squashing functions".
+        # It help to get the log_prob of the squashed action (action) in the squashed space
         log_prob -= torch.log(1 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
 
