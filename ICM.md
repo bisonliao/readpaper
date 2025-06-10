@@ -2189,7 +2189,7 @@ if __name__ == "__main__":
     env.close()
 ```
 
-##### RLeXplore （失败了）
+##### RLeXplore+PPO （失败了）
 
 只能到40%左右的成功率，让我想起了HER算法的FetchReach任务，也是只有40%成功率
 
@@ -2388,9 +2388,9 @@ if __name__ == '__main__':
 
 经过前面那么多失败，浪费了半个星期的时间后，我开始梳理思路稳打稳扎：
 
-1. 首先，我找到一个代码结构优雅、已经在pendulum和BipedalWalker上都验证可以收敛的PPO代码，见PPO论文笔记
-2. 然后我修改PPO代码，适配CustomFetchReachEnv环境，先不用ICM，只使用外部的成功时刻返回的奖励
-3. 第三步，我再继续追加ICM机制
+1. 首先，我找到一个代码结构优雅、**已经在pendulum和BipedalWalker上都验证可以收敛的PPO代码**，见PPO论文笔记
+2. 然后我修改PPO代码，适配CustomFetchReachEnv环境，先不用ICM，只使用外部的成功时刻返回的奖励。有28%的任务成功率
+3. 第三步，我再继续追加ICM机制。任务成功率非常低，ICM似乎还起了反作用。
 
 只使用PPO不启用ICM的运行情况如下，有30%的回合是成功的：
 
@@ -2398,7 +2398,7 @@ if __name__ == '__main__':
 
 ![image-20250610092408610](img/image-20250610092408610.png)
 
-![image-20250608195910950](img/image-20250608195910950.png)
+
 
 ```python
 import numpy as np
@@ -2470,7 +2470,7 @@ class CustomFetchReachEnv(gym.Env):
 
 # ICM模块 (保持不变)
 class ICM(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, eta=1000, feature_dim=288):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, eta=1.0, feature_dim=288):
         super(ICM, self).__init__()
         self.eta = eta
 
@@ -2543,7 +2543,7 @@ class PolicyNetwork(nn.Module):
         # exp(log_std) 得到标准差。
         self.log_std = nn.Parameter(torch.zeros(action_dim,))
 
-    def forward(self, x):
+    def forward(self, x:torch.Tensor):
 
         # todo:这里需要按任务实际情况修改
         normalized_x = x
@@ -2617,6 +2617,8 @@ class PPOAgent:
         if use_icm:
             self.icm = ICM(self.state_dim, self.action_dim).to(device)
             self.optim_icm = optim.Adam(self.icm.parameters(), lr=icm_lr)
+
+
 
         # 用于存储收集到的轨迹数据
         self.states = []
@@ -2742,9 +2744,16 @@ class PPOAgent:
         if use_icm:
             actions_tanh = torch.tanh(actions_raw) * self.max_action
             intrinsic_reward = self.icm.compute_intrinsic_reward(states, next_states, actions_tanh)
-            writer.add_scalar('stats/intrinsic_reward_mean', intrinsic_reward.mean().item(), self.total_steps)
-            writer.add_scalar('stats/intrinsic_reward_std', intrinsic_reward.std().item(), self.total_steps)
-            rewards = rewards + intrinsic_reward.squeeze(-1)
+            '''
+            我觉得对intrinsic_reward做归一化不合适，不利于跨rollout的相互比较状态的“新颖程度”，不同rollout的奖励都被拉平了
+            我和AI讨论了这个问题，AI赞同我的看法，但还是坚持要做rollout内的归一化，原因是为了稳定训练的妥协
+            可以参考RND算法，做全局的归一化，前面先跑一段rollout收集均值和方差。
+            '''
+            intrinsic_reward = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std() + 1e-8)
+            sample_idx = random.randint(0, len(intrinsic_reward)-1)
+            writer.add_scalar('stats/intrinsic_reward_sample', intrinsic_reward[sample_idx].item(), self.total_steps)
+            # todo:这里需要按任务实际情况修改
+            rewards = rewards + intrinsic_reward.squeeze(-1) * 0.05 # 乘以系数，避免ICM影响太大
 
         # 计算回报和优势
         returns = self.compute_gae_returns(rewards, self.values_old, dones, next_value)  #
