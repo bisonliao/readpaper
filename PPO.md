@@ -119,11 +119,23 @@ PPO算法，收集一次固定步数的数据，就利用这些数据若干次�
 
 另外要特别小心在用GAE或者MTC计算优势函数的时候，done字段的意义和last value的处理。
 
+#### 挤压函数的矫正
+
+![image-20250610195812907](img/image-20250610195812907.png)
+
+**上述逻辑的代码实现，我通常交给AI来做，但是AI也可能实现有隐藏的bug，这种bug不是运行报错，而是导致不收敛，而我们又不确定不收敛是因为这里的bug导致的，所以容易出现耗费一天两天毫无进展的苦恼情况。**
+
+**反正这里要提高警惕，多review，多找几个不同的AI实现几次多实验几次。**
+
 ### Experiments
 
 下图是在一系列任务上的与其他算法的性能对比
 
 ![image-20250428172038764](img/image-20250428172038764.png)
+
+
+
+
 
 ### show me the code
 
@@ -710,7 +722,7 @@ if __name__ == "__main__":
 
 之所以重写，是因为在搞ICM + PPO不能收敛，就想着先把PPO搞收敛确保基础算法没有问题，然后就搞了一整天也不收敛，我要被搞哭了。
 
-后来修改了action采样和log_prob的计算，才收敛。AI说修改后的才是正宗的，pendulum 1里的处理方式并不完全对。
+**后来做了对挤压函数的矫正，才收敛**。但pendulum 1 和 3 都没有做矫正也可以收敛呀。
 
 有问题的代码：
 
@@ -792,7 +804,7 @@ class Actor(nn.Module):
         )
         self.max_action = max_action
         self.mean = nn.Linear(hidden_dim // 2, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(1))
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, x):
         x = x / torch.tensor([1.0, 1.0, 8.0], device=x.device)  # normalize
@@ -1096,7 +1108,7 @@ if __name__ == "__main__":
     env.close()
 ```
 
-实在没有办法了，我就把action和log_prob对应起来，而不是action,action_raw和log_prob三个中的后两者对应起来。这样已调整居然就收敛了：
+##### pendulum 2的挤压函数矫正版本
 
 ![image-20250610163538767](img/image-20250610163538767.png)
 
