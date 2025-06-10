@@ -121,6 +121,12 @@ PPO算法，收集一次固定步数的数据，就利用这些数据若干次�
 
 #### 挤压函数的矫正
 
+我吐血的经验就是：不要信什么PPO的鲁棒性可以不用考虑挤压函数的矫正，PPO实现的时候一定要做好动作的挤压、缩放、平移，并对这些变换做好矫正！！！
+
+虽然实验部分的pendulum 1和pendulum 3都没有做矫正也收敛，但pendulum 2做了矫正就由不收敛变成收敛了。在这里花了三天时间！！！
+
+
+
 ![image-20250610195812907](img/image-20250610195812907.png)
 
 **上述逻辑的代码实现，我通常交给AI来做，但是AI也可能实现有隐藏的bug，这种bug不是运行报错，而是导致不收敛，而我们又不确定不收敛是因为这里的bug导致的，所以容易出现耗费一天两天毫无进展的苦恼情况。**
@@ -676,7 +682,7 @@ def train():
         for _ in range(10):  # PPO更新迭代次数
             mean, std = policy(states)
             dist = Independent(Normal(mean, std), 1)
-            log_probs_new = dist.log_prob(actions) #新的分布，但参数确是旧的原始动作！！！
+            log_probs_new = dist.log_prob(actions) #新的分布，但参数却是旧的原始动作！！！
             entropy = dist.entropy().mean()
 
             ratio = torch.exp(log_probs_new - log_probs_old)
