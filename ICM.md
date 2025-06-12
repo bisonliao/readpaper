@@ -936,24 +936,33 @@ env.close()
 
 
 
-#### FetchReach 
+#### FetchReach 任务
 
 ##### 环境的特殊性
 
 fetchReach这个任务，除了奖励稀疏，和以往的任务不同的地方在于：
 
-1. 目标位置每个回合都随机的变化，所以RL的策略模型/价值模型是需要输入目标位置信息的，也就是目标位置信息要作为state的一部分输入，否则怎么可能指导agent把手臂移动到目标位置呢
+1. **目标位置每个回合都随机的变化**，所以RL的策略模型/价值模型是需要输入目标位置信息的，也就是目标位置信息要作为state的一部分输入，否则怎么可能指导agent把手臂移动到目标位置呢
 2. reset()/step()函数以dict的形式，返回了通常的观测信息、achieved_goal、desired_goal
 
 不注意上面这个特殊情况，很容易就实验失败而不自知原因。
 
-##### 手动构造reward+SAC，不使用ICM （失败了）
+##### 手动构造reward+SAC，不使用ICM （35%成功率）
 
 环境的再封装，实现：
 
 1. 环境返回的state里要包含desired_goal
 2. 环境的observation_space需要相应的改动
 3. 手动构造reward，根据到desired_goal的距离变化，返回reward
+
+
+
+验证结果：
+
+1. 首先验证SAC代码没有明显问题，使用bipedalwalker任务验证。可以看到很好的收敛。
+2. 如果固定desired_goal（虽然不是我们想要的，但看看这种情况下是否能收敛），结果显示100%的成功率，符合预期。
+3. 如果不固定desired_goal，成功率35%左右。
+4. 不固定desired_goal，改为使用SB3实现的SAC，成功率可以到40%
 
 
 
@@ -1001,9 +1010,6 @@ class CustomFetchReachEnv(gym.Env):
         """
         super().__init__()
 
-        self.prev_achieved = None
-
-
 
         # 创建原始 FetchReach-v3 环境
         self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
@@ -1018,6 +1024,7 @@ class CustomFetchReachEnv(gym.Env):
 
         # 初始化渲染模式
         self.render_mode = render_mode
+        self.desired_goal = None
 
 
 
@@ -1026,11 +1033,21 @@ class CustomFetchReachEnv(gym.Env):
         重置环境，返回初始观测和 info。
         """
         obs, info = self._env.reset(seed=seed, options=options)
-        state = np.concat( [obs['observation'],obs['desired_goal'] ] )
+        '''
+        #尝试固定目标位置进行训练，结果显示可以到达100%成功率
+        if self.desired_goal is None:
+            self.desired_goal = obs['desired_goal']
+            print(f"desired:{self.desired_goal}")
+            writer.add_text('desired_goal', f"{self.desired_goal}", 1)'''
 
-        info['desired_goal'] = obs['desired_goal']
+        self.desired_goal = obs['desired_goal']
 
-        self.prev_achieved = obs['achieved_goal']
+
+        state = np.concatenate( [obs['observation'],self.desired_goal ] )
+
+        info['desired_goal'] = self.desired_goal
+
+
 
         return state, info
 
@@ -1041,12 +1058,12 @@ class CustomFetchReachEnv(gym.Env):
         """
         obs, external_reward, terminated, truncated, info = self._env.step(action)
         self.total_step += 1
-        state = np.concat( [obs['observation'],obs['desired_goal'] ] )
-        info['desired_goal'] = obs['desired_goal']
+        state = np.concatenate( [obs['observation'],self.desired_goal ] )
+        info['desired_goal'] = self.desired_goal
 
         # 获取 gripper 位置和目标位置（FetchReach 的 obs 包含这些信息）
         gripper_pos = obs["observation"][:3]  # 前 3 维是 gripper 的 (x, y, z)
-        target_pos = obs["desired_goal"]  # 目标位置
+        target_pos = self.desired_goal # 目标位置
 
         # 计算 gripper 到目标的欧氏距离
         distance = np.linalg.norm(gripper_pos - target_pos)
@@ -1054,21 +1071,20 @@ class CustomFetchReachEnv(gym.Env):
         # 设计密集奖励（距离越小，奖励越大）
         handcrafted_reward = -distance  # 可以加一个缩放系数，如 -0.1 * distance
 
-		# 另外一种奖励方式我也有尝试：比较step前后两次对desired_goal的距离，
-        # 如果缩小>=2cm就+0.3，变大>=2cm就-0.3，其他为0
 
-        # 我自行判断是否成功了，并修改外部reward
-        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+        success = np.linalg.norm(obs['achieved_goal'] - self.desired_goal) < 0.05
         if success:
             external_reward = 1
             terminated = True
         else:
             external_reward = handcrafted_reward
+            if terminated:
+                print(f"mismatch!!, {self.desired_goal}, {obs['desired_goal']}, {obs['achieved_gaol']}, {gripper_pos}")
 
         # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
         info["is_success"] = success
 
-        self.prev_achieved = obs['achieved_goal'] # 记录这次到达的位置
+
 
         return state, external_reward, terminated, truncated, info
 
@@ -1192,8 +1208,6 @@ class SAC:
         self.critic_target = Critic(state_dim, action_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-
-
         # 优化器
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
@@ -1281,43 +1295,20 @@ class SAC:
         for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-    def save(self, filename):
-        torch.save({
-            'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
-            'critic_target': self.critic_target.state_dict(),
 
-            'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic_optimizer': self.critic_optimizer.state_dict(),
-
-            'log_alpha': self.log_alpha,
-            'alpha_optimizer': self.alpha_optimizer.state_dict(),
-        }, filename)
-
-    def load(self, filename):
-        checkpoint = torch.load(filename)
-        self.actor.load_state_dict(checkpoint['actor'])
-        self.critic.load_state_dict(checkpoint['critic'])
-        self.critic_target.load_state_dict(checkpoint['critic_target'])
-
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
-
-        self.log_alpha = checkpoint['log_alpha']
-        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
 
 
 # 训练函数
 def train(env, agent, max_episodes, max_steps, batch_size):
     episode_rewards = []
 
-    results = deque(maxlen=100)
-
+    last100 = deque(maxlen=100)
     for episode in tqdm(range(max_episodes), 'train'):
         state,_ = env.reset()
         episode_reward = 0
         episode_len = 0
 
+        flag = False
         for step in range(max_steps):
             action = agent.select_action(state)
             next_state, reward, terminated, truncated, info = env.step(action)
@@ -1325,10 +1316,8 @@ def train(env, agent, max_episodes, max_steps, batch_size):
             agent.total_step += 1
 
             if info['is_success']:
-                results.append(1)
-                writer.add_scalar('steps/success', results.count(1), agent.total_step)
-            else:
-                results.append(0)
+                flag = True
+
 
             # 存储经验
             agent.replay_buffer.push(state, action, next_state, reward, done)
@@ -1345,14 +1334,16 @@ def train(env, agent, max_episodes, max_steps, batch_size):
                 break
 
         episode_rewards.append(episode_reward)
-        writer.add_scalar('steps/success_rate', results.count(1) / 100, agent.total_step)
+
         writer.add_scalar('steps/episode_rew', episode_reward, agent.total_step)
         writer.add_scalar('steps/episode_len', episode_len, agent.total_step)
-
-
-        # 每100个episode保存一次模型
-        if (episode + 1) % 1000 == 0:
-            agent.save(f"sac_icm_checkpoint_{episode + 1}.pth")
+        writer.add_scalar('steps/suc_ratio', last100.count(1) / 100.0, agent.total_step)
+        if flag:
+            last100.append(1)
+            writer.add_scalar('episode/suc_flag', 1, episode)
+        else:
+            last100.append(0)
+            writer.add_scalar('episode/suc_flag', 0, episode)
 
     return episode_rewards
 
@@ -1371,7 +1362,7 @@ if __name__ == "__main__":
     agent = SAC(state_dim, action_dim, max_action)
 
     # 训练参数
-    max_episodes = 5000  # 最大训练episode数
+    max_episodes = 2000  # 最大训练episode数
     max_steps = 100  # 每个episode最大步数
     batch_size = 256  # 批量大小
 
@@ -1395,7 +1386,9 @@ if __name__ == "__main__":
 2. 环境的observation_space需要相应的改动
 3. 使用ICM机制构造内部奖励
 
-   
+
+
+不启用ICM的情况下，SAC in SB3经历200K时间步，success_rate一直是0.
 
 6800多个episode下来，success rate也没有起色，而HER算法在200多episode的时候成功率开始上升。
 
@@ -2132,6 +2125,7 @@ def train(env, agent, max_episodes, max_steps, batch_size):
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             agent.total_step += 1
+            # todo: BUG!!!!!!!!!!!!!!!!!!!
             if reward > 0:
                 results.append(1)
             else:
@@ -2189,13 +2183,15 @@ if __name__ == "__main__":
     env.close()
 ```
 
-##### RLeXplore+PPO （失败了）
+##### RLeXplore+PPO （40%成功率）
 
 只能到40%左右的成功率，让我想起了HER算法的FetchReach任务，也是只有40%成功率
 
 ![image-20250608140745145](img/image-20250608140745145.png)
 
+后来多尝试几次发现不稳定，很多时候成功率没有上面高...
 
+![image-20250612124240692](img/image-20250612124240692.png)
 
 ```python
 import gymnasium as gym
@@ -2309,7 +2305,7 @@ class CustomFetchReachEnv(gym.Env):
         return self._env
 
 
-
+# 用回调的方式，与SB3的主干算法结合
 class RLeXploreWithOnPolicyRL(BaseCallback):
     """
     A custom callback for combining RLeXplore and on-policy algorithms from SB3.
@@ -2346,7 +2342,7 @@ class RLeXploreWithOnPolicyRL(BaseCallback):
         # ===================== compute the intrinsic rewards ===================== #
         # prepare the data samples
         obs = th.as_tensor(self.buffer.observations)
-        # get the new observations
+        # get the new observations，其实是next_obs
         new_obs = obs.clone()
         new_obs[:-1] = obs[1:]
         new_obs[-1] = th.as_tensor(self.locals["new_obs"])
@@ -2389,16 +2385,18 @@ if __name__ == '__main__':
 经过前面那么多失败，浪费了半个星期的时间后，我开始梳理思路稳打稳扎：
 
 1. 首先，我找到一个代码结构优雅、**已经在pendulum和BipedalWalker上都验证可以收敛的PPO代码**，见PPO论文笔记
-2. 然后我修改PPO代码，适配CustomFetchReachEnv环境，先不用ICM，只使用外部的成功时刻返回的奖励。有28%的任务成功率
+2. 然后我修改PPO代码，适配CustomFetchReachEnv环境，先不用ICM，**只使用外部的成功时刻返回的稀疏奖励**。有28%的任务成功率。但这个有偶然性，要多试几次，有时候完全没有成功的。
 3. 第三步，我再继续追加ICM机制。任务成功率非常低，ICM似乎还起了反作用。
 
-只使用PPO不启用ICM的运行情况如下，有30%的回合是成功的：
+
 
 ![image-20250610024822533](img/image-20250610024822533.png)
 
 ![image-20250610092408610](img/image-20250610092408610.png)
 
+**在使用 PPO 算法训练时，如果监控到 entropy（策略熵）不断增大，这是一个高度可靠的信号，提示模型没有收敛，甚至可能在发散**。
 
+**PPO 中 value 网络的 loss（一般是均方误差 MSE loss）也是判断模型是否收敛的一个非常可靠指标**。如果 value loss **长期很高、下降缓慢或震荡不定**说明根本没有学到东西。
 
 ```python
 import numpy as np
