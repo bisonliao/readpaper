@@ -643,7 +643,7 @@ if __name__ == "__main__":
 
 ```
 
-##### 网上开源的代码（复现不能收敛）
+##### 网上开源的代码（35%成功率）
 
 [这个小哥的项目](https://github.com/Emre-Akgul/Robot-Trajectory-Planner/tree/main?tab=readme-ov-file)，代码非常清晰。他的readme里说是收敛的，但是我执行下来6000多个回合（30万时间步），不能收敛：
 
@@ -840,7 +840,7 @@ class HERReplayBuffer:
 
 ```
 
-##### 继续各种挣扎
+##### 继续各种挣扎（没有进一步提升）
 
 在小哥的代码基础上尝试：
 
