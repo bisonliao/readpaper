@@ -101,13 +101,15 @@ RND方法适合局部探索，例如短期决策带来的后果，它不适合�
 
 ### bison的实验
 
-#### 1、基于策略网络的强化学习
+#### 1、自定义的迷宫任务
+
+##### 基于策略网络的强化学习
 
 暂时还没有信心训练agent玩蒙特祖玛的复仇，搞个简单的：一个迷宫有6个房间，房间之间只有一个小通道，移动的时候没有奖励，找到截至位置奖励1。
 
 对比有无RND方法的帮助，训练收敛速度和最优路径（步数最少）
 
-##### 问题一：
+###### 问题一：
 
 下面的代码，光说不使用RND的方式下，就搞了我一整天，出发点所在的第一个“房间”里的策略总是不正确，后面的房间里的策略都正确，哪怕训练5万个回合。我想了又想，可能和回报的归一化有关：我把回报减去均值再除以标准差，这样导致一个回合下早期时间步对应的回报总是负数，后期时间步的回报总是正数，不合理。
 
@@ -478,7 +480,7 @@ writer.close()
 
 ```
 
-##### 问题二：
+###### 问题二：
 
 终点位置太过“隐蔽”不能探索到，导致每个回合的奖励和回报都是全0，不能形成有效梯度，也就无法更新模型。
 
@@ -486,11 +488,11 @@ writer.close()
 
 **我总觉得RND不能解决这个问题，例如蒙特祖玛复仇游戏里，人类玩家不断探索，多次进入一个新房间进行尝试，就会导致RND对“处于新房间”这个状态不再“新鲜”，内部奖励变小，在取得真正的游戏进展（例如在新房间找到了宝剑）之前，不再鼓励agent对该房间做探索。**
 
-##### 问题三：
+###### 问题三：
 
 我上面的代码，没有把RND带来的内部奖励实现为跨回合的非回合制方式，这可能是**RND没有效果**的原因。通过和AI简单的讨论，可能需要添加价值网络才能实现跨回合的内部奖励。
 
-#### 2、Actor-Critic方式
+##### Actor-Critic方式
 
 由于上面的问题二、问题三，所以我还是只能回到Actor-Critic的方式。但其实RND也没有起到什么积极作用。
 
@@ -1012,5 +1014,206 @@ if __name__ == "__main__":
     # 开始训练
     agent.train()
 
+```
+
+#### 2、FetchReach任务
+
+##### 用开源库实现
+
+这个代码是在研究ICM算法的时候，顺便把算法替换为RND跑出来的效果。用到的开源实现是[RLeXplore](https://github.com/RLE-Foundation/RLeXplore)和SB3，我自己对FetchReach进行了二次封装，主要是转换FetchReach的状态返回格式。
+
+运行效果可以达到40%的任务成功率，与ICM相当。与ICM实验一样，这个复现不是确定的，成功率有时候高有时候低
+
+![image-20250612162248387](img/image-20250612162248387.png)
+
+代码如下：
+
+```python
+import datetime
+
+import gymnasium as gym
+import numpy as np
+import torch as th
+
+
+import gymnasium_robotics
+from stable_baselines3.common.base_class import BaseAlgorithm
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3 import PPO, SAC
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
+
+from rllte.xplore.reward import ICM,RND
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from torch.utils.tensorboard import SummaryWriter
+
+
+# 环境的再封装
+# 环境返回的state里要包含desired_goal
+# 环境的observation_space需要相应的改动
+# 手动构造reward，根据举例desired_goal的距离变化，返回reward
+class CustomFetchReachEnv(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, seed=73, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+
+        super().__init__()
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+        self._env.reset(seed=seed)
+        print(f"init env with seed {seed}")
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10+3,))  # 简化后的状态, 10个observe，3个desired_goal，一起拼接为state返回
+
+
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+        obs, info = self._env.reset(seed=seed, options=options)
+        state = np.concatenate( [obs['observation'],obs['desired_goal'] ] )
+
+        info['desired_goal'] = obs['desired_goal']
+
+
+
+        return state, info
+
+    def step(self, action):
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        state = np.concatenate( [obs['observation'],obs['desired_goal'] ] )
+        info['desired_goal'] = obs['desired_goal']
+
+        # 我自行判断是否成功了，并修改外部reward
+        success = np.linalg.norm(obs['achieved_goal'] - obs['desired_goal']) < 0.05
+        if success:
+            external_reward = 1
+            terminated = True
+        else:
+            external_reward = 0
+
+        # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
+        info["is_success"] = success
+
+
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+# 用回调的方式，与SB3的主干算法结合
+class RLeXploreWithOnPolicyRL(BaseCallback):
+    """
+    A custom callback for combining RLeXplore and on-policy algorithms from SB3.
+    """
+    def __init__(self, irs, verbose=0):
+        super(RLeXploreWithOnPolicyRL, self).__init__(verbose)
+        self.irs = irs
+        self.buffer = None
+
+    def init_callback(self, model: BaseAlgorithm) -> None:
+        super().init_callback(model)
+        self.buffer = self.model.rollout_buffer
+
+
+    def _on_step(self) -> bool:
+        """
+        This method will be called by the model after each call to `env.step()`.
+
+        :return: (bool) If the callback returns False, training is aborted early.
+        """
+        observations = self.locals["obs_tensor"]
+        device = observations.device
+        actions = th.as_tensor(self.locals["actions"], device=device)
+        rewards = th.as_tensor(self.locals["rewards"], device=device)
+        dones = th.as_tensor(self.locals["dones"], device=device)
+        next_observations = th.as_tensor(self.locals["new_obs"], device=device)
+
+        # ===================== watch the interaction ===================== #
+        self.irs.watch(observations, actions, rewards, dones, dones, next_observations)
+        # ===================== watch the interaction ===================== #
+        return True
+
+    def _on_rollout_end(self) -> None:
+        # ===================== compute the intrinsic rewards ===================== #
+        # prepare the data samples
+        obs = th.as_tensor(self.buffer.observations)
+        # get the new observations，其实是next_obs
+        new_obs = obs.clone()
+        new_obs[:-1] = obs[1:]
+        new_obs[-1] = th.as_tensor(self.locals["new_obs"])
+        actions = th.as_tensor(self.buffer.actions)
+        rewards = th.as_tensor(self.buffer.rewards)
+        dones = th.as_tensor(self.buffer.episode_starts)
+        print(obs.shape, actions.shape, rewards.shape, dones.shape, obs.shape)
+        # compute the intrinsic rewards
+        intrinsic_rewards = irs.compute(
+            samples=dict(observations=obs, actions=actions,
+                         rewards=rewards, terminateds=dones,
+                         truncateds=dones, next_observations=new_obs),
+            sync=True)
+
+        # add the intrinsic rewards to the buffer
+        self.buffer.advantages += intrinsic_rewards.cpu().numpy()
+        self.buffer.returns += intrinsic_rewards.cpu().numpy()
+        # ===================== compute the intrinsic rewards ===================== #
+
+if __name__ == '__main__':
+    # Parallel environments
+    device = 'cpu'
+    n_envs = 4
+    #envs = make_vec_env("BipedalWalker-v3", n_envs=n_envs)
+    envs = SubprocVecEnv([lambda i=i: CustomFetchReachEnv(i+53) for i in range(n_envs)])
+    writer = SummaryWriter(log_dir=f'logs/rllte_{datetime.datetime.now().strftime("%H%M%S")}')
+
+    # ===================== build the reward ===================== #
+    #irs = ICM(envs, device=device, writer=writer)
+    irs = RND(envs, device)
+    # ===================== build the reward ===================== #
+
+    model = PPO("MlpPolicy", envs, verbose=1, device=device, batch_size=256, tensorboard_log='./logs')
+    model.learn(total_timesteps=5_000_000, callback=RLeXploreWithOnPolicyRL(irs))
 ```
 
