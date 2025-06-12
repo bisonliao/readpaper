@@ -37,13 +37,21 @@
 
 ### Model
 
+#### 原理
+
 
 
 ![image-20250612161933274](img/image-20250612161933274.png)
 
 ![image-20250612171447688](img/image-20250612171447688.png)
 
+#### 伪代码
+
 ![image-20250612172535564](img/image-20250612172535564.png)
+
+#### 可以用于连续动作空间吗？
+
+![image-20250612202946113](img/image-20250612202946113.png)
 
 ### Experiments
 
@@ -56,3 +64,77 @@
 ### Conclusion
 
 ### bison的实验
+
+#### frozen lake
+
+[官方文档在这里](https://gymnasium.farama.org/environments/toy_text/frozen_lake/)
+
+先二次包装一个适合h-DQN算法的frozen lake的环境：
+
+```python
+import copy
+import random
+import time
+from typing import SupportsFloat, Any
+import numpy as np
+
+import gymnasium as gym
+from gymnasium.core import ActType, ObsType
+
+class CustomFrozenLake(gym.Env):
+    def __init__(self, render_mode=None):
+        super().__init__()
+        self.map_size = 8
+        mapname = f'{self.map_size}x{self.map_size}'
+        self.env = gym.make('FrozenLake-v1', desc=None, map_name=mapname, is_slippery=True, render_mode=render_mode)
+        self.map = self.env.unwrapped.desc #type:np.ndarray
+        #print(f"map type:{type(self.map)}")
+        self.map[0,0] = b'F'
+
+    def pos2xy(self, pos:int):
+        row = pos // self.map_size
+        col = pos - row * self.map_size
+        return row, col
+
+    def step(
+        self, action: ActType
+    ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
+        next_obs, reward, terminated, truncated, info = self.env.step(action)
+        row, col = self.pos2xy(next_obs)
+        next_state = copy.copy(self.map)
+        next_state[row, col] = b'A' # agent
+        next_state = next_state.view(np.uint8) / 255.0
+        return next_state, reward, terminated, truncated, info
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[ObsType, dict[str, Any]]:
+        obs, info = self.env.reset(seed=seed, options=options)
+        row, col = self.pos2xy(obs)
+        state = copy.copy(self.map)
+        state[row, col] = b'A'  # agent
+        state = state.view(np.uint8) / 255.0
+        return state, info
+    # 得到可以作为子目标的位置
+    def get_valid_subgoal(self):
+        subgoal = copy.copy(self.map)
+        return (subgoal == b'F').astype(np.int32)
+
+
+
+# 测试代码
+env = CustomFrozenLake()
+env.reset()
+print(env.get_valid_subgoal())
+while True:
+    action = random.randint(0,3)
+    array, r, terminated, truncated, info = env.step(action)
+    print(array)
+
+    time.sleep(2)
+
+```
+
