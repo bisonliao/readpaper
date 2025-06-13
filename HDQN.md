@@ -53,6 +53,10 @@
 
 ![image-20250612202946113](img/image-20250612202946113.png)
 
+#### 如何推理
+
+训练收敛后，推理不是只使用Q1网络，必须同时使用 Q2（选 subgoal）+ Q1（执行 subgoal）
+
 ### Experiments
 
 ![image-20250612174102939](img/image-20250612174102939.png)
@@ -73,6 +77,7 @@
 
 ```python
 import copy
+import datetime
 import random
 import time
 from typing import SupportsFloat, Any
@@ -83,8 +88,10 @@ import gymnasium as gym
 from gymnasium.core import ActType, ObsType
 from collections import deque, namedtuple
 from torch.optim import Adam
+from torch.utils.tensorboard import  SummaryWriter
 
 device="cpu"
+writer = SummaryWriter(log_dir=f'./logs/hDQN_FrozenLake_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
 
 class CustomFrozenLake(gym.Env):
     def __init__(self, render_mode=None):
@@ -92,8 +99,9 @@ class CustomFrozenLake(gym.Env):
         self.map_size = 8
         mapname = f'{self.map_size}x{self.map_size}'
         self.env = gym.make('FrozenLake-v1', desc=None, map_name=mapname, is_slippery=True, render_mode=render_mode)
-        self.map = self.env.unwrapped.desc #type:np.ndarray
-        #print(f"map type:{type(self.map)}")
+        self.map = copy.deepcopy(self.env.unwrapped.desc) #type:np.ndarray
+        print(self.map)
+
         self.map[0,0] = b'F'
         self.agent_pos = None
 
@@ -134,7 +142,7 @@ class CustomFrozenLake(gym.Env):
         next_obs, reward, terminated, truncated, info = self.env.step(action)
         self.agent_pos = next_obs
         row, col = self.pos2xy(next_obs)
-        next_state = copy.copy(self.map)
+        next_state = copy.deepcopy(self.map)
         next_state[row, col] = b'A' # agent
         next_state = next_state.view(np.uint8) / 255.0
         next_state = self._add_agent_chn(next_state)
@@ -149,7 +157,7 @@ class CustomFrozenLake(gym.Env):
         obs, info = self.env.reset(seed=seed, options=options)
         self.agent_pos = obs
         row, col = self.pos2xy(obs)
-        state = copy.copy(self.map)
+        state = copy.deepcopy(self.map)
         state[row, col] = b'A'  # agent
         state = state.view(np.uint8) / 255.0
         state = self._add_agent_chn(state)
@@ -157,7 +165,7 @@ class CustomFrozenLake(gym.Env):
 
     # 得到可以作为子目标的位置
     def get_valid_subgoal(self):
-        subgoal = copy.copy(self.map)
+        subgoal = copy.deepcopy(self.map)
         return (subgoal != b'H').astype(np.int32)
 
 def orthogonal_layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -258,8 +266,10 @@ class Q1Network(nn.Module):
 输入一个地图，其中一个通道包含了agent所在的位置信息，经过特征提取和转换，得到每个可能的位置的Q值
 '''
 class Q2Network(nn.Module):
-    def __init__(self, c, h, w, valid_position_mask: np.ndarray):
+    def __init__(self, c, h, w, valid_position_mask: np.ndarray, env:CustomFrozenLake):
         super().__init__()
+
+        self.env = env
 
         self.map_feat = nn.Sequential(
             orthogonal_layer_init(nn.Conv2d(c, 16, kernel_size=3, padding=1)),
@@ -269,6 +279,7 @@ class Q2Network(nn.Module):
             nn.Flatten()
         )
         self.valid_position_mask = torch.tensor(valid_position_mask, dtype=torch.bool)
+        print(f'{self.valid_position_mask}')
         assert len(valid_position_mask.shape) == 2 and valid_position_mask.shape[0] == h and \
                valid_position_mask.shape[1] == w
 
@@ -292,6 +303,11 @@ class Q2Network(nn.Module):
         x = x.reshape((B,  H, W))
         neg_inf = float('-inf')
         x = torch.where(mask == 1, x, neg_inf)
+
+        # agent所在当前位置不要选中作为suggoal
+        row, col = self.env.pos2xy(self.env.agent_pos)
+        x[:, row, col] = neg_inf
+
         return x #返回的是一个二维的对应地图形状的 Q值
 
     def epsGreedy(self, state:torch.Tensor, epsilon):
@@ -301,6 +317,9 @@ class Q2Network(nn.Module):
             mask = self.valid_position_mask.unsqueeze(0).expand(B, -1, -1).to(device)
             neg_inf = float('-inf')
             x = torch.where(mask == 1, x, neg_inf)
+            # agent所在当前位置不要选中作为suggoal
+            row, col = self.env.pos2xy(self.env.agent_pos)
+            x[:, row, col] = neg_inf
         else:
             x = self.forward(state)
         x = x.reshape((B, -1)) #统一展平,方便计算argmax
@@ -329,8 +348,8 @@ class ReplayBuffer:
         return len(self.buffer)
 
 class Args:
-    lr = 1e-3
-    gamma = 0.99
+    lr = 1e-4
+    gamma = 0.999
     eps1_start = 1.0
     eps1_decay = 0.99
     eps1_end = 0.1
@@ -339,10 +358,10 @@ class Args:
     eps2_decay = 0.99
     eps2_end = 0.1
 
-    num_episodes = 1000
+    num_episodes = 10000
 
     buf_size = 1e6
-    batch_sz = 3
+    batch_sz = 64
 
     map_w = 8
     map_h = 8
@@ -367,10 +386,10 @@ class hDQNAgent:
         self.env = CustomFrozenLake()
         valid_subgoal = self.env.get_valid_subgoal()
         self.q1 = Q1Network(Args.map_c,Args.map_h, Args.map_w,   Args.subgoal_dim, Args.action_dim).to(device)
-        self.q2 = Q2Network(Args.map_c,Args.map_h, Args.map_w,   valid_subgoal).to(device)
+        self.q2 = Q2Network(Args.map_c,Args.map_h, Args.map_w,   valid_subgoal, self.env).to(device)
 
         self.target_q1 = Q1Network(Args.map_c, Args.map_h, Args.map_w,   Args.subgoal_dim, Args.action_dim).to(device)
-        self.target_q2 = Q2Network(Args.map_c, Args.map_h, Args.map_w,  valid_subgoal).to(device)
+        self.target_q2 = Q2Network(Args.map_c, Args.map_h, Args.map_w,  valid_subgoal, self.env).to(device)
         self.target_q1.load_state_dict(self.q1.state_dict())
         self.target_q2.load_state_dict(self.q2.state_dict())
         self.optimizer1 = Adam(self.q1.parameters(), lr=Args.lr)
@@ -384,10 +403,17 @@ class hDQNAgent:
         self.subgoal_record = dict() # 每个subgoal 对应一个deque(maxlen=100)，里面是成功还是失败的结果 1/0
 
         self.critic = Critic(self.env)
+        self.episode = 0
+        self.total_step = 0
 
     def decay_epsilon(self, episode):
         self.epsilon2 = max(Args.eps2_end, self.epsilon2*Args.eps2_decay)
+        writer.add_scalar('episode/epsilon2', self.epsilon2, self.episode)
         keys = self.epsilon1_dict.keys()
+
+        minV, minV_updated = 1.0, False
+        maxV, maxV_updated = float('-inf'), False
+        rates = []
         for g in keys:
             suc_rate = 0
             if self.subgoal_record.__contains__(g):
@@ -395,9 +421,21 @@ class hDQNAgent:
                 suc_rate = record.count(1) / (len(record)+1e-8)
             else:
                 self.subgoal_record[g] = deque(maxlen=100)
-
+            rates.append(suc_rate)
             if suc_rate > 0.7:
                 self.epsilon1_dict[g] = max(Args.eps1_end, self.epsilon1_dict[g] * Args.eps1_decay)
+                if self.epsilon1_dict[g] > maxV:
+                    maxV = self.epsilon1_dict[g]
+                    maxV_updated = True
+                if self.epsilon1_dict[g] < minV:
+                    minV = self.epsilon1_dict[g]
+                    minV_updated = True
+        if minV_updated:
+            writer.add_scalar('episode/epsilon1_min', minV, self.episode)
+        if maxV_updated:
+            writer.add_scalar('episode/epsilon1_max', maxV, self.episode)
+        writer.add_scalar('episode/subgoal_suc_rate_mean', sum(rates) / (len(rates)+(1e-8)), self.episode)
+
 
 
     def get_epsilon1(self, subgoalInt):
@@ -419,11 +457,13 @@ class hDQNAgent:
     def update_target_network(self):
         self.target_q1.load_state_dict(self.q1.state_dict())
         self.target_q2.load_state_dict(self.q2.state_dict())
+        writer.add_scalar('episode/update_target', 1, self.episode)
 
 
     def train(self):
 
         for i in range(Args.num_episodes):
+            self.episode = i+1
 
             # state和stateTensorshi一对，只要修改state，就一定初始化stateTensor
             state, _ = self.env.reset()
@@ -435,29 +475,38 @@ class hDQNAgent:
             row,col = self.env.pos2xy(subgoalInt)
             subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device) # shape: (1,2)
 
+            #print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
+            writer.add_scalar('steps/subgoal', subgoalInt, self.total_step)
 
             done = False
             while not done:
                 F = 0
-                s0 =  copy.copy(stateTensor)
+                s0 =  copy.deepcopy(stateTensor)
                 subgoalReached = False
                 while not (done or self.env.hasReachGoal() or self.env.hasReachSubgoal(subgoalInt)):
                     eps1 = self.get_epsilon1(subgoalInt)
                     a = self.q1.epsGreedy(stateTensor, subgoalTensor, eps1)
                     a = a.squeeze(0).cpu().item()
                     next_state, f, terminated, truncated, info = self.env.step(a)
+                    self.total_step += 1
                     nextStateTensor = torch.FloatTensor(next_state).unsqueeze(0).to(device)
                     done = terminated or truncated
                     r = self.critic.getIntrinsicReward(subgoalInt)
 
                     if self.env.hasReachSubgoal(subgoalInt):
                         subgoalReached = True
-
+                        writer.add_scalar('steps/reach_subgoal', 1, self.total_step)
+                    if self.env.hasReachGoal():
+                        writer.add_scalar('steps/reach_goal', 1, self.total_step)
 
                     self.D1.push( (stateTensor.squeeze(0), subgoalTensor.squeeze(0)), a, r, (nextStateTensor.squeeze(0), subgoalTensor.squeeze(0)), done )
 
-                    self.update_q1()
-                    self.update_q2()
+                    loss1 = self.update_q1()
+                    loss2 = self.update_q2()
+                    if self.total_step % 200 == 0:
+                        writer.add_scalar('steps/loss1', loss1, self.total_step)
+                        writer.add_scalar('steps/loss2', loss2, self.total_step)
+                        print(f'log loss2={loss2} at {self.total_step}')
 
                     F += f
                     state = next_state
@@ -465,12 +514,16 @@ class hDQNAgent:
 
                 self.add_subgoal_result(subgoalReached, subgoalInt)
 
+                assert self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 0].cpu().item()] != b'H', \
+                    print(f'{subgoalTensor},{self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 0].cpu().item()]}')
                 self.D2.push( s0.squeeze(0), subgoalTensor.squeeze(0), F, nextStateTensor.squeeze(0), done) #如果只是达到子目标，done是false，如果达到最终目标或者回合长度超时，done是true
                 if not done:
                     subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2)  # type:torch.Tensor
                     subgoalInt = subgoal.cpu().item()
                     row, col = self.env.pos2xy(subgoalInt)
                     subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device)
+                    writer.add_scalar('steps/subgoal', subgoalInt, self.total_step)
+                    #print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
 
             self.decay_epsilon(episode=i)
             if (i+1) % Args.update_target_network_interval == 0:
@@ -478,7 +531,7 @@ class hDQNAgent:
 
     def update_q1(self):
         if len(self.D1) < Args.batch_sz:
-            return
+            return 0
         batch = self.D1.sample(Args.batch_sz)
         inputs, actions, rewards, next_states, dones = zip(*batch)
         stateTensors, subgoalTensor = zip(*inputs)
@@ -508,7 +561,7 @@ class hDQNAgent:
 
     def update_q2(self):
         if len(self.D2) < Args.batch_sz:
-            return
+            return 0
 
         W = Args.map_w
 
