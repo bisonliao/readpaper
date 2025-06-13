@@ -103,6 +103,7 @@ class CustomFrozenLake(gym.Env):
         print(self.map)
 
         self.map[0,0] = b'F'
+        self.map.setflags(write=False)
         self.agent_pos = None
 
     def pos2xy(self, pos:int):
@@ -161,6 +162,8 @@ class CustomFrozenLake(gym.Env):
         state[row, col] = b'A'  # agent
         state = state.view(np.uint8) / 255.0
         state = self._add_agent_chn(state)
+
+
         return state, info
 
     # 得到可以作为子目标的位置
@@ -266,10 +269,10 @@ class Q1Network(nn.Module):
 输入一个地图，其中一个通道包含了agent所在的位置信息，经过特征提取和转换，得到每个可能的位置的Q值
 '''
 class Q2Network(nn.Module):
-    def __init__(self, c, h, w, valid_position_mask: np.ndarray, env:CustomFrozenLake):
+    def __init__(self, c, h, w, valid_position_mask: np.ndarray):
         super().__init__()
 
-        self.env = env
+
 
         self.map_feat = nn.Sequential(
             orthogonal_layer_init(nn.Conv2d(c, 16, kernel_size=3, padding=1)),
@@ -279,7 +282,7 @@ class Q2Network(nn.Module):
             nn.Flatten()
         )
         self.valid_position_mask = torch.tensor(valid_position_mask, dtype=torch.bool)
-        print(f'{self.valid_position_mask}')
+        #print(f'{self.valid_position_mask}')
         assert len(valid_position_mask.shape) == 2 and valid_position_mask.shape[0] == h and \
                valid_position_mask.shape[1] == w
 
@@ -298,30 +301,31 @@ class Q2Network(nn.Module):
 
         mask = self.valid_position_mask.unsqueeze(0).expand(B, -1, -1).to(device)
 
+
         x = self.map_feat(state)
         x = self.out(x) #type:torch.Tensor
         x = x.reshape((B,  H, W))
+        assert not torch.any(torch.isinf(x) & (x < 0)), "forward cause -inf"
+        assert x.shape == mask.shape, f'shape mismatch:{x.shape}, {mask.shape}'
         neg_inf = float('-inf')
-        x = torch.where(mask == 1, x, neg_inf)
-
-        # agent所在当前位置不要选中作为suggoal
-        row, col = self.env.pos2xy(self.env.agent_pos)
-        x[:, row, col] = neg_inf
+        x = torch.where(mask == True, x, neg_inf)
 
         return x #返回的是一个二维的对应地图形状的 Q值
 
-    def epsGreedy(self, state:torch.Tensor, epsilon):
+    def epsGreedy(self, state:torch.Tensor, epsilon, agent_pos:tuple):
         B, C, H, W = state.shape
+        assert B == 1
         if random.random() < epsilon:
             x = torch.rand((B,H,W), dtype=torch.float32, device=state.device)
             mask = self.valid_position_mask.unsqueeze(0).expand(B, -1, -1).to(device)
             neg_inf = float('-inf')
-            x = torch.where(mask == 1, x, neg_inf)
-            # agent所在当前位置不要选中作为suggoal
-            row, col = self.env.pos2xy(self.env.agent_pos)
-            x[:, row, col] = neg_inf
+            x = torch.where(mask == True, x, neg_inf)
         else:
             x = self.forward(state)
+
+        row, col = agent_pos
+        x[:, row, col] = float('-inf')
+
         x = x.reshape((B, -1)) #统一展平,方便计算argmax
         pos = x.argmax(dim=1)
         return pos # shape:(B,)
@@ -386,10 +390,10 @@ class hDQNAgent:
         self.env = CustomFrozenLake()
         valid_subgoal = self.env.get_valid_subgoal()
         self.q1 = Q1Network(Args.map_c,Args.map_h, Args.map_w,   Args.subgoal_dim, Args.action_dim).to(device)
-        self.q2 = Q2Network(Args.map_c,Args.map_h, Args.map_w,   valid_subgoal, self.env).to(device)
+        self.q2 = Q2Network(Args.map_c,Args.map_h, Args.map_w,   valid_subgoal).to(device)
 
         self.target_q1 = Q1Network(Args.map_c, Args.map_h, Args.map_w,   Args.subgoal_dim, Args.action_dim).to(device)
-        self.target_q2 = Q2Network(Args.map_c, Args.map_h, Args.map_w,  valid_subgoal, self.env).to(device)
+        self.target_q2 = Q2Network(Args.map_c, Args.map_h, Args.map_w,  valid_subgoal).to(device)
         self.target_q1.load_state_dict(self.q1.state_dict())
         self.target_q2.load_state_dict(self.q2.state_dict())
         self.optimizer1 = Adam(self.q1.parameters(), lr=Args.lr)
@@ -470,12 +474,13 @@ class hDQNAgent:
             stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
 
             # subgoal, subgoalTensor,subgoalInt是绑定的，修改subgoal一定要修改其他两个
-            subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2 ) # type:torch.Tensor  (1,)
+            current_agent_pos = self.env.pos2xy(self.env.agent_pos)
+            subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2, current_agent_pos ) # type:torch.Tensor  (1,)
             subgoalInt = subgoal.cpu().item()
             row,col = self.env.pos2xy(subgoalInt)
             subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device) # shape: (1,2)
 
-            #print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
+            print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
             writer.add_scalar('steps/subgoal', subgoalInt, self.total_step)
 
             done = False
@@ -506,7 +511,7 @@ class hDQNAgent:
                     if self.total_step % 200 == 0:
                         writer.add_scalar('steps/loss1', loss1, self.total_step)
                         writer.add_scalar('steps/loss2', loss2, self.total_step)
-                        print(f'log loss2={loss2} at {self.total_step}')
+                        #print(f'log loss2={loss2} at {self.total_step}')
 
                     F += f
                     state = next_state
@@ -514,16 +519,18 @@ class hDQNAgent:
 
                 self.add_subgoal_result(subgoalReached, subgoalInt)
 
-                assert self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 0].cpu().item()] != b'H', \
-                    print(f'{subgoalTensor},{self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 0].cpu().item()]}')
+                assert self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()] != b'H', \
+                    print(f'{subgoalTensor},{self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()]}')
+
                 self.D2.push( s0.squeeze(0), subgoalTensor.squeeze(0), F, nextStateTensor.squeeze(0), done) #如果只是达到子目标，done是false，如果达到最终目标或者回合长度超时，done是true
                 if not done:
-                    subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2)  # type:torch.Tensor
+                    current_agent_pos = self.env.pos2xy(self.env.agent_pos)
+                    subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2, current_agent_pos)  # type:torch.Tensor
                     subgoalInt = subgoal.cpu().item()
                     row, col = self.env.pos2xy(subgoalInt)
                     subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device)
                     writer.add_scalar('steps/subgoal', subgoalInt, self.total_step)
-                    #print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
+                    print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
 
             self.decay_epsilon(episode=i)
             if (i+1) % Args.update_target_network_interval == 0:
@@ -581,6 +588,13 @@ class hDQNAgent:
         indexTensor = row * W + col  # shape: (B,)
         indexTensor = indexTensor.to(torch.int64).unsqueeze(1)
         q_values = q_values.gather(1, indexTensor)  # 从 Q(s, a) 选取执行的动作 Q 值
+
+        if  torch.any(torch.isinf(q_values) & (q_values < 0)):
+            for index in range(Args.batch_sz):
+                if torch.isinf(q_values[index]):
+                    row, col = subgoalTensors[index]
+                    print(f">>{index} {subgoalTensors[index]}\n{q_values}  \n  mask={self.q2.valid_position_mask}")
+                    exit(-1)
 
         # 计算目标 Q 值
         next_q_values = self.target_q2.forward(nextStateTensors)
