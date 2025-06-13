@@ -73,6 +73,10 @@
 
 [官方文档在这里](https://gymnasium.farama.org/environments/toy_text/frozen_lake/)
 
+很仓促的跑起来了，还没收敛：
+
+![image-20250614011848773](img/image-20250614011848773.png)
+
 代码如下：
 
 ```python
@@ -101,9 +105,7 @@ class CustomFrozenLake(gym.Env):
         self.env = gym.make('FrozenLake-v1', desc=None, map_name=mapname, is_slippery=True, render_mode=render_mode)
         self.map = copy.deepcopy(self.env.unwrapped.desc) #type:np.ndarray
         print(self.map)
-
         self.map[0,0] = b'F'
-        self.map.setflags(write=False)
         self.agent_pos = None
 
     def pos2xy(self, pos:int):
@@ -239,7 +241,7 @@ class Q1Network(nn.Module):
         batch_idx = torch.arange(B, device=map.device)
 
         # 设置目标位置为 1（每个样本的目标位置）
-        goal_mask[batch_idx, 0, x, y] = 1.0
+        goal_mask[batch_idx, 0, y, x] = 1.0
 
         # 拼接通道：在 dim=1 上拼接
         map_with_goal = torch.cat([map, goal_mask], dim=1)
@@ -308,21 +310,22 @@ class Q2Network(nn.Module):
         assert not torch.any(torch.isinf(x) & (x < 0)), "forward cause -inf"
         assert x.shape == mask.shape, f'shape mismatch:{x.shape}, {mask.shape}'
         neg_inf = float('-inf')
-        x = torch.where(mask == True, x, neg_inf)
+        x = torch.where(mask == True, x, neg_inf)#对每个元素：如果mask取true，就返回x的元素，否则就返回neg_inf
 
         return x #返回的是一个二维的对应地图形状的 Q值
 
     def epsGreedy(self, state:torch.Tensor, epsilon, agent_pos:tuple):
         B, C, H, W = state.shape
-        assert B == 1
+        assert B == 1 #确保当前agent的位置是有意义的。
         if random.random() < epsilon:
             x = torch.rand((B,H,W), dtype=torch.float32, device=state.device)
             mask = self.valid_position_mask.unsqueeze(0).expand(B, -1, -1).to(device)
             neg_inf = float('-inf')
-            x = torch.where(mask == True, x, neg_inf)
+            x = torch.where(mask == True, x, neg_inf) #对每个元素：如果mask取true，就返回x的元素，否则就返回neg_inf
         else:
             x = self.forward(state)
 
+        # 不希望 把agent当前的位置作为sub goal
         row, col = agent_pos
         x[:, row, col] = float('-inf')
 
@@ -373,7 +376,7 @@ class Args:
     subgoal_dim = 2
     action_dim = 4
 
-    update_target_network_interval = 4
+    update_target_network_interval = 2000
 
 class Critic:
     def __init__(self, env:CustomFrozenLake):
@@ -427,7 +430,7 @@ class hDQNAgent:
             else:
                 self.subgoal_record[g] = deque(maxlen=100)
             rates.append(suc_rate)
-            if suc_rate > 0.7:
+            if suc_rate > 0.8:
                 self.epsilon1_dict[g] = max(Args.eps1_end, self.epsilon1_dict[g] * Args.eps1_decay)
                 if self.epsilon1_dict[g] > maxV:
                     maxV = self.epsilon1_dict[g]
@@ -485,7 +488,7 @@ class hDQNAgent:
             row,col = self.env.pos2xy(subgoalInt)
             subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device) # shape: (1,2)
 
-            print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
+            print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}, ', end='')
             writer.add_scalar('steps/subgoal', subgoalInt, self.total_step)
 
             done = False
@@ -523,6 +526,7 @@ class hDQNAgent:
                     stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
 
                 self.save_subgoal_result(subgoalReached, subgoalInt)
+                print(f'subgoal {subgoalInt} reached? {subgoalReached}')
 
                 assert self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()] != b'H', \
                     print(f'{subgoalTensor},{self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()]}')
@@ -535,10 +539,10 @@ class hDQNAgent:
                     row, col = self.env.pos2xy(subgoalInt)
                     subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device)
                     writer.add_scalar('steps/subgoal', subgoalInt, self.total_step)
-                    print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}')
-
-            self.decay_epsilon(episode=i)
-            if (i+1) % Args.update_target_network_interval == 0:
+                    print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}, ', end='')
+            if (i+1)%5 == 0: #慢慢衰减
+                self.decay_epsilon(episode=i)
+            if (self.total_step) % Args.update_target_network_interval == 0:
                 self.update_target_network()
 
     def update_q1(self):
