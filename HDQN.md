@@ -69,7 +69,7 @@
 
 [官方文档在这里](https://gymnasium.farama.org/environments/toy_text/frozen_lake/)
 
-先二次包装一个适合h-DQN算法的frozen lake的环境：
+代码如下：
 
 ```python
 import copy
@@ -77,9 +77,14 @@ import random
 import time
 from typing import SupportsFloat, Any
 import numpy as np
-
+import torch.nn as nn
+import torch
 import gymnasium as gym
 from gymnasium.core import ActType, ObsType
+from collections import deque, namedtuple
+from torch.optim import Adam
+
+device="cpu"
 
 class CustomFrozenLake(gym.Env):
     def __init__(self, render_mode=None):
@@ -90,20 +95,49 @@ class CustomFrozenLake(gym.Env):
         self.map = self.env.unwrapped.desc #type:np.ndarray
         #print(f"map type:{type(self.map)}")
         self.map[0,0] = b'F'
+        self.agent_pos = None
 
     def pos2xy(self, pos:int):
         row = pos // self.map_size
         col = pos - row * self.map_size
         return row, col
 
+    def _add_agent_chn(self, state:np.ndarray):
+
+        if len(state.shape) == 2:
+            state = np.expand_dims(state, axis=0)
+
+        newchn = np.zeros_like(state, dtype=np.float32)
+        row, col = self.pos2xy(self.agent_pos)
+        newchn[0, row, col] = 1.0
+        result =  np.concatenate([state, newchn], axis=0)
+        return result
+    def hasReachGoal(self):
+        row, col = self.pos2xy(self.agent_pos)
+        if row == self.map_size-1 and col == self.map_size-1:
+            return True
+        else:
+            return False
+    def hasReachSubgoal(self, subgoal:int):
+        row, col = self.pos2xy(self.agent_pos)
+        gr, gc = self.pos2xy(subgoal)
+        if row == gr and col == gc:
+            return True
+        else:
+            return False
+
+
+
     def step(
         self, action: ActType
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
         next_obs, reward, terminated, truncated, info = self.env.step(action)
+        self.agent_pos = next_obs
         row, col = self.pos2xy(next_obs)
         next_state = copy.copy(self.map)
         next_state[row, col] = b'A' # agent
         next_state = next_state.view(np.uint8) / 255.0
+        next_state = self._add_agent_chn(next_state)
         return next_state, reward, terminated, truncated, info
 
     def reset(
@@ -113,28 +147,408 @@ class CustomFrozenLake(gym.Env):
         options: dict[str, Any] | None = None,
     ) -> tuple[ObsType, dict[str, Any]]:
         obs, info = self.env.reset(seed=seed, options=options)
+        self.agent_pos = obs
         row, col = self.pos2xy(obs)
         state = copy.copy(self.map)
         state[row, col] = b'A'  # agent
         state = state.view(np.uint8) / 255.0
+        state = self._add_agent_chn(state)
         return state, info
+
     # 得到可以作为子目标的位置
     def get_valid_subgoal(self):
         subgoal = copy.copy(self.map)
-        return (subgoal == b'F').astype(np.int32)
+        return (subgoal != b'H').astype(np.int32)
+
+def orthogonal_layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+'''
+输入 B x c x h x w形状的地图和 B x 2形状的subgoal
+会给地图拼接一个单独的通道，用来表示subgoal的空间信息
+经过各自的特征提取层后，拼接特征，然后经过全连接层输出每个动作的Q值
+'''
+class Q1Network(nn.Module):
+    def __init__(self, c:int, h:int, w:int, subgoal_dim:int, action_dim:int):
+        super().__init__()
+
+        self.action_dim = action_dim
+
+        self.map_feat = nn.Sequential(
+            orthogonal_layer_init(nn.Conv2d(c+1, 16, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            orthogonal_layer_init(nn.Conv2d(16, 32, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+
+        # 测试获得输出featuremap的尺寸
+        with torch.no_grad():
+            dummy = torch.zeros(1, c + 1, h, w)
+            dummy_feat = self.map_feat(dummy)
+            feature_dim1 = dummy_feat.shape[1]
+
+        feature_dim2 = 32
+
+        self.subgoal_feat = nn.Sequential(
+            orthogonal_layer_init(nn.Linear(subgoal_dim, 32)),
+            nn.ReLU(),
+            orthogonal_layer_init(nn.Linear(32, feature_dim2)),
+            nn.ReLU(),
+        )
 
 
+        self.out =  nn.Sequential(
+            orthogonal_layer_init(nn.Linear(feature_dim1+feature_dim2, action_dim)),
+        )
 
-# 测试代码
-env = CustomFrozenLake()
-env.reset()
-print(env.get_valid_subgoal())
-while True:
-    action = random.randint(0,3)
-    array, r, terminated, truncated, info = env.step(action)
-    print(array)
+    def _add_subgoal_chn(self, map: torch.Tensor, subgoal: torch.Tensor) -> torch.Tensor:
+        """
+        给输入 map 添加一个子目标通道，子目标由 subgoal 坐标指定。
 
-    time.sleep(2)
+        参数:
+            map (Tensor): 输入地图张量，形状为 (B, C, H,W)
+            subgoal (Tensor): 子目标坐标，形状为 (B, 2)，每行为 (y, x)
+
+        返回:
+            Tensor: 形状为 (B, C+1, H, W)，在末尾添加了子目标 mask 通道
+        """
+        B, C, H,W = map.shape
+        assert subgoal.shape == (B, 2), f"Expected subgoal shape (B, 2), got {subgoal.shape}"
+
+        # 初始化子目标 mask
+        goal_mask = torch.zeros(B, 1, H,W, device=map.device, dtype=map.dtype)
+
+        x = subgoal[:, 1]  # 列
+        y = subgoal[:, 0]  # 行
+
+        # 生成 batch 索引
+        batch_idx = torch.arange(B, device=map.device)
+
+        # 设置目标位置为 1（每个样本的目标位置）
+        goal_mask[batch_idx, 0, x, y] = 1.0
+
+        # 拼接通道：在 dim=1 上拼接
+        map_with_goal = torch.cat([map, goal_mask], dim=1)
+
+        return map_with_goal
+    def forward(self, state:torch.Tensor, subgoal:torch.Tensor):
+
+        x = self._add_subgoal_chn(state, subgoal)
+
+        B, C, H,W = state.shape
+        assert subgoal.shape == (B, 2), f"Expected subgoal shape (B, 2), got {subgoal.shape}"
+        WH = max(H,W)
+        feat1 = self.map_feat(x)
+        feat2 = self.subgoal_feat(subgoal / WH)
+        feat = torch.cat([feat1, feat2], dim=1)
+        qvalue = self.out(feat)
+        return qvalue
+    def epsGreedy(self, state:torch.Tensor, subgoal:torch.Tensor, epsilon):
+        if random.random() < epsilon:
+            B, C, H, W = state.shape
+            qvalue = torch.rand((B,self.action_dim), dtype=torch.float32, device=state.device)
+        else:
+            qvalue = self.forward(state, subgoal) #type:torch.Tensor
+        return qvalue.argmax(dim=1)
+
+'''
+输入一个地图，其中一个通道包含了agent所在的位置信息，经过特征提取和转换，得到每个可能的位置的Q值
+'''
+class Q2Network(nn.Module):
+    def __init__(self, c, h, w, valid_position_mask: np.ndarray):
+        super().__init__()
+
+        self.map_feat = nn.Sequential(
+            orthogonal_layer_init(nn.Conv2d(c, 16, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            orthogonal_layer_init(nn.Conv2d(16, 32, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        self.valid_position_mask = torch.tensor(valid_position_mask, dtype=torch.bool)
+        assert len(valid_position_mask.shape) == 2 and valid_position_mask.shape[0] == h and \
+               valid_position_mask.shape[1] == w
+
+        # 测试获得输出featuremap的尺寸
+        with torch.no_grad():
+            dummy = torch.zeros(1, c, h, w)
+            dummy_feat = self.map_feat(dummy)
+            feature_dim = dummy_feat.shape[1]
+
+
+        self.out = nn.Sequential(
+            orthogonal_layer_init(nn.Linear(feature_dim,  h*w)),
+        )
+    def forward(self, state:torch.Tensor):
+        B, C, H, W = state.shape
+
+        mask = self.valid_position_mask.unsqueeze(0).expand(B, -1, -1).to(device)
+
+        x = self.map_feat(state)
+        x = self.out(x) #type:torch.Tensor
+        x = x.reshape((B,  H, W))
+        neg_inf = float('-inf')
+        x = torch.where(mask == 1, x, neg_inf)
+        return x #返回的是一个二维的对应地图形状的 Q值
+
+    def epsGreedy(self, state:torch.Tensor, epsilon):
+        B, C, H, W = state.shape
+        if random.random() < epsilon:
+            x = torch.rand((B,H,W), dtype=torch.float32, device=state.device)
+            mask = self.valid_position_mask.unsqueeze(0).expand(B, -1, -1).to(device)
+            neg_inf = float('-inf')
+            x = torch.where(mask == 1, x, neg_inf)
+        else:
+            x = self.forward(state)
+        x = x.reshape((B, -1)) #统一展平,方便计算argmax
+        pos = x.argmax(dim=1)
+        return pos # shape:(B,)
+
+# 经验回放缓冲区
+Transition = namedtuple('Transition', ('input', 'output', 'reward', 'next_input', 'done'))
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, *args):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = Transition(*args)
+        self.position = int(  (self.position + 1) % self.capacity  )
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
+
+class Args:
+    lr = 1e-3
+    gamma = 0.99
+    eps1_start = 1.0
+    eps1_decay = 0.99
+    eps1_end = 0.1
+
+    eps2_start = 1.0
+    eps2_decay = 0.99
+    eps2_end = 0.1
+
+    num_episodes = 1000
+
+    buf_size = 1e6
+    batch_sz = 3
+
+    map_w = 8
+    map_h = 8
+    map_c = 2
+    subgoal_dim = 2
+    action_dim = 4
+
+    update_target_network_interval = 4
+
+class Critic:
+    def __init__(self, env:CustomFrozenLake):
+        self.env = env
+    # todo:内部激励还是比较稀疏的，可能不太好...
+    def getIntrinsicReward(self, subgoalInt):
+        if self.env.agent_pos == subgoalInt:
+            return 1
+        else:
+            return 0
+
+class hDQNAgent:
+    def __init__(self):
+        self.env = CustomFrozenLake()
+        valid_subgoal = self.env.get_valid_subgoal()
+        self.q1 = Q1Network(Args.map_c,Args.map_h, Args.map_w,   Args.subgoal_dim, Args.action_dim).to(device)
+        self.q2 = Q2Network(Args.map_c,Args.map_h, Args.map_w,   valid_subgoal).to(device)
+
+        self.target_q1 = Q1Network(Args.map_c, Args.map_h, Args.map_w,   Args.subgoal_dim, Args.action_dim).to(device)
+        self.target_q2 = Q2Network(Args.map_c, Args.map_h, Args.map_w,  valid_subgoal).to(device)
+        self.target_q1.load_state_dict(self.q1.state_dict())
+        self.target_q2.load_state_dict(self.q2.state_dict())
+        self.optimizer1 = Adam(self.q1.parameters(), lr=Args.lr)
+        self.optimizer2 = Adam(self.q2.parameters(), lr=Args.lr)
+
+        self.D1 = ReplayBuffer(Args.buf_size)
+        self.D2 = ReplayBuffer(Args.buf_size)
+
+        self.epsilon2 = Args.eps2_start
+        self.epsilon1_dict = dict()
+        self.subgoal_record = dict() # 每个subgoal 对应一个deque(maxlen=100)，里面是成功还是失败的结果 1/0
+
+        self.critic = Critic(self.env)
+
+    def decay_epsilon(self, episode):
+        self.epsilon2 = max(Args.eps2_end, self.epsilon2*Args.eps2_decay)
+        keys = self.epsilon1_dict.keys()
+        for g in keys:
+            suc_rate = 0
+            if self.subgoal_record.__contains__(g):
+                record = self.subgoal_record[g] #type:deque
+                suc_rate = record.count(1) / (len(record)+1e-8)
+            else:
+                self.subgoal_record[g] = deque(maxlen=100)
+
+            if suc_rate > 0.7:
+                self.epsilon1_dict[g] = max(Args.eps1_end, self.epsilon1_dict[g] * Args.eps1_decay)
+
+
+    def get_epsilon1(self, subgoalInt):
+        if self.epsilon1_dict.__contains__(subgoalInt):
+            return self.epsilon1_dict[subgoalInt]
+        else:
+            self.epsilon1_dict[subgoalInt] = Args.eps1_start
+            return Args.eps1_start
+
+    def add_subgoal_result(self, reached, subgoalInt):
+        if self.subgoal_record.__contains__(subgoalInt):
+            record = self.subgoal_record[subgoalInt]  # type:deque
+            record.append(1 if reached else 0)
+        else:
+            record = deque(maxlen=100)
+            record.append(1 if reached else 0)
+            self.subgoal_record[subgoalInt] = record
+
+    def update_target_network(self):
+        self.target_q1.load_state_dict(self.q1.state_dict())
+        self.target_q2.load_state_dict(self.q2.state_dict())
+
+
+    def train(self):
+
+        for i in range(Args.num_episodes):
+
+            # state和stateTensorshi一对，只要修改state，就一定初始化stateTensor
+            state, _ = self.env.reset()
+            stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+
+            # subgoal, subgoalTensor,subgoalInt是绑定的，修改subgoal一定要修改其他两个
+            subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2 ) # type:torch.Tensor  (1,)
+            subgoalInt = subgoal.cpu().item()
+            row,col = self.env.pos2xy(subgoalInt)
+            subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device) # shape: (1,2)
+
+
+            done = False
+            while not done:
+                F = 0
+                s0 =  copy.copy(stateTensor)
+                subgoalReached = False
+                while not (done or self.env.hasReachGoal() or self.env.hasReachSubgoal(subgoalInt)):
+                    eps1 = self.get_epsilon1(subgoalInt)
+                    a = self.q1.epsGreedy(stateTensor, subgoalTensor, eps1)
+                    a = a.squeeze(0).cpu().item()
+                    next_state, f, terminated, truncated, info = self.env.step(a)
+                    nextStateTensor = torch.FloatTensor(next_state).unsqueeze(0).to(device)
+                    done = terminated or truncated
+                    r = self.critic.getIntrinsicReward(subgoalInt)
+
+                    if self.env.hasReachSubgoal(subgoalInt):
+                        subgoalReached = True
+
+
+                    self.D1.push( (stateTensor.squeeze(0), subgoalTensor.squeeze(0)), a, r, (nextStateTensor.squeeze(0), subgoalTensor.squeeze(0)), done )
+
+                    self.update_q1()
+                    self.update_q2()
+
+                    F += f
+                    state = next_state
+                    stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+
+                self.add_subgoal_result(subgoalReached, subgoalInt)
+
+                self.D2.push( s0.squeeze(0), subgoalTensor.squeeze(0), F, nextStateTensor.squeeze(0), done) #如果只是达到子目标，done是false，如果达到最终目标或者回合长度超时，done是true
+                if not done:
+                    subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2)  # type:torch.Tensor
+                    subgoalInt = subgoal.cpu().item()
+                    row, col = self.env.pos2xy(subgoalInt)
+                    subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device)
+
+            self.decay_epsilon(episode=i)
+            if (i+1) % Args.update_target_network_interval == 0:
+                self.update_target_network()
+
+    def update_q1(self):
+        if len(self.D1) < Args.batch_sz:
+            return
+        batch = self.D1.sample(Args.batch_sz)
+        inputs, actions, rewards, next_states, dones = zip(*batch)
+        stateTensors, subgoalTensor = zip(*inputs)
+        nextStateTensor, _ = zip(*next_states)
+
+        stateTensors = torch.stack(stateTensors)
+        subgoalTensor = torch.stack(subgoalTensor)
+        nextStateTensor = torch.stack(nextStateTensor)
+        actions = torch.LongTensor(actions).unsqueeze(1).to(device)  # (batch_size,) -> (batch_size, 1)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)  # (batch_size,) -> (batch_size, 1)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)  # (batch_size,) -> (batch_size, 1)
+
+        # 计算当前 Q 值
+        q_values = self.q1.forward(stateTensors, subgoalTensor).gather(1, actions)  # 从 Q(s, a) 选取执行的动作 Q 值
+
+        # 计算目标 Q 值
+        next_q_values = self.target_q1.forward(nextStateTensor, subgoalTensor).max(1, keepdim=True)[0]  # 选取 Q(s', a') 的最大值
+        target_q_values = rewards + Args.gamma * next_q_values * (1 - dones)  # TD 目标
+
+        # 计算损失
+        loss = nn.functional.mse_loss(q_values, target_q_values.detach())
+        self.optimizer1.zero_grad()
+        loss.backward()
+        self.optimizer1.step()
+
+        return loss.item()
+
+    def update_q2(self):
+        if len(self.D2) < Args.batch_sz:
+            return
+
+        W = Args.map_w
+
+        batch = self.D2.sample(Args.batch_sz)
+        stateTensors, subgoalTensors, rewards, nextStateTensors, dones = zip(*batch)
+        stateTensors = torch.stack(stateTensors)
+        subgoalTensors = torch.stack(subgoalTensors)
+        nextStateTensors = torch.stack(nextStateTensors)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)  # (batch_size,) -> (batch_size, 1)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)  # (batch_size,) -> (batch_size, 1)
+
+        # 计算当前 Q 值
+        q_values = self.q2.forward(stateTensors) #计算子目标
+        q_values = q_values.reshape((Args.batch_sz,-1)) #展平
+        row = subgoalTensors[:, 0]  # shape: (B,)
+        col = subgoalTensors[:, 1]  # shape: (B,)
+        indexTensor = row * W + col  # shape: (B,)
+        indexTensor = indexTensor.to(torch.int64).unsqueeze(1)
+        q_values = q_values.gather(1, indexTensor)  # 从 Q(s, a) 选取执行的动作 Q 值
+
+        # 计算目标 Q 值
+        next_q_values = self.target_q2.forward(nextStateTensors)
+        next_q_values = next_q_values.reshape((Args.batch_sz,-1))
+        next_q_values = next_q_values.max(1, keepdim=True)[0]  # 选取 Q(s', a') 的最大值
+        target_q_values = rewards + Args.gamma * next_q_values * (1 - dones)  # TD 目标
+
+        # 计算损失
+        loss = nn.functional.mse_loss(q_values, target_q_values.detach())
+        self.optimizer2.zero_grad()
+        loss.backward()
+        self.optimizer2.step()
+
+        return loss.item()
+
+def main():
+    agent = hDQNAgent()
+    agent.train()
+
+
+main()
 
 ```
 
