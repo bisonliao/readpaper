@@ -352,7 +352,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 class Args:
-    lr = 1e-4
+    lr = 1e-3
     gamma = 0.999
     eps1_start = 1.0
     eps1_decay = 0.99
@@ -409,6 +409,7 @@ class hDQNAgent:
         self.critic = Critic(self.env)
         self.episode = 0
         self.total_step = 0
+        self.final_goal = Args.map_w * Args.map_h - 1
 
     def decay_epsilon(self, episode):
         self.epsilon2 = max(Args.eps2_end, self.epsilon2*Args.eps2_decay)
@@ -441,7 +442,6 @@ class hDQNAgent:
         writer.add_scalar('episode/subgoal_suc_rate_mean', sum(rates) / (len(rates)+(1e-8)), self.episode)
 
 
-
     def get_epsilon1(self, subgoalInt):
         if self.epsilon1_dict.__contains__(subgoalInt):
             return self.epsilon1_dict[subgoalInt]
@@ -449,7 +449,7 @@ class hDQNAgent:
             self.epsilon1_dict[subgoalInt] = Args.eps1_start
             return Args.eps1_start
 
-    def add_subgoal_result(self, reached, subgoalInt):
+    def save_subgoal_result(self, reached, subgoalInt):
         if self.subgoal_record.__contains__(subgoalInt):
             record = self.subgoal_record[subgoalInt]  # type:deque
             record.append(1 if reached else 0)
@@ -457,6 +457,11 @@ class hDQNAgent:
             record = deque(maxlen=100)
             record.append(1 if reached else 0)
             self.subgoal_record[subgoalInt] = record
+
+        if subgoalInt == self.final_goal:  # 如果最终的目标以 sub goal的方式出现了，上报它的成功率,顺便的事
+            suc_rate = record.count(1) / (len(record) + 1e-8)
+            writer.add_scalar('episode/finalgoal_suc_rate_mean', suc_rate, self.episode)
+            writer.add_scalar('episode/finalgoal_count', len(record), self.episode)
 
     def update_target_network(self):
         self.target_q1.load_state_dict(self.q1.state_dict())
@@ -517,7 +522,7 @@ class hDQNAgent:
                     state = next_state
                     stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
 
-                self.add_subgoal_result(subgoalReached, subgoalInt)
+                self.save_subgoal_result(subgoalReached, subgoalInt)
 
                 assert self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()] != b'H', \
                     print(f'{subgoalTensor},{self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()]}')
