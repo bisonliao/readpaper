@@ -1359,8 +1359,9 @@ main()
 
 最终，可以看到训练是有效果的：
 
-1. Q1的子目标完成能力ok，绝大多数都能达到70%+的成功率
-2. Q2的规划能力有明显的帮助，找到了0-4-7-31-63的这样一个路径
+1. Q1的子目标完成能力ok，单段路径绝大多数都能达到70%+的成功率，很多高达90%+
+2. Q2有明显合理的的规划能力和导航能力，找到了0-4-7-31-63的这样一个路径。多运行几次，路径不是每次都一样，例如有时候是找到 0 - 7 - 63 这样的线路。
+3. 端到端效果不算好，大回合的成功率最高到25%，且不稳定。
 
 详细分析如下：
 
@@ -1376,7 +1377,6 @@ import copy
 import datetime
 import random
 import time
-from cgi import maxlen
 from typing import SupportsFloat, Any
 import numpy as np
 import torch.nn as nn
@@ -1384,8 +1384,6 @@ import torch
 import gymnasium as gym
 from gymnasium.core import ActType, ObsType
 from collections import deque, namedtuple
-
-from torch.distributed.elastic.multiprocessing.errors import record
 from torch.optim import Adam
 from torch.utils.tensorboard import  SummaryWriter
 
