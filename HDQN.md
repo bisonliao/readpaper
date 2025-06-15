@@ -62,7 +62,11 @@ We follow a two phase training procedure：
 
 在后面我自己做的实验里，也有这么干，就是先确保Q1是可以收敛的，再徐徐图之。
 
-当然我自己后来觉得一条很重要的经验就是：一定要有非常非常详细的监控，包括各段的回合数、成功率、各子目标的成功率、各个epsilon 1的衰减等等，否则一抹黑发现不了问题也看不到进展。
+另外，我觉得一条很重要的经验就是：由于h-DQN比较复杂繁琐，一定要有非常非常详细的监控，包括各段的回合数、成功率、各子目标的成功率、各个epsilon 1的衰减等等，否则一抹黑发现不了问题也看不到进展。
+
+预训练遇到的典型问题：
+
+![image-20250615094410208](img/image-20250615094410208.png)
 
 ##### 2、可以用于连续动作空间吗？
 
@@ -79,6 +83,19 @@ We follow a two phase training procedure：
 ##### 5、Q2/meta controller到底怎么学习的
 
 ![image-20250615075625964](img/image-20250615075625964.png)
+
+```shell
+                # 对于FrozenLake这样的只要到了终点才有非0奖励的任务，我忍不住要加上下面的这行代码
+                # 但我后来还是注释掉了，这样会让agent自娱自乐的挣过程工分，不利于它面向结果的去达成最后的goal
+                # 通过预先训练q1的子目标达成能力，然后Q2通过随机(暴力的)组合路径拼接，会倒推着优先调度带来外部奖励的子目标，完成路径的发现
+                # 有点类似图理论中的最短路径算法了。
+                # 让我下决心注释掉下面这行代码的实验依据：我发现预训练完成后，Q2的偏好调度是0->4 -> 7 -> 4。形成环了。
+                # 为何如此？ 因为0出发的诸多目标中，4达成成功率最高；4出发的，7达成成功率最高，如此递推得到上面的偏好。
+                
+                #F += 0.1 if subgoalReached else -0.1
+```
+
+
 
 ### Experiments
 
@@ -1342,13 +1359,25 @@ main()
 
 ![image-20250615092233312](img/image-20250615092233312.png)
 
+最终，可以看到训练是有效果的：
 
+1. Q1的子目标完成能力ok，绝大多数都能达到70%+的成功率
+2. Q2的规划能力有明显的帮助，找到了0-4-7-31-63的这样一个路径
+
+详细分析如下：
+
+![image-20250615115740003](img/image-20250615115740003.png)
+
+遗留问题：
+
+1. 路径31去往63的成功率还是比较低，可能需要增设一个中间子目标来提升。
 
 ```python
 import copy
 import datetime
 import random
 import time
+from cgi import maxlen
 from typing import SupportsFloat, Any
 import numpy as np
 import torch.nn as nn
@@ -1693,6 +1722,7 @@ class hDQNAgent:
 
         self.D1 = ReplayBuffer(Args.buf_size)
         self.D2 = ReplayBuffer(Args.buf_size)
+        self.D3 = ReplayBuffer(Args.buf_size)
 
         self.epsilon2 = Args.eps2_start
         self.epsilon1_dict = dict()
@@ -1781,10 +1811,6 @@ class hDQNAgent:
             record.append(1 if reached else 0)
             self.subgoal_result[subgoalInt] = record
 
-        if subgoalInt == self.final_goal:  # 如果最终的目标以 sub goal的方式出现了，上报它的成功率,顺便的事
-            suc_rate = record.count(1) / (len(record) + 1e-8)
-            writer.add_scalar('episode/finalgoal_suc_rate', suc_rate, self.episode)
-            writer.add_scalar('episode/finalgoal_count', len(record), self.episode)
 
         #更新计数器
         if self.subgoal_counter.__contains__(subgoalInt):
@@ -1815,6 +1841,7 @@ class hDQNAgent:
     def train(self):
 
         start, end = 0, 0 #标识一个回合的起止位置，作为一段路径
+        finalGoalReachRecord = deque(maxlen=100) #记录最近100次大回合是否达成最终目标
         for i in range(Args.num_episodes):
             self.episode = i+1
 
@@ -1831,11 +1858,12 @@ class hDQNAgent:
             end = subgoalInt
 
             done = False
+            finalGoalReached = False #记录一个大回合下来，是否达到了最终的目标
             # 一个大回合，也就是外部环境从reset 到step返回done终止的一个完整回合，里面可能会进行多个小回合
             while not done:
                 F = 0
                 s0 =  copy.deepcopy(stateTensor)
-                subgoalReached = False
+                subgoalReached = False #记录一个小回合下来，是否达到了子目标
                 # 一个小回合，从start到end的小回合，可能对于环境来说不是一个完整的回合，是一个完整回合的一部分
                 # 每个小回合会在D2里产生一条样本，而每个与环境交互的时间步，在D1里产生一个样本
                 while not (done or self.env.hasReachGoal() or self.env.hasReachSubgoal(subgoalInt)):
@@ -1857,6 +1885,7 @@ class hDQNAgent:
                         writer.add_scalar('steps/reach_subgoal', 1, self.total_step)
                     if self.env.hasReachGoal():
                         writer.add_scalar('steps/reach_goal', 1, self.total_step)
+                        finalGoalReached = True
 
                     self.D1.push( (stateTensor.squeeze(0), subgoalTensor.squeeze(0)), a, r, (nextStateTensor.squeeze(0), subgoalTensor.squeeze(0)), done )
 
@@ -1878,8 +1907,18 @@ class hDQNAgent:
                 self.update_subgoal_result(subgoalReached, subgoalInt)  # 统计以终点为key的成功率
                 self.update_route_suc_rate(start, end, subgoalReached) # 统计路径达成成功率
 
-                # 对于FrozenLake这样的只要到了终点才有非0奖励的任务，我得修正一下F，否则没法训练Q2
-                F += 0.1 if subgoalReached else -0.1
+                # 对于FrozenLake这样的只要到了终点才有非0奖励的任务，我忍不住要加上下面的这句
+                # 但我后来还是注释掉了，这样会让agent自娱自乐的挣过程工分，不利于它面向结果的去达成最后的goal
+                # 通过预先训练q1的子目标达成能力，然后Q2通过随机组合路径拼接，会倒推着优先调度带来外部奖励的子目标，完成路径的发现
+                # 有点类似图理论中的最短路径算法了。
+                # 让我下决心注释掉下面这行代码的实验依据：我发现预训练完成后，Q2的偏好调度是0->4 -> 7 -> 4。形成环了。
+                # 为何如此？ 因为0出发的诸多目标中，4达成成功率最高；4出发的，7达成成功率最高，如此递推得到上面的偏好。
+                #F += 0.1 if subgoalReached else -0.1
+
+                #把特别宝贵的样本额外再存一份，用于Q2的训练
+                if F != 0:
+                    self.D3.push(s0.squeeze(0), subgoalTensor.squeeze(0), F, nextStateTensor.squeeze(0),
+                                 done)  # 如果只是达到子目标，done是false，如果达到最终目标或者回合长度超时，done是true
 
                 assert self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()] != b'H', \
                     print(f'{subgoalTensor},{self.env.map[subgoalTensor[0, 0].cpu().item(), subgoalTensor[0, 1].cpu().item()]}')
@@ -1892,6 +1931,11 @@ class hDQNAgent:
                     print(f'begin train sub goal {subgoalInt} from {self.env.agent_pos}, ', end='')
                     start = self.env.agent_pos
                     end = subgoalInt
+
+            finalGoalReachRecord.append(1 if finalGoalReached else 0)
+            #训练效果的终极指标：最近过去100个回合，达成最终目标的成功率
+            writer.add_scalar('episode/finalgoal_suc_rate', finalGoalReachRecord.count(1)/(len(finalGoalReachRecord)+(1e-8)), self.episode)
+
             if (i+1)%5 == 0: #慢慢衰减
                 self.decay_epsilon(episode=i)
             if (i+1) % Args.update_target_network_interval == 0:
@@ -1929,13 +1973,21 @@ class hDQNAgent:
         return loss.item()
 
     def update_q2(self):
-        # 前 半段 q2不训练，只做q1预训练
-        if len(self.D2) < Args.batch_sz_2 or self.episode < (Args.pretrain_q1_episodes):
+        if self.episode < (Args.pretrain_q1_episodes) or len(self.D2) < Args.batch_sz_2:# 前 半段 q2不训练，只做q1预训练
             return 0
 
+        half_batch = Args.batch_sz_2 // 2
         W = Args.map_w
 
-        batch = self.D2.sample(Args.batch_sz_2)
+        if len(self.D3) < half_batch:
+            batch = self.D2.sample(Args.batch_sz_2)
+        else:
+            batch_D2 = self.D2.sample(half_batch)
+            batch_D3 = self.D3.sample(half_batch)
+            batch = batch_D2 + batch_D3
+            random.shuffle(batch)  #  避免样本顺序偏置
+
+
         stateTensors, subgoalTensors, rewards, nextStateTensors, dones = zip(*batch)
         stateTensors = torch.stack(stateTensors)
         subgoalTensors = torch.stack(subgoalTensors)
@@ -1979,9 +2031,8 @@ def main():
 
 
 main()
-
 ```
 
-##### 没完：带滑行概率的任务
+##### 再看 滑行概率的挑战
 
 前面通过关闭滑行概率来完成FrozenLake任务，但我们不能回避滑行这个问题。
