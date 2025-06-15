@@ -99,6 +99,10 @@ We follow a two phase training procedure：
 
 可以统计每个大回合是否达成了最终目标，并记录最近的100次大回合每次是否达成了最终目标，统计最终目标达成率，也就是final_goal_suc_rate
 
+##### 7、关于泛化能力的思考
+
+![image-20250615222321785](img/image-20250615222321785.png)
+
 ### Experiments
 
 ![image-20250612174102939](img/image-20250612174102939.png)
