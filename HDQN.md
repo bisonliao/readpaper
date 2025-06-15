@@ -95,7 +95,9 @@ We follow a two phase training procedure：
                 #F += 0.1 if subgoalReached else -0.1
 ```
 
+##### 6、如何判断训练收敛
 
+可以统计每个大回合是否达成了最终目标，并记录最近的100次大回合每次是否达成了最终目标，统计最终目标达成率，也就是final_goal_suc_rate
 
 ### Experiments
 
@@ -129,13 +131,9 @@ We follow a two phase training procedure：
 2. critic网络的奖励还得稠密，可能距离是一个办法，虽然说最短路径未必不会掉到冰洞里
 3. h-DQN比较复杂，需要更详尽的监控信息，对训练过程做深入分析
 
-还有个问题：到底怎么才算收敛？
 
-1. 是子目标的成功率90%+？
-2.  是最终目标作为子目标的成功率90%+？
-3. 还是最终目标顺便完成的成功率90%+？
 
-   
+
 
 ![image-20250614011848773](img/image-20250614011848773.png)
 
