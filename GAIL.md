@@ -52,14 +52,86 @@ Our characterization introduces a framework for directly learning policies from 
 
 ![image-20250616122201314](img/image-20250616122201314.png)
 
-### 生成对抗模仿学习
+### 生成对抗模仿学习（GAIL）
 
 ![image-20250616122421532](img/image-20250616122421532.png)
 
+#### 说人话
+
+```python
+# 初始化策略 πθ 和判别器 Dω
+initialize_policy_network()
+initialize_discriminator_network()
+
+# 准备专家数据 (s, a) 对
+expert_dataset = load_expert_trajectories()
+
+for iteration in range(num_iterations):
+
+    # === 1. 用当前策略 πθ 跑环境，采样一批 trajectory ===
+    fake_trajectories = rollout_policy(policy=πθ, env, num_steps)
+    fake_batch = extract_state_action_pairs(fake_trajectories)
+
+    # === 2. 训练判别器 Dω，判断 expert / agent ===
+    for _ in range(num_discriminator_steps):
+        expert_batch = sample_batch(expert_dataset)
+        fake_batch = sample_batch(fake_batch)
+
+        # 判别器 loss: 二分类交叉熵
+        D_loss = -mean(log(D(s,a)) for (s,a) in expert_batch) \
+                 -mean(log(1 - D(s,a)) for (s,a) in fake_batch)
+
+        update_discriminator(D_loss)
+
+    # === 3. 把 log D(s, a) 当作 reward，训练策略 πθ ===
+    for _ in range(num_policy_update_steps):
+
+        # 用 log D(s, a) 当 reward，计算 return / advantage
+        rewards = [log(D(s, a)) for (s, a) in fake_trajectories]
+        returns, advantages = estimate_advantage(rewards)
+
+        # 用 PPO / REINFORCE / TRPO 更新策略
+        policy_loss = -log_prob * advantage (with clipping if PPO)
+        update_policy(policy_loss)
+
+    # === 4. 日志输出（可选）===
+    print(f"Iter {iteration}: avg_reward = ..., D_acc = ...")
+
+```
+
+![image-20250616171729899](img/image-20250616171729899.png)
+
+#### fake reward绝对值很大怎么办
+
+用log D(s,a)做为reward，负值的绝对值可能很大，这种情况下推荐怎么做？还是说不需要额外处理？
+
+![image-20250616170756265](img/image-20250616170756265.png)
+
+#### 输入只是(s,a)数据对？
+
 ![image-20250616123835214](img/image-20250616123835214.png)
 
+#### GAIL一定要与环境交互吗？
 
+![image-20250616142633232](img/image-20250616142633232.png)
+
+#### GAIL只能训练策略网络吗？
+
+![image-20250616170020021](img/image-20250616170020021.png)
+
+#### cost函数就是一个度量指标
 
 cost函数这个概念感觉有点奇奇怪怪的：
 
 ![image-20250616135959370](img/image-20250616135959370.png)
+
+### Experiments
+
+![image-20250616141143161](img/image-20250616141143161.png)
+
+### bison的实验
+
+实验设计：
+
+1. 训练一个DQN作为专家，与CartPole环境交互，得到一系列离线的专家经验
+2. 使用GAIL训练G和D，RL算法采用REINFORCE算法
