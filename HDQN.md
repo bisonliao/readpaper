@@ -80,7 +80,7 @@ We follow a two phase training procedure：
 
 ![image-20250615072433504](img/image-20250615072433504.png)
 
-##### 5、Q2/meta controller到底怎么学习的
+##### 5、Q2/meta ctrler到底怎么学习的
 
 ![image-20250615075625964](img/image-20250615075625964.png)
 
@@ -102,6 +102,23 @@ We follow a two phase training procedure：
 ##### 7、关于泛化能力的思考
 
 ![image-20250615222321785](img/image-20250615222321785.png)
+
+##### 8、训练meta ctrler的其他可能方法
+
+Q：我理解h-DQN算法，如果是类似FrozenLake这样的任务，可以通过人工标注+有监督学习的方式训练 q2，或者通过图的最短路径等各类算法来得到一个meta controller，不限于用RL的方式，可能是更加高效和智能的。有这方面的算法提出或者论文吗？
+
+AI：你的想法非常有前瞻性：在 **h-DQN** 框架中，不必局限于使用强化学习（RL）来训练 meta-controller（即 Q₂，选择子目标的策略）。下面是一些相关的论文：
+
+```shell
+ # 不一定准确，没有看细节来检验AI说的对不对
+ https://arxiv.org/abs/1703.00956 # 用 graph Laplacian eigenvectors 发现关键子目标
+ https://arxiv.org/abs/1606.05312 #用 successor representation 近似“访问频率图”，隐式地捕捉状态空间结构
+ https://arxiv.org/abs/1805.01954 # 不使用动作，只基于专家状态序列训练策略
+ https://arxiv.org/abs/2006.13205 # 明确提出从演示轨迹提取“任务分解”，训练 hierarchical policy
+ 
+```
+
+
 
 ### Experiments
 
