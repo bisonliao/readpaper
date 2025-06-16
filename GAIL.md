@@ -152,7 +152,7 @@ from torch.distributions import Categorical
 
 # 设备选择
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-env = gym.make("CartPole-v1", render_mode="human", max_episode_steps=500)
+env = gym.make("CartPole-v1", render_mode=None, max_episode_steps=500)
 n_state = env.observation_space.shape[0]  # 状态维度
 n_action = env.action_space.n  # 动作数量
 writer = SummaryWriter(log_dir=f'./logs/GAIL_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
@@ -179,7 +179,7 @@ class Policy(nn.Module):
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, action_dim)
 
-    def forwad(self, x):
+    def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
@@ -193,21 +193,23 @@ class Discriminator(nn.Module):
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, 2)
 
-    def forwad(self, states, actions):
-        x = torch.concatenate([states, actions], dim=1)
+    def forward(self, states, actions):
+        actions_one_hot = F.one_hot(actions.to(torch.long), num_classes=n_action)
+        x = torch.concatenate([states, actions_one_hot], dim=1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return F.softmax(x, dim=1)
 
 # 待训练的策略网络与环境交互，获得rollout数据
-def interact_with_env(g:Policy()):
+def interact_with_env(g:Policy):
     fake_samples = []
+    traj_lens = []
     g.eval()
     while len(fake_samples) < 2048:
         state = env.reset()
         state = state[0]
-
+        ep_len = 0
         for _ in range(500):
             env.render()
             with torch.no_grad():
@@ -216,19 +218,36 @@ def interact_with_env(g:Policy()):
                 action = action.argmax(dim=1)[0].cpu().item()
 
             fake_samples.append((state, action))
+            ep_len += 1
             state, reward, done, _, _ = env.step(action)
 
             if done:
+                traj_lens.append(ep_len)
                 break
-    return fake_samples
+    g.train()
+    return fake_samples, traj_lens
 
 # 根据奖励计算累计回报
-def compute_returns(rewards, gamma=0.99):
+def compute_returns(rewards, traj_lens:list, gamma=0.99):
     returns = []
-    R = 0
-    for r in reversed(rewards):
-        R = r + gamma * R
-        returns.insert(0, R)
+
+    # split rewards as trajectory
+    reward_seg = []
+    start = 0
+    for l in traj_lens:
+        end = start + l
+        reward_seg.append( rewards[start:end] )
+        start = end
+
+    # calc returns for each segment
+    for seg in reward_seg:
+        R = 0
+        returns_seg = []
+        for r in reversed(seg):
+            R = r + gamma * R
+            returns_seg.insert(0, R)
+        returns.extend(returns_seg)
+
     return torch.tensor(returns, device=device)
 
 #利用样本数据，REINFORCE算法更新策略网络
@@ -248,9 +267,30 @@ def update_policy_network(policy, optimizer, states, actions, returns):
     optimizer.step()
     return loss
 
+def show_case(policy:Policy):
+    eval_env = gym.make("CartPole-v1", render_mode="human", max_episode_steps=500)
+    policy.eval()
+    for _ in range(10):
+        state = eval_env.reset()
+        state = state[0]
+        ep_len = 0
+        for _ in range(500):
+            with torch.no_grad():
+                stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                action = policy(stateTensor)  # type:torch.Tensor
+                action = action.argmax(dim=1)[0].cpu().item()
+            ep_len += 1
+            state, reward, done, _, _ = eval_env.step(action)
+
+            if done:
+                break
+        print(f"episode len:{ep_len}")
+    policy.train()
+
+
 # 利用GAIL算法训练策略网络
 def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
-    max_epoches = 1000
+    max_epoches = 500
     lr_g = 1e-4
     lr_d = 1e-4
     batch_size = 128
@@ -263,7 +303,7 @@ def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=lr_d)
 
     for ep in range(max_epoches):
-        fake_samples = interact_with_env(generator)
+        fake_samples, traj_lens = interact_with_env(generator)
 
         #训练判别器
         for _ in range(2):
@@ -289,17 +329,18 @@ def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
 
         #训练生成器
         for _ in range(2):
-            inputs = random.sample(fake_samples, batch_size)
+            inputs = fake_samples
             states, actions = zip(*inputs)
 
             states = torch.tensor(states, dtype=torch.float32).to(device)
             actions = torch.tensor(actions, dtype=torch.float32).to(device)
             with torch.no_grad():
                 outputs = discriminator(states, actions)# type:torch.Tensor
-            outputs = outputs.argmax(dim=1)
+            #outputs = outputs.argmax(dim=1)
+            outputs = outputs[:,1] # todo:这里再捋捋，凭感觉的
             rewards = torch.log(outputs+ (1e-8) ) # 1e-8, 一方面防止0导致无穷小，一方面防止reward绝对值太大
             # 计算回报
-            returns = compute_returns(rewards, gamma)
+            returns = compute_returns(rewards, traj_lens, gamma)
             # 让权重有正有负，如果正的，我们就要增大在这个状态采取这个动作的概率；如果是负的，我们就要减小在这个状态采取这个动作的概率
             returns = (returns - returns.mean()) / (returns.std() + 1e-9)
 
@@ -309,6 +350,7 @@ def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
         writer.add_scalar('GAIL/d_loss', d_loss.item(), ep)
         writer.add_scalar('GAIL/g_loss', g_loss.item(), ep)
         writer.add_scalar('GAIL/rewards', rewards.mean().cpu().item(), ep)
+    show_case(generator)
 
 
 # 训练专家网络过程中，与环境交互
@@ -429,7 +471,7 @@ def get_expert_trajectory():
 
 
 if __name__ == "__main__":
-    get_expert_trajectory()
+    #get_expert_trajectory()
     GAIL_train_policy()
 
 ```
