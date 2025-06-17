@@ -59,6 +59,8 @@ introduction部分有说，这里不重复。论文也没有更多算法描述
 
 D4RL（Datasets for Deep Data-Driven Reinforcement Learning）提供了多个经典强化学习任务的**离线经验数据集**
 
+也是Farama Foundation这个非盈利组织提供的。
+
 ![image-20250617153112821](img/image-20250617153112821.png)
 
 #### 实验对比效果
