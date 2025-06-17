@@ -1,6 +1,6 @@
 **A Minimalist Approach to Offline Reinforcement Learning**
 
-离线强化学习的极简实现
+一种离线强化学习的极简实现
 
 ### 1、Introduction
 
