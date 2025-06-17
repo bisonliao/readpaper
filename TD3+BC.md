@@ -79,7 +79,7 @@ AI：
 
 #### pendulum
 
-step1：先用SAC算法训练一个expert，然后让expert在eval模式下与环境交互收集经验数据，保存下来。这里不贴详细代码了，用之前的SAC的代码即可快速搞定。
+step1：先用SAC算法训练一个expert，然后让expert在eval模式下与环境交互收集经验数据，保存下来（10完个时间步）。这里不贴详细代码了，用之前的SAC的代码即可快速搞定。
 
 step2：使用TD3+BC算法，进行offline RL。
 
