@@ -131,12 +131,29 @@ cost函数这个概念感觉有点奇奇怪怪的：
 
 ### bison的实验
 
+#### cartpole（结果不错）
+
 实验设计：
 
 1. 训练一个DQN作为专家，与CartPole环境交互，得到一系列离线的专家经验
 2. 使用GAIL训练G和D，RL算法采用REINFORCE算法
 
+结果：能学到不错的策略，show_case的输出：
 
+```shell
+episode len:500
+episode len:500
+episode len:500
+episode len:500
+episode len:500
+episode len:500
+episode len:500
+episode len:500
+episode len:500
+episode len:500
+```
+
+![image-20250617104211983](img/image-20250617104211983.png)
 
 ```python
 import datetime
@@ -191,7 +208,7 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         self.fc1 = nn.Linear(state_dim+action_dim, 128)
         self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, 2)
+        self.fc3 = nn.Linear(64, 1)
 
     def forward(self, states, actions):
         actions_one_hot = F.one_hot(actions.to(torch.long), num_classes=n_action)
@@ -199,7 +216,7 @@ class Discriminator(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
-        return F.softmax(x, dim=1)
+        return F.sigmoid(x) # 0-1的概率
 
 # 待训练的策略网络与环境交互，获得rollout数据
 def interact_with_env(g:Policy):
@@ -211,11 +228,12 @@ def interact_with_env(g:Policy):
         state = state[0]
         ep_len = 0
         for _ in range(500):
-            env.render()
             with torch.no_grad():
                 stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
                 action = g(stateTensor) # type:torch.Tensor
-                action = action.argmax(dim=1)[0].cpu().item()
+                dist = Categorical(action)
+                action = dist.sample().item()
+                #action = action.argmax(dim=1)[0].cpu().item()
 
             fake_samples.append((state, action))
             ep_len += 1
@@ -224,13 +242,15 @@ def interact_with_env(g:Policy):
             if done:
                 traj_lens.append(ep_len)
                 break
+        if not done: #不是因为终止而退出上述循环
+            traj_lens.append(ep_len)
     g.train()
     return fake_samples, traj_lens
 
 # 根据奖励计算累计回报
 def compute_returns(rewards, traj_lens:list, gamma=0.99):
     returns = []
-
+    # assert sum(traj_lens) == rewards.shape[0], f"sum {traj_lens}  != {rewards.shape[0]}"
     # split rewards as trajectory
     reward_seg = []
     start = 0
@@ -290,7 +310,7 @@ def show_case(policy:Policy):
 
 # 利用GAIL算法训练策略网络
 def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
-    max_epoches = 500
+    max_epoches = 800
     lr_g = 1e-4
     lr_d = 1e-4
     batch_size = 128
@@ -306,7 +326,7 @@ def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
         fake_samples, traj_lens = interact_with_env(generator)
 
         #训练判别器
-        for _ in range(2):
+        for _ in range(4):
             batch_size_hf = batch_size // 2
             inputs = random.sample(true_samples, batch_size_hf) + random.sample(fake_samples, batch_size_hf)
             labels = [0] * batch_size_hf + [1] * batch_size_hf
@@ -321,8 +341,8 @@ def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
             states = torch.tensor(states, dtype=torch.float32).to(device)
             actions = torch.tensor(actions, dtype=torch.float32).to(device)
             labels = torch.tensor(labels, dtype=torch.long).to(device)
-            outputs = discriminator(states, actions)
-            d_loss = nn.functional.cross_entropy(outputs, labels)
+            outputs = discriminator(states, actions) #输出的是(B,)的0-1概率， 1表示是专家
+            d_loss = nn.functional.binary_cross_entropy(outputs.squeeze(1), labels.float())
             optimizer_d.zero_grad()
             d_loss.backward()
             optimizer_d.step()
@@ -336,14 +356,12 @@ def GAIL_train_policy(experiments_file='./expert_trajectory.pth'):
             actions = torch.tensor(actions, dtype=torch.float32).to(device)
             with torch.no_grad():
                 outputs = discriminator(states, actions)# type:torch.Tensor
-            #outputs = outputs.argmax(dim=1)
-            outputs = outputs[:,1] # todo:这里再捋捋，凭感觉的
-            rewards = torch.log(outputs+ (1e-8) ) # 1e-8, 一方面防止0导致无穷小，一方面防止reward绝对值太大
+            rewards = -torch.log( 1 - outputs + (1e-8) ) # 1e-8, 一方面防止0导致无穷小，一方面防止reward绝对值太大
             # 计算回报
             returns = compute_returns(rewards, traj_lens, gamma)
             # 让权重有正有负，如果正的，我们就要增大在这个状态采取这个动作的概率；如果是负的，我们就要减小在这个状态采取这个动作的概率
             returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-
+            # assert actions.shape == returns.shape
             # 更新策略
             g_loss = update_policy_network(generator, optimizer_g, states, actions, returns)
 
@@ -455,7 +473,6 @@ def get_expert_trajectory():
 
 
         for _ in range(episode_max_steps):
-            env.render()
             with torch.no_grad():
                 action = select_action_from_expert(model, state, 0)  # 纯利用，epsilon=0
             expert_experience.append( (state, action) )
