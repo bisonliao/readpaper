@@ -91,6 +91,14 @@ Evaluation Episode 2, Reward: -123.72
 Evaluation Episode 3, Reward: -236.22
 Evaluation Episode 4, Reward: -231.89
 Evaluation Episode 5, Reward: -240.85
+
+#好奇心重的我一定会问：只用TD3，不加BC，可以纯离线训练出不错的agent吗？
+# 下面是去掉BC正则项训练的agent的表现，具体视觉效果就是钟摆不断的转，立不起来
+Evaluation Episode 1, Reward: -1561.17
+Evaluation Episode 2, Reward: -1379.67
+Evaluation Episode 3, Reward: -1380.50
+Evaluation Episode 4, Reward: -1506.39
+Evaluation Episode 5, Reward: -1655.49
 ```
 
 ![image-20250617191731549](img/image-20250617191731549.png)
