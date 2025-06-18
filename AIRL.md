@@ -42,3 +42,7 @@ In our experiments, we aim to answer two questions:
 ![image-20250618195346791](img/image-20250618195346791.png)
 
 ![image-20250618200329229](img/image-20250618200329229.png)
+
+论文中Figure 3 4 5的中心思想：
+
+![image-20250618205540190](D:\GitHub\readpaper\img\image-20250618205540190.png)
