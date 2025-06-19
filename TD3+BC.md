@@ -739,13 +739,13 @@ main('train')
 
 #### racecar
 
-定义环境、收集专家数据：
+定义环境、收集专家数据，注意FPS=20，后面训练也需要对齐：
 
 ```python
 import datetime
 import random
 import time
-
+import numpy
 
 import pybullet as p
 import pybullet_data
@@ -762,6 +762,10 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import pygame
 
+steer = 0
+throttle = 0
+FPS = 20
+
 
 class RaceCarEnv(gym.Env):
     """
@@ -774,7 +778,7 @@ class RaceCarEnv(gym.Env):
     - 动作空间：转向和油门控制
     """
 
-    def __init__(self, writer:SummaryWriter, render=False,fps=100):
+    def __init__(self, writer:SummaryWriter, render=False,fps=20):
         # 检测是否在并行环境中运行
         if hasattr(self, 'metadata') and 'is_vector_env' in self.metadata and self.metadata['is_vector_env']:
             raise RuntimeError(
@@ -793,9 +797,9 @@ class RaceCarEnv(gym.Env):
 
         # 设置搜索路径
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        self.fps = 100
+        self.fps = 20
         p.setTimeStep(1/self.fps, physicsClientId=self.physicsClient)
-        p.setRealTimeSimulation(0, physicsClientId=self.physicsClient)
+        p.setRealTimeSimulation(1, physicsClientId=self.physicsClient)
 
         # 定义动作空间和状态空间
         self.action_space = spaces.Box(
@@ -920,6 +924,11 @@ class RaceCarEnv(gym.Env):
 
     def reset(self, seed=None):
         """重置环境到初始状态"""
+        global  steer
+        global  throttle
+        steer = 0
+        throttle = 0
+
         p.resetSimulation()
         self._create_track()
 
@@ -1152,14 +1161,16 @@ AI说：
                     reward =  -1 # 撞墙惩罚
                     done = True
                     self.writer.add_scalar("steps/hitWall", 1, self.total_step)
+                    print('hit wall')
                     return reward, done
 
         # 2. 检查是否到达终点
         finish_distance = np.linalg.norm(state[:2] - np.array(self.finish_pos[:2]))
-        if finish_distance < 1.0:  # 接近终点
+        if finish_distance < 2.0:  # 接近终点
             reward = +3  # 到达终点奖励
             done = True
             self.writer.add_scalar("steps/reachGoal", 1, self.total_step)
+            print('goal')
             return  reward, done
 
 
@@ -1174,33 +1185,76 @@ AI说：
         """关闭环境"""
         p.disconnect()
 
+
 def get_user_action():
-    keys = pygame.key.get_pressed()
-    steer = 0
-    throttle = 0
-    if keys[pygame.K_LEFT]:
-        steer = -1
-    if keys[pygame.K_RIGHT]:
-        steer = 1
-    if keys[pygame.K_UP]:
-        throttle = 1
-    if keys[pygame.K_DOWN]:
-        throttle = -1
-    return [steer, throttle]
+    global steer
+    global throttle
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            exit()
+
+        if event.type == pygame.KEYDOWN:
+            flag = False
+            if event.key == pygame.K_LEFT:
+                #print("left")
+                flag = True
+                steer += -0.2
+            if event.key == pygame.K_RIGHT:
+                #print("right")
+                flag = True
+                steer += 0.2
+            if event.key == pygame.K_UP:
+                #print("up")
+                flag = True
+                throttle += 0.1
+            if event.key == pygame.K_DOWN:
+                #print("down")
+                flag = True
+                throttle += -0.1
+            if flag:
+                throttle = max(min(throttle, 1), -1)
+                steer = max(min(steer, 1), -1)
+                return numpy.array([steer, throttle], dtype=numpy.float32)
+
+    return  numpy.array([steer, throttle], dtype=numpy.float32)
 
 
 if __name__ == '__main__':
+    pygame.init()
+    pygame.display.set_mode((400, 300))  # 创建一个最小窗口，必要！
+    clock = pygame.time.Clock()
+
     writer = SummaryWriter( f'logs/racecar_expert_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
     env = RaceCarEnv(writer, True)
-    while True:
+    all_traj = []
+    for _ in range(100):
         done = False
         obs, _ = env.reset()
+        traj = []
+        traj_started = False
         while not done:
+            clock.tick(FPS)
+            p.stepSimulation(env.physicsClient)
             action = get_user_action()
-            obs,reward, terminated, truncated, info = env.step(action)
+            if (action[0] != 0 or action[1] != 0) and traj_started == False:
+                traj_started = True
+                print('start a trajectory')
+
+            next_obs,reward, terminated, truncated, info = env.step(action)
+            if traj_started:
+                traj.append((obs, action, reward, terminated, truncated, info, next_obs))
+            obs = next_obs
             if terminated or truncated:
                 break
+        all_traj.append(traj)
+        print(f'trajectory len:{len(traj)}')
+        print(f'has collected {len(all_traj)} trajectories')
+
+    torch.save(all_traj, './expert_racecar_traj.pth')
 
 
 ```
 
+收集到的专家数据[在这里](models/expert_racecar_traj.pth)
