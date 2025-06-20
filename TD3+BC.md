@@ -801,7 +801,7 @@ class RaceCarEnv(gym.Env):
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         self.fps = 20
         p.setTimeStep(1/self.fps, physicsClientId=self.physicsClient)
-        p.setRealTimeSimulation(1, physicsClientId=self.physicsClient)
+        p.setRealTimeSimulation(0, physicsClientId=self.physicsClient)
 
         # 定义动作空间和状态空间
         self.action_space = spaces.Box(
@@ -1261,6 +1261,65 @@ if __name__ == '__main__':
 
 收集到的专家数据[在这里](models/expert_racecar_traj.pth)
 
+###### pygame循环的使用
+
+因为是一个重要知识点，所以专门拎出来说。
+
+以下是一个标准、结构清晰**的 **Pygame 循环模板，附有详细注释，适合快速集成绘制和控制逻辑：
+
+```python
+import pygame
+import sys
+
+# ==========================
+# 1️⃣ 初始化
+# ==========================
+pygame.init()
+screen = pygame.display.set_mode((400, 300))
+pygame.display.set_caption("Pygame Demo")  # 可选：窗口标题
+clock = pygame.time.Clock()
+FPS = 30  # 目标帧率
+
+# ==========================
+# 2️⃣ 游戏主循环
+# ==========================
+running = True
+while running: #每一帧做下面的事情
+    # ---- ① 事件检测 ----
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        # 可选：额外键鼠检测
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                running = False
+
+    # ---- ② 更新游戏状态 ----
+    # 在这里更新位置、计算动力学、检测碰撞等
+    # 示例：
+    # x += dx
+    # y += dy
+
+    # ---- ③ 绘制 ----
+    screen.fill((30, 30, 30))  # 背景颜色
+    # 在这里绘制对象，例如：
+    # pygame.draw.rect(screen, (255, 0, 0), (x, y, 50, 30))
+    # 绘制文本、图像等等
+    pygame.display.flip()       # 更新窗口显示
+
+    # ---- ④ 控制帧率 ----
+    clock.tick(FPS)
+
+# ==========================
+# 3️⃣ 完成退出
+# ==========================
+pygame.quit()
+sys.exit()
+
+```
+
+
+
 ###### 训练
 
 想了各种办法也不收敛，百思不得其解：
@@ -1269,6 +1328,7 @@ if __name__ == '__main__':
 2. 把state进行归一化：小车位置和目标位置都除以15
 3. 一开始就进行100个epoch的纯behavior clone
 4. 篡改专家数据里的reward，如果为0就改为-0.01
+5. 也尝试只做行为克隆（2万 epoch），不做RL训练
 
 结果训练出来的agent，一启动就把车左转，一头撞死在墙上，获得 -1回报。tb上报如下：
 
