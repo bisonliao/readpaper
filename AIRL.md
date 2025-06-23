@@ -45,4 +45,4 @@ In our experiments, we aim to answer two questions:
 
 论文中Figure 3 4 5的中心思想：
 
-![image-20250618205540190](D:\GitHub\readpaper\img\image-20250618205540190.png)
+![image-20250618205540190](img/image-20250618205540190.png)
