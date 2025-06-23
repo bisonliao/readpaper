@@ -1,3 +1,5 @@
+### 网友整理的RL论文
+
 | 类别               | 论文题目                                                     | 原文链接                                                     | 视频解读 |
 | ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ | -------- |
 | Value-based        | Playing Atari with Deep Reinforcement Learning (**DQN**) [[Markdown\]](https://github.com/datawhalechina/easy-rl/blob/master/papers/DQN/Playing Atari with Deep Reinforcement Learning.md) [[PDF\]](https://github.com/datawhalechina/easy-rl/blob/master/papers/DQN/PDF/Playing Atari with Deep Reinforcement Learning.pdf) | https://arxiv.org/abs/1312.5602                              |          |
@@ -41,3 +43,71 @@
 | Imitation Learning | GAIL                                                         | https://arxiv.org/abs/1606.03476                             |          |
 |                    | TD3+BC                                                       | https://arxiv.org/pdf/2106.06860.pdf                         |          |
 | Model based        | Dyna Q                                                       | https://arxiv.org/abs/1801.06176                             |          |
+
+
+
+
+
+### AI整理的
+
+#### 价值迭代类：
+
+| 算法               | 论文名称                                                     | ArXiv 链接                                                   |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Q-Learning         | Watkins's Q-learning                                         | https://www.cs.rhul.ac.uk/~chrisw/new-q.pdf（无 arXiv，原始论文） |
+| DQN                | Human-level control through deep reinforcement learning      | https://arxiv.org/abs/1312.5602                              |
+| Double DQN         | Deep Reinforcement Learning with Double Q-learning           | https://arxiv.org/abs/1509.06461                             |
+| Dueling DQN        | Dueling Network Architectures for Deep Reinforcement Learning | https://arxiv.org/abs/1511.06581                             |
+| Prioritized Replay | Prioritized Experience Replay                                | https://arxiv.org/abs/1511.05952                             |
+| Rainbow DQN        | Rainbow: Combining Improvements in Deep RL                   | https://arxiv.org/abs/1710.02298                             |
+| QR-DQN             | Distributional Reinforcement Learning with Quantile Regression | https://arxiv.org/abs/1710.10044                             |
+
+#### 策略迭代类：
+
+| 算法      | 论文名称                                             | ArXiv 链接                                                   |
+| --------- | ---------------------------------------------------- | ------------------------------------------------------------ |
+| REINFORCE | Simple Statistical Gradient-Following Algorithms     | https://www-anw.cs.umass.edu/~barto/courses/cs687/williams92simple.pdf（无 arXiv） |
+| TRPO      | Trust Region Policy Optimization                     | https://arxiv.org/abs/1502.05477                             |
+| PPO       | Proximal Policy Optimization Algorithms              | https://arxiv.org/abs/1707.06347                             |
+| A2C / A3C | Asynchronous Methods for Deep Reinforcement Learning | https://arxiv.org/abs/1602.01783                             |
+
+#### AC类：
+
+| 算法 | 论文名称                                                     | ArXiv 链接                       |
+| ---- | ------------------------------------------------------------ | -------------------------------- |
+| DDPG | Continuous control with deep reinforcement learning          | https://arxiv.org/abs/1509.02971 |
+| TD3  | Addressing Function Approximation Error in Actor-Critic Methods | https://arxiv.org/abs/1802.09477 |
+| SAC  | Soft Actor-Critic: Off-Policy Maximum Entropy Deep RL        | https://arxiv.org/abs/1801.01290 |
+
+#### 模仿学习/逆强化学习：
+
+| 算法                  | 论文名称                                                     | ArXiv 链接                       |
+| --------------------- | ------------------------------------------------------------ | -------------------------------- |
+| Behavior Cloning (BC) | 无固定首发，经典总结见：A Survey of Robot Learning from Demonstration | https://arxiv.org/abs/1206.3501  |
+| DAgger                | A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning | https://arxiv.org/abs/1011.0686  |
+| GAIL                  | Generative Adversarial Imitation Learning                    | https://arxiv.org/abs/1606.03476 |
+| AIRL                  | Adversarial Inverse Reinforcement Learning                   | https://arxiv.org/abs/1710.11248 |
+| BCQ                   | Batch-Constrained deep Q-learning                            | https://arxiv.org/abs/1812.02900 |
+
+#### 离线学习：
+
+| 算法   | 论文名称                                                     | ArXiv 链接                       |
+| ------ | ------------------------------------------------------------ | -------------------------------- |
+| BCQ    | Batch-Constrained deep Q-learning                            | https://arxiv.org/abs/1812.02900 |
+| TD3+BC | Conservative Offline Deep Reinforcement Learning (含 TD3+BC baseline) | https://arxiv.org/abs/2106.06860 |
+| CQL    | Conservative Q-Learning for Offline Reinforcement Learning   | https://arxiv.org/abs/2006.04779 |
+| IQL    | Implicit Q-Learning for Offline RL                           | https://arxiv.org/abs/2110.06169 |
+
+#### 层级强化学习/多目标强化学习
+
+| 算法  | 论文名称                                           | ArXiv 链接                       |
+| ----- | -------------------------------------------------- | -------------------------------- |
+| h-DQN | Hierarchical Deep Reinforcement Learning           | https://arxiv.org/abs/1604.06057 |
+| HIRO  | Data-Efficient Hierarchical Reinforcement Learning | https://arxiv.org/abs/1810.00257 |
+
+#### RLHF相关：
+
+| 算法               | 论文名称                                                     | ArXiv 链接                       |
+| ------------------ | ------------------------------------------------------------ | -------------------------------- |
+| PPO+KL（RLHF基础） | Learning to Summarize with Human Feedback                    | https://arxiv.org/abs/2009.01325 |
+| DPO                | Direct Preference Optimization: Your Language Model is Secretly a Reward Model | https://arxiv.org/abs/2305.18290 |
