@@ -279,3 +279,300 @@ if __name__ == "__main__":
         train_BCQ(state_dim, action_dim, max_action, device, args)
 ```
 
+#### CartPole
+
+BCQ也可以用于离散动作场景，专门有一篇论文：
+
+```
+https://arxiv.org/pdf/1910.01708
+```
+
+所以用cartpole + 官方代码再试一下，任务比较简单，5000次迭代（下图最左边第一个点）就evaluate显示很好的回合回报了：
+
+![image-20250624142900372](img/image-20250624142900372.png)
+
+贴一下修改过的代码：
+
+```python
+import argparse
+import copy
+import importlib
+import json
+import os
+import datetime
+
+from stable_baselines3 import DQN
+from huggingface_hub import hf_hub_download
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from typing import Callable, List
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+import torch
+
+from BCQ_discrete import discrete_BCQ
+
+writer = SummaryWriter(log_dir=f'logs/BCQ_cartpole_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+class Config:
+    max_iteration = 30
+    max_experience_len = 100_000
+    state_dim = 4
+    num_action = 2
+    experience_filename = './rl-trained-agents/expert_experience_cartpole.pth'
+
+class StandardBuffer(object):
+    def __init__(self, state_dim, batch_size, buffer_size, device):
+        self.batch_size = batch_size
+        self.max_size = int(buffer_size)
+        self.device = device
+
+        self.ptr = 0
+        self.crt_size = 0
+
+        self.state = np.zeros((self.max_size, state_dim))
+        self.action = np.zeros((self.max_size, 1))
+        self.next_state = np.array(self.state)
+        self.reward = np.zeros((self.max_size, 1))
+        self.not_done = np.zeros((self.max_size, 1))
+
+    def add(self, state, action, next_state, reward, done, episode_done, episode_start):
+        self.state[self.ptr] = state
+        self.action[self.ptr] = action
+        self.next_state[self.ptr] = next_state
+        self.reward[self.ptr] = reward
+        self.not_done[self.ptr] = 1. - done
+
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.crt_size = min(self.crt_size + 1, self.max_size)
+
+    def sample(self):
+        ind = np.random.randint(0, self.crt_size, size=self.batch_size)
+        return (
+            torch.FloatTensor(self.state[ind]).to(self.device),
+            torch.LongTensor(self.action[ind]).to(self.device),
+            torch.FloatTensor(self.next_state[ind]).to(self.device),
+            torch.FloatTensor(self.reward[ind]).to(self.device),
+            torch.FloatTensor(self.not_done[ind]).to(self.device)
+        )
+
+    def save(self, save_folder):
+        np.save(f"{save_folder}_state.npy", self.state[:self.crt_size])
+        np.save(f"{save_folder}_action.npy", self.action[:self.crt_size])
+        np.save(f"{save_folder}_next_state.npy", self.next_state[:self.crt_size])
+        np.save(f"{save_folder}_reward.npy", self.reward[:self.crt_size])
+        np.save(f"{save_folder}_not_done.npy", self.not_done[:self.crt_size])
+        np.save(f"{save_folder}_ptr.npy", self.ptr)
+
+    def load(self, save_folder, size=-1):
+        reward_buffer = np.load(f"{save_folder}_reward.npy")
+
+        # Adjust crt_size if we're using a custom size
+        size = min(int(size), self.max_size) if size > 0 else self.max_size
+        self.crt_size = min(reward_buffer.shape[0], size)
+
+        self.state[:self.crt_size] = np.load(f"{save_folder}_state.npy")[:self.crt_size]
+        self.action[:self.crt_size] = np.load(f"{save_folder}_action.npy")[:self.crt_size]
+        self.next_state[:self.crt_size] = np.load(f"{save_folder}_next_state.npy")[:self.crt_size]
+        self.reward[:self.crt_size] = reward_buffer[:self.crt_size]
+        self.not_done[:self.crt_size] = np.load(f"{save_folder}_not_done.npy")[:self.crt_size]
+
+        print(f"Replay Buffer loaded with {self.crt_size} elements.")
+
+
+def interact_with_environment(env, replay_buffer, args):
+    # For saving files
+    # Initialize and load policy
+    policy = DQN.load('./rl-trained-agents/dqn/CartPole-v1_1/CartPole-v1.zip')
+
+
+    state, _ = env.reset()
+    done = False
+    episode_start = True
+    episode_reward = 0
+    episode_timesteps = 0
+    episode_num = 0
+
+    # Interact with the environment
+    for t in range(100_000):
+
+        episode_timesteps += 1
+
+        action, _ = policy.predict(np.array(state))
+
+
+        # Perform action and log results
+        next_state, reward, term, trunc, info = env.step(action)
+        done = term or trunc
+        episode_reward += reward
+
+        # Only consider "done" if episode terminates due to failure condition
+        done_float = 0.0
+        if term and not trunc:
+            done_float = 1.0
+
+
+
+        # Store data in replay buffer
+        replay_buffer.add(state, action, next_state, reward, done_float, done, episode_start)
+        state = copy.copy(next_state)
+        episode_start = False
+
+
+
+        if done:
+            # +1 to account for 0 indexing. +0 on ep_timesteps since it will increment +1 even if done=True
+            print(
+                f"Total T: {t + 1} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f}")
+            # Reset environment
+            state, _ = env.reset()
+            done = False
+            episode_start = True
+            episode_reward = 0
+            episode_timesteps = 0
+            episode_num += 1
+
+    torch.save(replay_buffer, Config.experience_filename)
+
+
+# Trains BCQ offline
+def train_BCQ(env, replay_buffer, is_atari, num_actions, state_dim, device, args, parameters):
+    # For saving files
+    setting = f"{args.env}_{args.seed}"
+    buffer_name = f"{args.buffer_name}_{setting}"
+
+    # Initialize and load policy
+    policy = discrete_BCQ(
+        is_atari,
+        num_actions,
+        state_dim,
+        device,
+        args.BCQ_threshold,
+        parameters["discount"],
+        parameters["optimizer"],
+        parameters["optimizer_parameters"],
+        parameters["polyak_target_update"],
+        parameters["target_update_freq"],
+        parameters["tau"],
+        parameters["initial_eps"],
+        parameters["end_eps"],
+        parameters["eps_decay_period"],
+        parameters["eval_eps"]
+    )
+
+    # Load replay buffer
+    replay_buffer = torch.load(Config.experience_filename, weights_only=False)
+
+    episode_num = 0
+    done = True
+    training_iters = 0
+
+    while training_iters < args.max_timesteps:
+
+        for _ in range(int(parameters["eval_freq"])):
+            policy.train(replay_buffer)
+
+        eval_policy(policy, training_iters)
+
+        training_iters += int(parameters["eval_freq"])
+        print(f"Training iterations: {training_iters}")
+
+
+# Runs policy for X episodes and returns average reward
+# A fixed seed is used for the eval environment
+def eval_policy(policy, it, eval_episodes=10):
+    eval_env = gym.make('CartPole-v1')
+
+    avg_reward = 0.
+    for _ in range(eval_episodes):
+        state, _ = eval_env.reset()
+        done = False
+        while not done:
+            action = policy.select_action(np.array(state), eval=True)
+            state, reward, term, trunc, _ = eval_env.step(action)
+            done = term or trunc
+            avg_reward += reward
+
+    avg_reward /= eval_episodes
+
+    print("---------------------------------------")
+    print(f"Evaluation over {eval_episodes} episodes: {avg_reward:.3f}")
+    print("---------------------------------------")
+    writer.add_scalar('eval/avg_reward', avg_reward, it)
+    return avg_reward
+
+
+if __name__ == "__main__":
+
+
+
+    regular_parameters = {
+        # Exploration
+        "start_timesteps": 1e3,
+        "initial_eps": 0.1,
+        "end_eps": 0.1,
+        "eps_decay_period": 1,
+        # Evaluation
+        "eval_freq": 5e3,
+        "eval_eps": 0,
+        # Learning
+        "discount": 0.99,
+        "buffer_size": 1e6,
+        "batch_size": 64,
+        "optimizer": "Adam",
+        "optimizer_parameters": {
+            "lr": 3e-4
+        },
+        "train_freq": 1,
+        "polyak_target_update": True,
+        "target_update_freq": 1,
+        "tau": 0.005
+    }
+
+    # Load parameters
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", default="PongNoFrameskip-v0")  # OpenAI gym environment name
+    parser.add_argument("--seed", default=0, type=int)  # Sets Gym, PyTorch and Numpy seeds
+    parser.add_argument("--buffer_name", default="Default")  # Prepends name to filename
+    parser.add_argument("--max_timesteps", default=1e6, type=int)  # Max time steps to run environment or train for
+    parser.add_argument("--BCQ_threshold", default=0.3, type=float)  # Threshold hyper-parameter for BCQ
+    parser.add_argument("--low_noise_p", default=0.2,
+                        type=float)  # Probability of a low noise episode when generating buffer
+    parser.add_argument("--rand_action_p", default=0.2,
+                        type=float)  # Probability of taking a random action when generating buffer, during non-low noise episode
+    parser.add_argument("--generate_buffer", action="store_true")  # If true, generate buffer
+    args = parser.parse_args()
+
+    print("---------------------------------------")
+    if args.generate_buffer:
+        print(f"Setting: Generating buffer, Env: {args.env}, Seed: {args.seed}")
+    else:
+        print(f"Setting: Training BCQ, Env: {args.env}, Seed: {args.seed}")
+    print("---------------------------------------")
+
+
+
+
+    # Make env and determine properties
+    env = gym.make('CartPole-v1')
+    parameters =  regular_parameters
+
+    # Set seeds
+    env.action_space.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    device = DEVICE
+
+    replay_buffer = StandardBuffer(Config.state_dim, parameters["batch_size"], parameters["buffer_size"], device)
+
+    if  args.generate_buffer:
+        interact_with_environment(env, replay_buffer, args)
+    else:
+        train_BCQ(env, replay_buffer, False, Config.num_action, Config.state_dim, device, args, parameters)
+```
+
