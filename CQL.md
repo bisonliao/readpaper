@@ -94,6 +94,7 @@ class Config:
     max_iteration = 50_000
     experience_filename = './rl-trained-agents/expert_experience_lunarlander.pth'
     task_id = "LunarLander-v2"
+    max_experience_len = 200_000
 
     # 超参数
     gamma = 0.99  # 折扣因子
