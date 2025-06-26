@@ -56,6 +56,25 @@
 
 ![image-20250625151745424](img/image-20250625151745424.png)
 
+#### 供参考的超参数清单
+
+| **超参数**                 | **推荐取值**                              | **含义**                                                     |
+| -------------------------- | ----------------------------------------- | ------------------------------------------------------------ |
+| N（迭代次数）              | 50～200                                   | 算法主训练循环次数；每次迭代用混合策略采样新的轨迹并更新策略网络，直到策略收敛为止。 |
+| α₀（初始专家权重）         | 1.0                                       | 初始混合权重；开始时完全依赖专家策略 π* 来指导 roll-in 行为。 |
+| α_n（衰减策略）            | α_n = α₀ · (decay_rate)ⁿ 或 α_n = 1/(n+1) | 逐步减少专家权重；推荐使用指数衰减（decay_rate=0.99~0.995），保证算法渐进过渡到纯策略采样。 |
+| decay_rate                 | 0.99~0.995                                | α_n 中的指数衰减速率，控制减少速度；值接近1意味着减少缓慢，值较小时意味着减少快。 |
+| K（每次迭代采样轨迹数）    | 8～32                                     | 每次迭代中从环境中采集的新轨迹数量，用于更新策略网络。       |
+| 轨迹步长 H                 | 环境的 episode 长度                       | 单个 episode 最大步数（任务相关），例如 BipedalWalkerHardcore 一集约 1600 步。 |
+| γ（折扣因子）              | 0.99                                      | 折扣因子，用于计算轨迹回报时折扣未来奖励，标准 RL 折扣取法即可。 |
+| lr（学习率）               | 3e-4                                      | 策略网络优化器学习率，建议用 Adam 优化器，开始用较小学习率减少梯度爆炸风险。 |
+| batch_size（训练批大小）   | 64～256                                   | 用轨迹中采集到的所有 transition 训练策略网络时的批大小。     |
+| clip_grad_norm（梯度裁剪） | 0.5～1.0                                  | 梯度裁剪范围，避免梯度过大导致网络权重更新过猛引发 NaN 或不稳定。 |
+| log_std_min/max            | [-10, 1]                                  | 策略网络中 log_std 的取值范围，避免标准差过大过小导致数值不稳定。 |
+| entropy_coeff（熵权重）    | 0.0~0.01                                  | 可以考虑添加小权重鼓励策略探索（与 PPO 类似），AggreVaTeD 中通常可以设为 0 或非常小。 |
+| normalize_q_star           | True                                      | 是否对 Q*(s,a) 做 min-max 归一化或减去 baseline，减少梯度方差，提高稳定性。 |
+| replay_buffer              | False                                     | AggreVaTeD 建议不使用 replay buffer，保证 roll-in 策略分布匹配理论假设。 |
+
 #### 实现细节
 
 ![image-20250626112507394](img/image-20250626112507394.png)
@@ -72,7 +91,9 @@
 
 #### BipedalWalkerHardCore
 
+啥都没有学到啊
 
+![image-20250626120401445](img/image-20250626120401445.png)
 
 
 
@@ -101,7 +122,7 @@ writer = SummaryWriter(log_dir=f'logs/AggreVateD_BipedalWalker_{datetime.datetim
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 class Config:
-    max_iteration = 300
+    max_iteration = 50
     max_experience_len = 100_000
     state_dim = 24
     action_dim = 4
@@ -283,6 +304,7 @@ class AggreVateDAgent:
     def train(self):
 
         update_cnt = 0
+        step_cnt = 0
         for epoch in tqdm(range(0, Config.max_iteration), 'trainning'):
             transition_list = []
             for _ in range(Config.K):
@@ -294,6 +316,8 @@ class AggreVateDAgent:
                         action = self.mixed_policy(state_tensor) #type:torch.Tensor
                     next_state, reward, done, _, _ = self.env.step(action)
                     q_star = self.get_q_star(state, action)
+                    step_cnt += 1
+                    writer.add_scalar('train/q_star', q_star, step_cnt)
 
                     transition_list.append(
                                  (state,
