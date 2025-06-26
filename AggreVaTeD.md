@@ -91,6 +91,8 @@
 
 #### BipedalWalkerHardCore
 
+##### REINFORCE + AggreVateD
+
 啥都没有学到啊
 
 ![image-20250626120401445](img/image-20250626120401445.png)
@@ -123,7 +125,6 @@ device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 class Config:
     max_iteration = 50
-    max_experience_len = 100_000
     state_dim = 24
     action_dim = 4
     max_action = 1
@@ -131,11 +132,10 @@ class Config:
     H = 1000
     env_name = "BipedalWalkerHardcore-v3"
     hidden_dim = 128
-    lr = 1e-4
+    lr = 3e-4
     gamma = 0.99
     batch_sz = 128
-    train_repeat = 50
-
+    train_repeat = 30
 # ----------------------------
 # 1. 策略网络定义
 # ----------------------------
@@ -144,6 +144,7 @@ class PolicyNetwork(nn.Module):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(state_dim, Config.hidden_dim)
         self.fc2 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
+        self.fc3 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
 
         self.mean = nn.Linear(Config.hidden_dim, action_dim)
         self.log_std = nn.Linear(Config.hidden_dim, action_dim)
@@ -154,6 +155,7 @@ class PolicyNetwork(nn.Module):
     def forward(self, state):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
 
         mean = self.mean(x)
         log_std = self.log_std(x)
@@ -232,6 +234,19 @@ class AggreVateDAgent:
         self.alpha = 1.0 - slope * epoch
         return self.alpha
 
+    def compute_returns(self, rewards):
+        returns = []
+        R = 0
+        for r in reversed(rewards):
+            R = r + Config.gamma * R
+            returns.insert(0, R)
+        return returns
+
+    def normalize_returns(self, return_list):
+        return_list = np.array(return_list)
+        return_list = (return_list - return_list.mean()) / (return_list.std() + 1e-8)
+        return return_list
+
 
     def normalize_q_star(self, transition_list):
         q_star_list = []
@@ -241,23 +256,31 @@ class AggreVateDAgent:
             q_star_list.append(q_star)
         q_star_list = np.array(q_star_list) # type:np.ndarray
         q_star_list = (q_star_list - q_star_list.min()) / (q_star_list.max() - q_star_list.min() + 1e-8)
+        #q_star_list -= 0.5
+        #q_star_list = (q_star_list - q_star_list.mean()) / (q_star_list.std() + 1e-8)
         return q_star_list
 
-    def update(self, transition_list:list, normalized_q_star_list:np.ndarray, epoch:int):
+    def update(self, states_list:np.ndarray, actions_list:np.ndarray, normalized_q_star_list:np.ndarray, epoch:int):
         total_loss = 0.0
         loss_cnt = 0
-
-        states_list, actions_list, _, _, _, _ = zip(*transition_list)
-        for start in range(0, len(transition_list), Config.batch_sz):
-            end = min(start + Config.batch_sz, len(transition_list) )
-            state = states_list[start:end]
-            action = actions_list[start:end]
-            q_star = normalized_q_star_list[start:end]
+        sample_num = states_list.shape[0]
+        indices = np.arange(sample_num)
+        np.random.shuffle(indices)
 
 
-            obs_tensor = torch.tensor(state).float().to(device)
-            action_tensor = torch.tensor(action).float().to(device)
-            q_star_tensor = torch.tensor(q_star).float().unsqueeze(-1).to(device)
+        for start in range(0, sample_num, Config.batch_sz):
+            end = min(start + Config.batch_sz, sample_num )
+
+            batch_idx = indices[start:end]
+
+            action = actions_list[batch_idx]
+            state = states_list[batch_idx]
+            q_star = normalized_q_star_list[batch_idx]
+
+
+            obs_tensor = torch.from_numpy(state).float().to(device)
+            action_tensor = torch.from_numpy(action).float().to(device)
+            q_star_tensor = torch.from_numpy(q_star).float().unsqueeze(-1).to(device)
 
 
             log_prob = self.policy.get_log_prob(obs_tensor, action_tensor)
@@ -307,8 +330,10 @@ class AggreVateDAgent:
         step_cnt = 0
         for epoch in tqdm(range(0, Config.max_iteration), 'trainning'):
             transition_list = []
+            return_list = []
             for _ in range(Config.K):
                 state,_ = self.env.reset()
+                rewards = []
                 for _ in range(Config.H):
                     state_tensor = torch.FloatTensor(state).to(device)
                     state_tensor = state_tensor.unsqueeze(0)
@@ -318,6 +343,7 @@ class AggreVateDAgent:
                     q_star = self.get_q_star(state, action)
                     step_cnt += 1
                     writer.add_scalar('train/q_star', q_star, step_cnt)
+                    rewards.append(reward)
 
                     transition_list.append(
                                  (state,
@@ -331,12 +357,18 @@ class AggreVateDAgent:
                     state = next_state
                     if done:
                         break
+                returns = self.compute_returns(rewards)
+                return_list.extend(returns)
 
 
             q_star_list = self.normalize_q_star(transition_list)  # type:np.ndarray
+            return_list = self.normalize_returns(return_list)
+            states_list, actions_list, _, _, _, _ = zip(*transition_list)
+            states_list = np.stack(states_list)
+            actions_list = np.stack(actions_list)
             for _ in range(Config.train_repeat):
                 update_cnt += 1
-                loss = self.update(transition_list, q_star_list,epoch)
+                loss = self.update(states_list, actions_list, q_star_list, epoch)
                 writer.add_scalar('train/loss', loss.item(), update_cnt)
 
             score = self.evaluate()
@@ -358,3 +390,265 @@ if __name__ == "__main__":
     main("train")
 ```
 
+为了排查问题，我需要稳打稳扎，我先搞定REINFORCE算法训练agent完成BipedalWalker任务：
+
+```python
+import datetime
+import random
+
+from stable_baselines3 import SAC
+
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import torch.nn.functional as F
+
+
+
+
+writer = SummaryWriter(log_dir=f'logs/reinforce_BipedalWalker_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+class Config:
+    max_iteration = 1000
+    state_dim = 24
+    action_dim = 4
+    max_action = 1
+    H = 1000
+
+    #env_name = "BipedalWalkerHardcore-v3"
+    env_name = "BipedalWalker-v3"
+    hidden_dim = 128
+    lr = 3e-4
+    gamma = 0.99
+    batch_sz = 128
+    train_repeat = 4
+    rollout_repeat = 1
+
+# ----------------------------
+# 1. 策略网络定义
+# ----------------------------
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, log_std_min=-10, log_std_max=2):
+        super(PolicyNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_dim, Config.hidden_dim)
+        self.fc2 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
+        self.fc3 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
+
+        self.mean = nn.Linear(Config.hidden_dim, action_dim)
+        self.log_std = nn.Linear(Config.hidden_dim, action_dim)
+
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+
+        mean = self.mean(x)
+        log_std = self.log_std(x)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std)
+
+        return mean, std
+
+    # 带随机性的采样动作和该动作的log-prob值
+    def sample(self, state):
+        mean, std = self.forward(state)
+        normal = torch.distributions.Normal(mean, std)
+        x = normal.rsample()
+        action = torch.tanh(x)
+
+        log_prob = normal.log_prob(x)
+        # This is the crucial part, known as the "log-derivative of the tanh transformation" or
+        # the "correction term for squashing functions".
+        # It help to get the log_prob of the squashed action (action) in the squashed space
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        # todo：如果任务的action幅度不是+-1，还需要乘，并调整log_prob
+        return action, log_prob
+    # 确定性的返回最大概率的动作
+    def predict(self, state):
+        mean, std = self.forward(state)
+        x = mean
+        action = torch.tanh(x)
+        return action
+    # 根据state计算动作分布，返回old_action动作在该分布下的log_prob，
+    # old_action是经过tanh rescaled了的
+    def get_log_prob(self, state, old_action):
+        #避免 后面 arctanh 返回的绝对值太大了，做稍微裁剪
+        eps = 1e-6
+        old_action = torch.clamp(old_action, -1 + eps, 1 - eps)
+
+        mean, std = self.forward(state)
+        assert (torch.abs(old_action) < 1).all(), f'invalid action:{old_action}'
+        normal = torch.distributions.Normal(mean, std)
+        unscaled_action = torch.arctanh(old_action)
+        ent = normal.entropy()
+
+        log_prob = normal.log_prob(unscaled_action)
+        # This is the crucial part, known as the "log-derivative of the tanh transformation" or
+        # the "correction term for squashing functions".
+        # It help to get the log_prob of the squashed action (action) in the squashed space
+        log_prob -= torch.log(1 - old_action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        # todo：如果任务的action幅度不是+-1，还需要乘，并调整log_prob
+        return  log_prob, ent.mean()
+
+
+
+
+class AggreVateDAgent:
+    def __init__(self):
+        self.env = gym.make(Config.env_name, render_mode=None)  # 开启可视化
+
+        self.policy = PolicyNetwork(Config.state_dim, Config.action_dim, Config.hidden_dim).to(device)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=Config.lr)
+
+    def compute_returns(self, rewards):
+        returns = []
+        R = 0
+        for r in reversed(rewards):
+            R = r + Config.gamma * R
+            returns.insert(0, R)
+        return returns
+
+    def normalize_returns(self, return_list):
+        return_list = np.array(return_list)
+        return_list = (return_list - return_list.mean()) / (return_list.std() + 1e-8)
+        #return_list = (return_list - return_list.min()) / (return_list.max() - return_list.min() + 1e-8)
+        return return_list
+
+
+    def update(self, states_list:np.ndarray, actions_list:np.ndarray, scale_factor:np.ndarray, epoch:int):
+        total_loss = 0.0
+        loss_cnt = 0
+        sample_num = states_list.shape[0]
+        indices = np.arange(sample_num)
+        np.random.shuffle(indices)
+
+
+        for start in range(0, sample_num, Config.batch_sz):
+            end = min(start + Config.batch_sz, sample_num )
+
+            batch_idx = indices[start:end]
+
+            action = actions_list[batch_idx]
+            state = states_list[batch_idx]
+            q_star = scale_factor[batch_idx]
+
+
+            obs_tensor = torch.from_numpy(state).float().to(device)
+            action_tensor = torch.from_numpy(action).float().to(device)
+            q_star_tensor = torch.from_numpy(q_star).float().unsqueeze(-1).to(device)
+
+
+            log_prob, ent_mean = self.policy.get_log_prob(obs_tensor, action_tensor)
+            loss = -log_prob * q_star_tensor - ent_mean * 0.01
+            loss = loss.mean()
+            total_loss += loss
+            loss_cnt += 1
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+        return total_loss / (loss_cnt + 1e-8)
+
+
+    def evaluate(self, mode=None):
+        env = gym.make(Config.env_name, render_mode=mode)
+        total_reward = 0
+        for _ in range(5):
+            state, _ = env.reset()
+            for _ in range(1000):
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                    action = self.policy.predict(state_tensor)
+                    action = action.squeeze(0).cpu().numpy()
+
+                next_state, reward, done, _, _ = env.step(action)
+                total_reward += reward
+                state = next_state
+
+                if done:
+                    break
+
+        env.close()
+        return total_reward / 5
+
+
+    def train(self):
+
+        update_cnt = 0
+        step_cnt = 0
+        for epoch in tqdm(range(0, Config.max_iteration), 'trainning'):
+            transition_list = []
+            return_list = []
+            episodes_per_rollout = 0
+            #for _ in range(Config.rollout_repeat):
+            while len(transition_list) < 2000:
+                state,_ = self.env.reset()
+                rewards = []
+                episodes_per_rollout += 1
+                for _ in range(Config.H):
+                    state_tensor = torch.FloatTensor(state).to(device)
+                    state_tensor = state_tensor.unsqueeze(0)
+                    with torch.no_grad():
+                        action, _ = self.policy.sample(state_tensor)
+                        action = action.squeeze(0).cpu().numpy()
+                    next_state, reward, done, _, _ = self.env.step(action)
+                    step_cnt += 1
+                    rewards.append(reward)
+
+                    transition_list.append(
+                                 (state,
+                                  action,
+                                  next_state,
+                                  reward,
+                                  done)
+                                 )
+
+                    state = next_state
+                    if done:
+                        break
+                returns = self.compute_returns(rewards)
+                return_list.extend(returns)
+            writer.add_scalar('train/episodes_per_rollout', episodes_per_rollout, epoch)
+
+
+            return_list = self.normalize_returns(return_list)
+            states_list, actions_list, _, _, _ = zip(*transition_list)
+            states_list = np.stack(states_list)
+            actions_list = np.stack(actions_list)
+            for _ in range(Config.train_repeat):
+                update_cnt += 1
+                loss = self.update(states_list, actions_list, return_list, epoch) # todo:从 REINFORCE 改回来
+                writer.add_scalar('train/loss', loss.item(), update_cnt)
+
+            if (epoch + 1) % 10 == 0:
+                score = self.evaluate()
+                writer.add_scalar('eval/episode_reward', score, epoch)
+
+
+        self.evaluate('human')
+
+# 6. 主函数（命令行参数解析）
+# ----------------------------
+def main(mode):
+    agent = AggreVateDAgent()
+    agent.train()
+
+
+if __name__ == "__main__":
+    main("train")
+```
+
+但依然搞不定，分别让两个顶尖的AI写代码实现，也不收敛。
+
+我怀疑REINFORCE算法就是搞不定BipedalWalker这样稍显复杂的任务。
