@@ -1191,4 +1191,54 @@ if __name__ == "__main__":
 
 #### BipedalWalkerHardcore
 
-我自己写的PPO反正没有搞定，用SB3的试试。
+##### 手搓的PPO
+
+代码同上面BipedalWalker任务的代码。运行下来不收敛：
+![image-20250627131355705](img/image-20250627131355705.png)
+
+##### SB3的PPO
+
+![image-20250627132343639](img/image-20250627132343639.png)
+
+代码：
+
+```python
+import gymnasium as gym
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import CheckpointCallback
+from torch.backends.mkl import verbose
+
+# 创建环境
+env_id = "BipedalWalkerHardcore-v3"
+env = DummyVecEnv([lambda: Monitor(gym.make(env_id))])
+env = VecNormalize(env, norm_obs=True, norm_reward=False)
+
+# 创建模型
+model = PPO(
+    "MlpPolicy",
+    env,
+    verbose=1,
+    n_steps=2048,
+    batch_size=64,
+    gae_lambda=0.95,
+    gamma=0.99,
+    n_epochs=10,
+    ent_coef=0.001,
+    learning_rate=2.5e-4,
+    clip_range=0.2,
+    tensorboard_log="./logs/"
+)
+
+# 回调：保存模型
+checkpoint_callback = CheckpointCallback(save_freq=100_000, save_path="./checkpoints/", name_prefix="ppo_bwhc")
+
+# 训练
+model.learn(total_timesteps=10_000_000, callback=checkpoint_callback)
+
+# 保存最终模型
+model.save("ppo_bwhc_final")
+env.save("ppo_bwhc_vecnormalize.pkl")
+```
+
