@@ -910,6 +910,11 @@ if __name__ == "__main__":
 
 ##### PPO + AggreVateD（失败）
 
+我本着尽量少改的原则，只修改：
+
+1. 使用混合策略收集轨迹
+2. 只在actor的update中使用Q*， value网路更新不用
+
 不收敛：
 
 ![image-20250626205319556](img/image-20250626205319556.png)
@@ -922,12 +927,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
-from stable_baselines3 import SAC
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import random
-
+from stable_baselines3 import SAC
 # ----------------------------
 # ✅ Config 配置超参数
 # ----------------------------
@@ -938,24 +941,24 @@ class Config:
     hidden_dim = 128
 
     min_rollout_steps = 3000
-    episode_length = 2000
+    max_episode_length = 3000
     gamma = 0.99
-    train_iters = 30
+    lam = 0.95  # GAE lambda
+    train_iters = 10
+    alpha_start = 1.0
 
     clip_ratio = 0.2
-    entropy_coef = 0.0003
+    entropy_coef = 0.001 #这个值很敏感，稍微大一点就不收敛了
     lr = 3e-4
     batch_size = 128
-    max_iters = 300
-    alpha_start = 0.05
+    max_iters = 600
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log_dir = f'logs/PPO_AggreVaTeD_GAE_{datetime.datetime.now().strftime("%m%d_%H%M%S")}'
+    log_dir = f'logs/PPO_{datetime.datetime.now().strftime("%m%d_%H%M%S")}'
     obs_scale = torch.tensor([
         3.1415927, 5., 5., 5., 3.1415927, 5., 3.1415927, 5., 5., 3.1415927,
         5., 3.1415927, 5., 5., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.
     ], dtype=torch.float32)  # shape: [24]
-
 
 # ----------------------------
 # ✅ 策略网络
@@ -982,22 +985,19 @@ class PolicyNet(nn.Module):
     def sample(self, state):
         mean, std = self.forward(state)
         dist = torch.distributions.Normal(mean, std)
-        x = dist.rsample()
-        action = torch.tanh(x)
-        log_prob = dist.log_prob(x) - torch.log(1 - action.pow(2) + 1e-6)
+        raw_action = dist.rsample()
+        action = torch.tanh(raw_action)
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(-1, keepdim=True)
         entropy = dist.entropy().sum(-1, keepdim=True)
         return action, log_prob, entropy
 
     def get_log_prob(self, state, action):
-        eps = 1e-6
-        action = torch.clamp(action, -1 + eps, 1 - eps)
         mean, std = self.forward(state)
         dist = torch.distributions.Normal(mean, std)
-        unscaled = torch.arctanh(action)
-        log_prob = dist.log_prob(unscaled) - torch.log(1 - action.pow(2) + 1e-6)
+        raw_action = torch.atanh(action.clamp(-0.999999, 0.999999))
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
         return log_prob.sum(-1, keepdim=True)
-
 
 # ----------------------------
 # ✅ 值函数网络
@@ -1015,11 +1015,10 @@ class ValueNet(nn.Module):
         x = F.relu(self.fc2(x))
         return self.v(x)
 
-
 # ----------------------------
-# ✅ PPO + AggreVaTeD Agent
+# ✅ PPO Agent
 # ----------------------------
-class AggreVateDPPOAgent:
+class PPOAgent:
     def __init__(self):
         self.env = gym.make(Config.env_name)
         self.policy = PolicyNet().to(Config.device)
@@ -1027,16 +1026,15 @@ class AggreVateDPPOAgent:
 
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=Config.lr)
         self.optimizer_value = optim.Adam(self.value.parameters(), lr=Config.lr)
-
         self.writer = SummaryWriter(Config.log_dir)
-        self.expert = SAC.load('./rl-trained-agents/sac/BipedalWalkerHardcore-v3_1/BipedalWalkerHardcore-v3.zip')
-        self.alpha = Config.alpha_start
 
         self.actor_update_cnt = 0
         self.critic_update_cnt = 0
+        self.expert = SAC.load('./rl-trained-agents/sac/BipedalWalkerHardcore-v3_1/BipedalWalkerHardcore-v3.zip')
+        self.alpha = Config.alpha_start
 
     def decay_alpha(self, epoch):
-        self.alpha = Config.alpha_start - epoch / Config.max_iters
+        self.alpha = max(0, Config.alpha_start - epoch / Config.max_iters*2)
         return self.alpha
 
     def mixed_policy(self, state: torch.Tensor):
@@ -1055,137 +1053,142 @@ class AggreVateDPPOAgent:
 
         return action, log_prob, entropy
 
-
-    def get_q_star(self, state, action):
-        s = torch.tensor(state).float().unsqueeze(0).to(Config.device)
-        a = torch.tensor(action).float().unsqueeze(0).to(Config.device)
+    def get_q_star(self, s, a):
         q1, q2 = self.expert.critic.forward(s, a)
-        return torch.min(q1, q2).item()
+        return torch.min(q1, q2)
 
     def rollout(self):
         buffer = []
         while len(buffer) < Config.min_rollout_steps:
             state, _ = self.env.reset()
-            for _ in range(Config.episode_length):
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(Config.device)
+            for _ in range(Config.max_episode_length):
+                s = torch.FloatTensor(state).unsqueeze(0).to(Config.device)
                 with torch.no_grad():
-                    action, log_prob, entropy = self.mixed_policy(state_tensor)
-                action_np = action.squeeze(0).cpu().numpy()
-                next_state, _, done, _, _ = self.env.step(action_np)
+                    #action, log_prob, entropy = self.policy.sample(s)
+                    action, log_prob, entropy = self.mixed_policy(s)
+                    value = self.value(s)
+                action_np = action.cpu().numpy().squeeze(0)
+                next_state, reward, term, truncated, _ = self.env.step(action_np)
+                done = term or truncated
 
-                q_star = self.get_q_star(state, action_np)
-                buffer.append((state, action_np, log_prob.item(), entropy.item(), q_star))
+                buffer.append((state, action_np, log_prob.item(),
+                               reward, value.item(), done))  # ✅ 多存done
                 state = next_state
                 if done:
                     break
-        return buffer
+        return buffer, next_state
 
-    def update(self, buffer, epoch):
-        states, actions, old_log_probs, entropies, q_star_vals = zip(*buffer)
+    def compute_gae(self, rewards, values, dones, next_state):
+        advantages = []
+        gae = 0
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0 if dones[t] else self.value(
+                    torch.FloatTensor(next_state).unsqueeze(0).to(Config.device)).item()
+            else:
+                next_value = 0 if dones[t] else values[t + 1]
 
+            delta = rewards[t] + Config.gamma * next_value - values[t]
+            gae = delta + Config.gamma * Config.lam * (1 - dones[t]) * gae
+            advantages.insert(0, gae)
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(Config.device)
+        returns = advantages + torch.tensor(values, dtype=torch.float32).to(Config.device)
+        return advantages, returns
+
+    def update(self, buffer, next_state):
+        states, actions, old_log_probs, rewards, values, dones = zip(*buffer)
         states = torch.FloatTensor(np.array(states)).to(Config.device)
         actions = torch.FloatTensor(np.array(actions)).to(Config.device)
         old_log_probs = torch.FloatTensor(old_log_probs).unsqueeze(-1).to(Config.device)
-        entropies = torch.FloatTensor(entropies).unsqueeze(-1).to(Config.device)
-        q_stars = torch.FloatTensor(q_star_vals).unsqueeze(-1).to(Config.device)
+        rewards = list(rewards)
+        dones = list(dones)
+        values = list(values)
 
-        with torch.no_grad():
-            value_preds = self.value(states)
-        advantages = q_stars - value_preds
+        advantages, returns = self.compute_gae(rewards, values, dones, next_state)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        returns = value_preds + advantages
 
-
-        # ✅ 更新值网络
+        # Critic
         for _ in range(Config.train_iters):
             perm = np.random.permutation(len(states))
             for start in range(0, len(perm), Config.batch_size):
-                end = start + Config.batch_size
-                idx = perm[start:end]
+                idx = perm[start:start + Config.batch_size]
                 self.critic_update_cnt += 1
-
-                s = states[idx]
-                target_v = q_stars[idx]
-                v_pred = self.value(s)
-                value_loss = F.mse_loss(v_pred, target_v)
-
+                v_pred = self.value(states[idx])
+                v_target = returns[idx].unsqueeze(-1)
+                value_loss = F.mse_loss(v_pred, v_target)
                 self.optimizer_value.zero_grad()
                 value_loss.backward()
                 self.optimizer_value.step()
+                self.writer.add_scalar('train/critic_loss', value_loss.item(), self.critic_update_cnt)
+                self.writer.add_scalar('train/critic_value', v_pred.mean().item(), self.critic_update_cnt)
 
-                self.writer.add_scalar("train/value_loss", value_loss.item(), self.critic_update_cnt)
-
-        # ✅ 更新策略网络（PPO clipped + entropy + advantage）
+        # Actor
         for _ in range(Config.train_iters):
             perm = np.random.permutation(len(states))
             for start in range(0, len(perm), Config.batch_size):
-                end = start + Config.batch_size
-                idx = perm[start:end]
+                idx = perm[start:start + Config.batch_size]
                 self.actor_update_cnt += 1
+                new_logp = self.policy.get_log_prob(states[idx], actions[idx])
+                ratio = torch.exp(new_logp - old_log_probs[idx])
 
-                s = states[idx]
-                a = actions[idx]
-                old_logp = old_log_probs[idx].detach()
-                adv = advantages[idx].detach()
-
-                new_logp = self.policy.get_log_prob(s, a)
-                ratio = torch.exp(new_logp - old_logp)
-                clip_ratio = Config.clip_ratio
-
+                ###############################  AggreVateD ################
+                with torch.no_grad():
+                    q_star = self.get_q_star(states[idx], actions[idx])
+                    batch_values = np.array(values)[idx]
+                    batch_values = torch.FloatTensor(batch_values).unsqueeze(-1).to(Config.device)
+                    adv = q_star - batch_values
                 surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+                surr2 = torch.clamp(ratio, 1 - Config.clip_ratio, 1 + Config.clip_ratio) * adv
 
-                _, _, entropy = self.policy.sample(s)
+                '''surr1 = ratio * advantages[idx].unsqueeze(-1)
+                surr2 = torch.clamp(ratio, 1-Config.clip_ratio, 1+Config.clip_ratio) * advantages[idx].unsqueeze(-1)'''
+                policy_loss = - torch.min(surr1, surr2).mean()
+                _, _, entropy = self.policy.sample(states[idx])
                 loss = policy_loss - Config.entropy_coef * entropy.mean()
-
                 self.optimizer_policy.zero_grad()
                 loss.backward()
                 self.optimizer_policy.step()
+                self.writer.add_scalar('train/entropy', entropy.mean().item(), self.actor_update_cnt)
+                self.writer.add_scalar('train/actor_loss', loss.item(), self.actor_update_cnt)
 
-                self.writer.add_scalar("train/policy_loss", policy_loss.item(), self.actor_update_cnt)
-                self.writer.add_scalar("train/entropy", entropy.mean().item(), self.actor_update_cnt)
-
-    def evaluate(self):
+    def evaluate(self, num_episodes=5):
         env = gym.make(Config.env_name)
         rewards = []
-        for _ in range(5):
+        for _ in range(num_episodes):
             state, _ = env.reset()
             total = 0
-            for _ in range(Config.episode_length):
+            episode_len = 0
+            for _ in range(Config.max_episode_length):
                 with torch.no_grad():
                     s = torch.FloatTensor(state).unsqueeze(0).to(Config.device)
-                    action = self.policy.sample(s)[0].squeeze(0).cpu().numpy()
-                next_state, r, done, _, _ = env.step(action)
-                total += r
-                state = next_state
+                    action, _, _ = self.policy.sample(s)
+                state, reward, term, truncated, _ = env.step(action.cpu().numpy().squeeze(0))
+                done = term or truncated
+                total += reward
+                episode_len += 1
                 if done:
                     break
+            print(f'eval episode reward:{total}, episode len:{episode_len}')
             rewards.append(total)
         return np.mean(rewards)
 
     def train(self):
         for epoch in tqdm(range(Config.max_iters), desc="Training"):
-            buffer = self.rollout()
-            self.update(buffer, epoch)
-
-            score = self.evaluate()
-            self.writer.add_scalar("eval/score", score, epoch)
-            self.writer.add_scalar("train/alpha", self.alpha, epoch)
+            buffer, next_state = self.rollout()
+            self.update(buffer, next_state)
             self.decay_alpha(epoch)
-
-        self.evaluate()
-
+            self.writer.add_scalar("train/alpha", self.alpha, epoch)
+            if (epoch+1) % 20 == 0:
+                avg_ret = self.evaluate()
+                self.writer.add_scalar("eval/score", avg_ret, epoch)
+                print(f"[Iter {epoch}] Avg Return: {avg_ret:.2f}")
 
 # ----------------------------
 # ✅ 主入口
 # ----------------------------
-def main():
-    agent = AggreVateDPPOAgent()
-    agent.train()
-
 if __name__ == "__main__":
-    main()
+    agent = PPOAgent()
+    agent.train()
 
 ```
 
@@ -1198,47 +1201,51 @@ if __name__ == "__main__":
 
 ##### SB3的PPO
 
+超参数来自：https://huggingface.co/sb3/ppo-BipedalWalkerHardcore-v3， 居然也没有收敛...
+
 ![image-20250627132343639](img/image-20250627132343639.png)
 
 代码：
 
 ```python
-import gymnasium as gym
+from mpmath.libmp import normalize
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import CheckpointCallback
-from torch.backends.mkl import verbose
+import gymnasium as gym
+from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.env_util import make_vec_env
 
-# 创建环境
-env_id = "BipedalWalkerHardcore-v3"
-env = DummyVecEnv([lambda: Monitor(gym.make(env_id))])
+#超参数来自：https://huggingface.co/sb3/ppo-BipedalWalkerHardcore-v3
+
+env = make_vec_env("BipedalWalkerHardcore-v3", n_envs=16)
 env = VecNormalize(env, norm_obs=True, norm_reward=False)
 
-# 创建模型
+def linear_schedule(initial_value):
+    def func(progress_remaining):
+        return progress_remaining * initial_value  # 从 initial_value 衰减到 0
+    return func
+
 model = PPO(
     "MlpPolicy",
     env,
-    verbose=1,
+    learning_rate=linear_schedule(2.5e-4),
     n_steps=2048,
     batch_size=64,
-    gae_lambda=0.95,
-    gamma=0.99,
     n_epochs=10,
-    ent_coef=0.001,
-    learning_rate=2.5e-4,
+    gamma=0.99,
+    gae_lambda=0.95,
     clip_range=0.2,
-    tensorboard_log="./logs/"
+    ent_coef=0.001,
+    vf_coef=0.5,
+    max_grad_norm=0.5,
+    policy_kwargs=dict(net_arch=[dict(pi=[256,256], vf=[256,256])]),
+    tensorboard_log="./logs/",
+    verbose=1,
 )
 
-# 回调：保存模型
-checkpoint_callback = CheckpointCallback(save_freq=100_000, save_path="./checkpoints/", name_prefix="ppo_bwhc")
-
-# 训练
-model.learn(total_timesteps=10_000_000, callback=checkpoint_callback)
-
-# 保存最终模型
-model.save("ppo_bwhc_final")
-env.save("ppo_bwhc_vecnormalize.pkl")
+model.learn(total_timesteps=int(1e7))
+model.save("ppo_bwhc_best")
+env.save('VecNormalize')
 ```
+
+
 
