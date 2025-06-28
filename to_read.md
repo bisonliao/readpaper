@@ -83,7 +83,7 @@
 
 | 算法                  | 论文名称                                                     | ArXiv 链接                       |
 | --------------------- | ------------------------------------------------------------ | -------------------------------- |
-| Behavior Cloning (BC) | 无固定首发，经典总结见：A Survey of Robot Learning from Demonstration | https://arxiv.org/abs/1206.3501  |
+| Behavior Cloning (BC) | 无固定首发，经典总结见：A Survey of Demonstration Learning   | https://arxiv.org/abs/2303.11191 |
 | DAgger                | A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning | https://arxiv.org/abs/1011.0686  |
 | GAIL                  | Generative Adversarial Imitation Learning                    | https://arxiv.org/abs/1606.03476 |
 | AIRL                  | Adversarial Inverse Reinforcement Learning                   | https://arxiv.org/abs/1710.11248 |
@@ -98,12 +98,15 @@
 | CQL    | Conservative Q-Learning for Offline Reinforcement Learning   | https://arxiv.org/abs/2006.04779 |
 | IQL    | Implicit Q-Learning for Offline RL                           | https://arxiv.org/abs/2110.06169 |
 
-#### 层级强化学习/多目标强化学习
+#### 层级强化学习
 
-| 算法  | 论文名称                                           | ArXiv 链接                       |
-| ----- | -------------------------------------------------- | -------------------------------- |
-| h-DQN | Hierarchical Deep Reinforcement Learning           | https://arxiv.org/abs/1604.06057 |
-| HIRO  | Data-Efficient Hierarchical Reinforcement Learning | https://arxiv.org/abs/1810.00257 |
+| 算法          | 论文名称                                             | ArXiv 链接                       |
+| ------------- | ---------------------------------------------------- | -------------------------------- |
+| h-DQN         | Hierarchical Deep Reinforcement Learning             | https://arxiv.org/abs/1604.06057 |
+| HIRO          | Data-Efficient Hierarchical Reinforcement Learning   | https://arxiv.org/abs/1810.00257 |
+| Option-Critic | The Option-Critic Architecture                       | https://arxiv.org/abs/1609.05140 |
+| FuN           | FeUdal Networks for Hierarchical Reinforcement Learn | https://arxiv.org/abs/1703.01161 |
+| HAC           | Learning Multi-Level Hierarchies with Hindsight      | https://arxiv.org/abs/1712.00948 |
 
 #### RLHF相关：
 

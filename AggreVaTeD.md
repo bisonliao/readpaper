@@ -1196,8 +1196,259 @@ if __name__ == "__main__":
 
 ##### 手搓的PPO
 
-代码同上面BipedalWalker任务的代码。运行下来不收敛：
+代码类似上面BipedalWalker任务的代码。运行下来不收敛：
 ![image-20250627131355705](img/image-20250627131355705.png)
+
+```python
+import datetime
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# ----------------------------
+# ✅ Config 配置超参数
+# ----------------------------
+class Config:
+    env_name = "BipedalWalkerHardcore-v3"
+    state_dim = 24
+    action_dim = 4
+    hidden_dim = 256
+
+    min_rollout_steps = 5000
+    max_episode_length = 3000
+    gamma = 0.99
+    lam = 0.95  # GAE lambda
+    train_iters = 10
+
+    clip_ratio = 0.2
+    entropy_coef = 0.001 #这个值很敏感，稍微大一点就不收敛了
+    lr = 3e-4
+    batch_size = 128
+    max_iters = 800
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log_dir = f'logs/PPO_{datetime.datetime.now().strftime("%m%d_%H%M%S")}'
+    obs_scale = torch.tensor([
+        3.1415927, 5., 5., 5., 3.1415927, 5., 3.1415927, 5., 5., 3.1415927,
+        5., 3.1415927, 5., 5., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.
+    ], dtype=torch.float32)  # shape: [24]
+
+# ----------------------------
+# ✅ 策略网络
+# ----------------------------
+class PolicyNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(Config.state_dim, Config.hidden_dim)
+        self.fc2 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
+        self.mean = nn.Linear(Config.hidden_dim, Config.action_dim)
+        self.log_std = nn.Linear(Config.hidden_dim, Config.action_dim)
+        self.log_std_min = -10
+        self.log_std_max = 2
+
+    def forward(self, state):
+        state = state / Config.obs_scale.to(Config.device)
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        mean = self.mean(x)
+        log_std = torch.clamp(self.log_std(x), self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std)
+        return mean, std
+
+    def sample(self, state):
+        mean, std = self.forward(state)
+        dist = torch.distributions.Normal(mean, std)
+        raw_action = dist.rsample()
+        action = torch.tanh(raw_action)
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        entropy = dist.entropy().sum(-1, keepdim=True)
+        return action, log_prob, entropy
+
+    def get_log_prob(self, state, action):
+        mean, std = self.forward(state)
+        dist = torch.distributions.Normal(mean, std)
+        raw_action = torch.atanh(action.clamp(-0.999999, 0.999999))
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
+        return log_prob.sum(-1, keepdim=True)
+
+# ----------------------------
+# ✅ 值函数网络
+# ----------------------------
+class ValueNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(Config.state_dim, Config.hidden_dim)
+        self.fc2 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
+        self.v = nn.Linear(Config.hidden_dim, 1)
+
+    def forward(self, state):
+        state = state / Config.obs_scale.to(Config.device)
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        return self.v(x)
+
+# ----------------------------
+# ✅ PPO Agent
+# ----------------------------
+class PPOAgent:
+    def __init__(self):
+        self.env = gym.make(Config.env_name)
+        self.policy = PolicyNet().to(Config.device)
+        self.value = ValueNet().to(Config.device)
+
+
+
+        # 创建线性调度函数：从 1 → 0
+        lr_lambda = lambda current_iter: 1.0 - current_iter / float(Config.max_iters)
+
+        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=Config.lr)
+        self.optimizer_value = optim.Adam(self.value.parameters(), lr=Config.lr)
+
+        self.scheduler_policy = torch.optim.lr_scheduler.LambdaLR(self.optimizer_policy, lr_lambda)
+        self.scheduler_value = torch.optim.lr_scheduler.LambdaLR(self.optimizer_value, lr_lambda)
+
+        self.writer = SummaryWriter(Config.log_dir)
+
+        self.actor_update_cnt = 0
+        self.critic_update_cnt = 0
+
+    def rollout(self):
+        buffer = []
+        while len(buffer) < Config.min_rollout_steps:
+            state, _ = self.env.reset()
+            for _ in range(Config.max_episode_length):
+                s = torch.FloatTensor(state).unsqueeze(0).to(Config.device)
+                with torch.no_grad():
+                    action, log_prob, entropy = self.policy.sample(s)
+                    value = self.value(s)
+                action_np = action.cpu().numpy().squeeze(0)
+                next_state, reward, term, truncated, _ = self.env.step(action_np)
+                done = term or truncated
+
+                buffer.append((state, action_np, log_prob.item(),
+                               reward, value.item(), done))  # ✅ 多存done
+                state = next_state
+                if done:
+                    break
+        return buffer, next_state
+
+    def compute_gae(self, rewards, values, dones, next_state):
+        advantages = []
+        gae = 0
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0 if dones[t] else self.value(
+                    torch.FloatTensor(next_state).unsqueeze(0).to(Config.device)).item()
+            else:
+                next_value = 0 if dones[t] else values[t + 1]
+
+            delta = rewards[t] + Config.gamma * next_value - values[t]
+            gae = delta + Config.gamma * Config.lam * (1 - dones[t]) * gae
+            advantages.insert(0, gae)
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(Config.device)
+        returns = advantages + torch.tensor(values, dtype=torch.float32).to(Config.device)
+        return advantages, returns
+
+    def update(self, buffer, next_state):
+        states, actions, old_log_probs, rewards, values, dones = zip(*buffer)
+        states = torch.FloatTensor(np.array(states)).to(Config.device)
+        actions = torch.FloatTensor(np.array(actions)).to(Config.device)
+        old_log_probs = torch.FloatTensor(old_log_probs).unsqueeze(-1).to(Config.device)
+        rewards = list(rewards)
+        dones = list(dones)
+        values = list(values)
+
+        advantages, returns = self.compute_gae(rewards, values, dones, next_state)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Critic
+        for _ in range(Config.train_iters):
+            perm = np.random.permutation(len(states))
+            for start in range(0, len(perm), Config.batch_size):
+                idx = perm[start:start + Config.batch_size]
+                self.critic_update_cnt += 1
+                v_pred = self.value(states[idx])
+                v_target = returns[idx].unsqueeze(-1)
+                value_loss = F.mse_loss(v_pred, v_target)
+                self.optimizer_value.zero_grad()
+                value_loss.backward()
+                self.optimizer_value.step()
+                if self.critic_update_cnt % 100 == 0:
+                    self.writer.add_scalar('train/critic_loss', value_loss.item(), self.critic_update_cnt)
+                    self.writer.add_scalar('train/critic_value', v_pred.mean().item(), self.critic_update_cnt)
+
+        # Actor
+        for _ in range(Config.train_iters):
+            perm = np.random.permutation(len(states))
+            for start in range(0, len(perm), Config.batch_size):
+                idx = perm[start:start + Config.batch_size]
+                self.actor_update_cnt += 1
+                new_logp = self.policy.get_log_prob(states[idx], actions[idx])
+                ratio = torch.exp(new_logp - old_log_probs[idx])
+                surr1 = ratio * advantages[idx].unsqueeze(-1)
+                surr2 = torch.clamp(ratio, 1-Config.clip_ratio, 1+Config.clip_ratio) * advantages[idx].unsqueeze(-1)
+                policy_loss = - torch.min(surr1, surr2).mean()
+                _, _, entropy = self.policy.sample(states[idx])
+                loss = policy_loss - Config.entropy_coef * entropy.mean()
+                self.optimizer_policy.zero_grad()
+                loss.backward()
+                self.optimizer_policy.step()
+                if self.actor_update_cnt % 100 == 0:
+                    self.writer.add_scalar('train/entropy', entropy.mean().item(), self.actor_update_cnt)
+                    self.writer.add_scalar('train/actor_loss', loss.item(), self.actor_update_cnt)
+
+    def evaluate(self, num_episodes=5):
+        env = gym.make(Config.env_name)
+        rewards = []
+        for _ in range(num_episodes):
+            state, _ = env.reset()
+            total = 0
+            episode_len = 0
+            for _ in range(Config.max_episode_length):
+                with torch.no_grad():
+                    s = torch.FloatTensor(state).unsqueeze(0).to(Config.device)
+                    action, _, _ = self.policy.sample(s)
+                state, reward, term, truncated, _ = env.step(action.cpu().numpy().squeeze(0))
+                done = term or truncated
+                total += reward
+                episode_len += 1
+                if done:
+                    break
+            print(f'eval episode reward:{total}, episode len:{episode_len}')
+            rewards.append(total)
+        return np.mean(rewards)
+
+    def train(self):
+        for epoch in tqdm(range(Config.max_iters), desc="Training"):
+            buffer, next_state = self.rollout()
+            self.update(buffer, next_state)
+
+            self.scheduler_policy.step()
+            self.scheduler_value.step()
+
+            current_lr = self.scheduler_policy.get_last_lr()[0]
+            self.writer.add_scalar("train/learning_rate", current_lr, epoch)
+            if (epoch+1) % 20 == 0:
+                avg_ret = self.evaluate()
+                self.writer.add_scalar("eval/score", avg_ret, epoch)
+                print(f"[Iter {epoch}] Avg Return: {avg_ret:.2f}")
+                if (epoch+1) % 100 == 0:
+                    filename = f'./checkpoints/ppo_bwhc_{epoch}_{avg_ret:.2f}.pth'
+                    torch.save(self.policy, filename)
+
+# ----------------------------
+# ✅ 主入口
+# ----------------------------
+if __name__ == "__main__":
+    agent = PPOAgent()
+    agent.train()
+```
 
 ##### SB3的PPO
 
