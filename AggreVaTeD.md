@@ -1196,7 +1196,22 @@ if __name__ == "__main__":
 
 ##### 手搓的PPO
 
-代码类似上面BipedalWalker任务的代码。运行下来不收敛：
+代码类似上面BipedalWalker任务的代码，稍作修改：
+
+1. lr会做线性衰减
+2. 每次rollout收集更多的时间步
+
+有学到一些东西，但最终没有收敛到较好的效果：
+
+```
+eval episode reward:-18.36461067199707, episode len:2000
+eval episode reward:1.397518515586853, episode len:2000
+eval episode reward:8.410011291503906, episode len:2000
+eval episode reward:6.883878707885742, episode len:2000
+eval episode reward:-1.9226666688919067, episode len:2000
+[Iter 799] Avg Return: -0.72
+```
+
 ![image-20250627131355705](img/image-20250627131355705.png)
 
 ```python
@@ -1219,7 +1234,7 @@ class Config:
     action_dim = 4
     hidden_dim = 256
 
-    min_rollout_steps = 5000
+    min_rollout_steps = 32768
     max_episode_length = 3000
     gamma = 0.99
     lam = 0.95  # GAE lambda
@@ -1227,7 +1242,7 @@ class Config:
 
     clip_ratio = 0.2
     entropy_coef = 0.001 #这个值很敏感，稍微大一点就不收敛了
-    lr = 3e-4
+    lr = 2.5e-4
     batch_size = 128
     max_iters = 800
 
@@ -1448,6 +1463,7 @@ class PPOAgent:
 if __name__ == "__main__":
     agent = PPOAgent()
     agent.train()
+
 ```
 
 ##### SB3的PPO
