@@ -1723,9 +1723,15 @@ class PPOAgent:
                 self.optimizer_policy.zero_grad()
                 loss.backward()
                 self.optimizer_policy.step()
+                
+                # check kl div
+                log_ratio = new_logp.detach() - rollout_data.old_log_prob.unsqueeze(-1)
+                approx_kl_div = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                
                 if self.actor_update_cnt % 100 == 0:
                     self.writer.add_scalar('train/entropy', entropy.mean().item(), self.actor_update_cnt)
                     self.writer.add_scalar('train/actor_loss', loss.item(), self.actor_update_cnt)
+                    self.writer.add_scalar('train/kl_div', approx_kl_div.item(), self.actor_update_cnt)
 
     def evaluate(self, num_episodes=5):
         env = gym.make(Config.env_name)
