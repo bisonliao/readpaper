@@ -1516,7 +1516,7 @@ env.save('VecNormalize')
 
 ##### 手搓的并发多环境的PPO
 
-不收敛
+算法实现应该没有太大问题，BipedalWalker-v3任务可以收敛。但Hardcore版本不收敛
 
 ![image-20250629111118577](img/image-20250629111118577.png)
 
