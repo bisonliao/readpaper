@@ -1,6 +1,6 @@
 **Data-Efficient Hierarchical Reinforcement Learning**
 
-### Introduction
+### 1、Introduction
 
 DRL在机械手臂控制等场景表现突出，但它只能完成一些原子的、简单的任务，例如移动一个零件，极少涉及到复杂的任务，例如在一个maze游戏里，蚂蚁需要跑到到绿色的终点位置，它除了需要规划线路，还需要找到钥匙打开门，或者推动方块填充沟壑铺路。
 
@@ -61,7 +61,33 @@ DRL在机械手臂控制等场景表现突出，但它只能完成一些原子�
 
 ![image-20250630120011993](img/image-20250630120011993.png)
 
-### Bison的实验
+### 4、Related Work
 
-直接硬编码Q2的规划线路，用hDQN算法搞定FrozenLake任务，着重训练Q1
+提到了一些HRL框架：
+
+1. options framework
+2. option-critic framework
+3. auxiliary rewards for the low-level policies
+4.  FeUdal Networks（FuN）
+
+并简单的比对了HIRO的优势
+
+### 5、Experiments
+
+![image-20250630133450613](img/image-20250630133450613.png)
+
+### 6、Conclusion
+
+We have presented a method:
+
+1. training a two-layer hierarchical policy. 
+2. be general, using learned goals to pass instructions from the higher-level policy to the lower-level one. 
+3. be trained in an off-policy manner concurrently for highly sample-efficient learning. 
+4. our method outperforms prior HRL algorithms and can solve exceedingly complex tasks 
+
+Our results are still far from perfect, and there is much work left for future research to improve the stability and performance of HRL methods on these tasks.
+
+### 7、Bison的实验
+
+
 
