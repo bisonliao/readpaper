@@ -1518,6 +1518,8 @@ env.save('VecNormalize')
 
 算法实现应该没有太大问题，BipedalWalker-v3任务可以收敛。但Hardcore版本不收敛
 
+演示效果看是在某个方块障碍物那里就以各种方式卡住了
+
 ![image-20250629111118577](img/image-20250629111118577.png)
 
 ```python

@@ -103,7 +103,7 @@
 | 算法          | 论文名称                                             | ArXiv 链接                       |
 | ------------- | ---------------------------------------------------- | -------------------------------- |
 | h-DQN         | Hierarchical Deep Reinforcement Learning             | https://arxiv.org/abs/1604.06057 |
-| HIRO          | Data-Efficient Hierarchical Reinforcement Learning   | https://arxiv.org/abs/1810.00257 |
+| HIRO          | Data-Efficient Hierarchical Reinforcement Learning   | https://arxiv.org/abs/1805.08296 |
 | Option-Critic | The Option-Critic Architecture                       | https://arxiv.org/abs/1609.05140 |
 | FuN           | FeUdal Networks for Hierarchical Reinforcement Learn | https://arxiv.org/abs/1703.01161 |
 | HAC           | Learning Multi-Level Hierarchies with Hindsight      | https://arxiv.org/abs/1712.00948 |
