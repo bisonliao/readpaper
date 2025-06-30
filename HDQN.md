@@ -1372,9 +1372,7 @@ main()
 
 ###### 第三步：引入Q2网络的规划能力
 
-前面几千episodes，保持epsilon 2等于1.0，且不更新Q2，只训练Q1.
-
-不知道为什么，预训练阶段，到24和28这两个目标都在后面的成功率反而下降了。所以后来我把预训练的episodes改为3000。
+前面几千episodes，保持epsilon 2等于1.0，固定规划的路径为0-4-7-31-63，对Q1做预训练，让它具备一定的能力.
 
 ![image-20250615092233312](img/image-20250615092233312.png)
 
@@ -1382,18 +1380,13 @@ main()
 
 1. Q1的子目标完成能力ok，单段路径绝大多数都能达到70%+的成功率，很多高达90%+
 2. Q2有明显合理的的规划能力和导航能力，找到了0-4-7-31-63的这样一个路径。多运行几次，路径不是每次都一样，例如有时候是找到 0 - 7 - 63 这样的线路。
-3. 端到端效果不算好，大回合的成功率最高到25%，且不稳定。
+3. 端到端效果也不错，大回合的成功率最高到98%，但不太稳定。
 
 详细分析如下：
 
 ![image-20250615115740003](img/image-20250615115740003.png)
 
-遗留问题：
 
-1. 路径31去往63的成功率还是比较低，可能需要增设一个中间子目标来提升?  但它为什么会下降呢？这段路径的训练样本数也不少， 关键是还影响了端到端的成功率。Q1的能力还需要进一步提升。
-2. 关闭了滑行概率才得到上面的结果，还需要研究滑行概率33%的时候如何应对
-
-增加了Q1网络架构的深度也没有太明显改善，关键是不稳定：
 
 ![image-20250615195417764](img/image-20250615195417764.png)
 
@@ -1412,7 +1405,7 @@ from collections import deque, namedtuple
 from torch.optim import Adam
 from torch.utils.tensorboard import  SummaryWriter
 
-device="cpu"
+device="cuda:0" if torch.cuda.is_available() else 'cpu'
 writer = SummaryWriter(log_dir=f'./logs/hDQN_FrozenLake_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
 
 class CustomFrozenLake(gym.Env):
@@ -1689,14 +1682,14 @@ class Args:
     gamma = 0.999
     eps1_start = 1.0
     eps1_decay = 0.99
-    eps1_end = 0.1
+    eps1_end = 0.01
 
     eps2_start = 1.0
     eps2_decay = 0.99
-    eps2_end = 0.1
+    eps2_end = 0.01
 
-    num_episodes = 10000
-    pretrain_q1_episodes = 3000
+    num_episodes = 4000
+    pretrain_q1_episodes = 1000
 
     buf_size = 1e6
     #由于q1要面向各种目标：从a出发到子目标b，其泛化能力要求很高，所以
@@ -1847,13 +1840,26 @@ class hDQNAgent:
         self.target_q2.load_state_dict(self.q2.state_dict())
         writer.add_scalar('episode/update_target', 1, self.episode)
 
-    def get_sub_goal(self, stateTensor:torch.Tensor, manual_set=None):
+    def get_sub_goal(self, stateTensor:torch.Tensor):
+        if self.episode < Args.pretrain_q1_episodes:
+            current_agent_pos = self.env.agent_pos
+            if current_agent_pos == 0:
+                subgoalInt = 4
+            elif current_agent_pos == 4:
+                subgoalInt = 7
+            elif current_agent_pos == 7:
+                subgoalInt = 31
+            elif current_agent_pos == 31:
+                subgoalInt = 63
+            else:
+                writer.add_scalar('hardcode/halfway', 1, self.total_step)
+                subgoalInt = 63
+            row, col = self.env.pos2xy(subgoalInt)
+            subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device)  # shape: (1,2)
+            return subgoalInt, subgoalTensor
 
-        if manual_set is None:
-            current_agent_pos = self.env.pos2xy(self.env.agent_pos)
-            subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2, current_agent_pos)  # type:torch.Tensor  (1,)
-        else:
-            subgoal = torch.tensor([manual_set], dtype=torch.int32).to(device)
+        current_agent_pos = self.env.pos2xy(self.env.agent_pos)
+        subgoal = self.q2.epsGreedy(stateTensor, self.epsilon2, current_agent_pos)  # type:torch.Tensor  (1,)
         subgoalInt = subgoal.cpu().item()
         row, col = self.env.pos2xy(subgoalInt)
         subgoalTensor = torch.tensor([[row, col]], dtype=torch.int32, device=device)  # shape: (1,2)
@@ -2607,6 +2613,8 @@ main()
 成功收敛，大回合成功率99%
 
 ![image-20250630175404866](img/image-20250630175404866.png)
+
+真的就是尽信书则不如无书，我觉得这样才是正确的使用方式。完全同步训练，可能大多数情况下都是不行的。
 
 代码如下：
 
