@@ -381,11 +381,11 @@ class ReplayBuffer:
 
 # 策略网络 (Actor)
 class GaussianPolicy(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, max_action=2.0):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, max_action=1.0):
         super(GaussianPolicy, self).__init__()
         self.max_action = max_action
-
-        # 共享的特征提取层
+        self.norm = nn.LayerNorm(state_dim)
+        # 特征提取层
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 
@@ -396,6 +396,7 @@ class GaussianPolicy(nn.Module):
     def forward(self, state):
         """前向传播，返回动作的均值和log标准差"""
         # state: (batch_size, state_dim) -> (batch_size, hidden_dim)
+        state = self.norm(state)
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
 
@@ -410,27 +411,26 @@ class GaussianPolicy(nn.Module):
 
     def sample(self, state):
         """从策略中采样动作，并计算对数概率"""
-        # 获取均值和log标准差
-        # mean: (batch_size, action_dim)
-        # log_std: (batch_size, action_dim)
         mean, log_std = self.forward(state)
         std = log_std.exp()
 
-        # 重参数化技巧采样动作
-        # normal_noise: (batch_size, action_dim)
+        # 采样动作
         normal_noise = torch.randn_like(mean)
-        # action: (batch_size, action_dim)
-        raw_action = mean + normal_noise * std
+        raw_action = mean + normal_noise * std  # 未被 clamp 的原始 action
 
-        # 计算tanh变换前的对数概率
+        # 计算原始对数概率
         log_prob = -0.5 * (normal_noise.pow(2) + 2 * log_std + np.log(2 * np.pi))
         log_prob = log_prob.sum(dim=-1, keepdim=True)
 
-        # 应用tanh变换
-        action = torch.tanh(raw_action) * self.max_action
+        # 🔧 ⚠️ 修正 tanh 的 log_prob BEFORE clamp
+        correction = 2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))
+        log_prob -= correction.sum(dim=-1, keepdim=True)
 
-        # 添加tanh的Jacobian修正
-        log_prob -= (2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))).sum(dim=-1, keepdim=True)
+        # 最后才执行 clamp（用于稳定 backward，不影响 log_prob 计算）
+        raw_action = torch.clamp(raw_action, -20, 20)
+
+        # 输出最终 action
+        action = torch.tanh(raw_action) * self.max_action
 
         return action, log_prob
 
@@ -439,7 +439,7 @@ class GaussianPolicy(nn.Module):
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(QNetwork, self).__init__()
-
+        self.norm = nn.LayerNorm(state_dim+action_dim)
         # Q1网络
         self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -455,6 +455,7 @@ class QNetwork(nn.Module):
         # state: (batch_size, state_dim)
         # action: (batch_size, action_dim)
         sa = torch.cat([state, action], dim=-1)
+        sa = self.norm(sa)
 
         # Q1网络
         q1 = F.relu(self.fc1(sa))
@@ -473,14 +474,14 @@ class QNetwork(nn.Module):
 class HIRO_LOW_SAC:
     def __init__(self, state_dim, action_dim, max_action, writer):
         # 超参数
-        self.gamma = 0.99
+        self.gamma = 0.97
         self.tau = 0.005
-        self.alpha = 0.2
+        self.alpha = 0.001
         self.lr = 3e-4
-        self.batch_size = 128
+        self.batch_size = 256
         self.buffer_size = 100000
         self.target_entropy = -action_dim
-        self.automatic_entropy_tuning = True
+        self.automatic_entropy_tuning = False
         self.step_cnt = 0
         self.writer = writer
 
@@ -519,7 +520,7 @@ class HIRO_LOW_SAC:
 
     def update_parameters(self):
         """更新网络参数"""
-        if len(self.replay_buffer) < self.batch_size:
+        if len(self.replay_buffer) < self.batch_size*10:
             return None,None,None
         self.step_cnt += 1
 
@@ -533,6 +534,7 @@ class HIRO_LOW_SAC:
             # 计算目标Q值
             q1_next, q2_next = self.critic_target(next_state, next_action)
             min_q_next = torch.min(q1_next, q2_next) - self.alpha * next_log_prob
+            min_q_next = min_q_next.view(-1,1)
             target_q = reward + (1 - done) * self.gamma * min_q_next
 
         # 更新Critic网络
@@ -547,11 +549,12 @@ class HIRO_LOW_SAC:
         new_action, log_prob = self.actor.sample(state)
         q1, q2 = self.critic(state, new_action)
         min_q = torch.min(q1, q2)
-        # 最大化熵和最大化min_q，因为是梯度下降，要实现梯度上升，所以min_q前面有符号， 熵是 -log_prob，负负得正
+        # 最大化熵和最大化min_q，因为是梯度下降，要实现梯度上升，所以min_q前面有负号， 熵是 -log_prob，负负得正
         actor_loss = (self.alpha * log_prob - min_q).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
         self.actor_optimizer.step()
 
         # 自动调节alpha
@@ -561,19 +564,21 @@ class HIRO_LOW_SAC:
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
-
-            self.alpha = self.log_alpha.exp()
+            self.alpha = self.log_alpha.exp().item()
 
         # 软更新目标网络
-        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        with torch.no_grad():
+            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
 
         self.writer.add_scalar('lo/critic_loss', critic_loss.item(), self.step_cnt)
         self.writer.add_scalar('lo/actor_loss',  actor_loss.item(), self.step_cnt)
-        self.writer.add_scalar('lo/alpha', self.alpha.item(), self.step_cnt)
+        self.writer.add_scalar('lo/alpha', self.alpha, self.step_cnt)
 
-        return critic_loss.item(), actor_loss.item(), self.alpha.item()
+        return critic_loss.item(), actor_loss.item(), self.alpha
+
+
 ```
 
 ##### 定义高层SAC
@@ -1158,3 +1163,923 @@ if __name__ == '__main__':
 ```
 
 ![image-20250701153633664](img/image-20250701153633664.png)
+
+##### 稳打稳扎
+
+上面的一气呵成的代码并不能收敛，那就一步一步来，慢慢上复杂度
+
+###### step1：确保SB3的SAC 可以搞定固定的短距离小目标
+
+两个发现：
+
+1. 我在这里踩了个坑：随便写了个小目标：在reset初始位置的基础上，再位移[0.1, 0.1, 0.1]，实际上是不可达的，因为reset后机械手臂伸直水平状，xyz三个方向都为正就表示目标位置在可达范围（半球）外面了。我在这里浪费了一整天。
+2. 输入到深度网络里的状态，后面三个维度是目标位置的绝对位置，还是相对初始位置的位移，验证了都能收敛。但我觉得位置好一些，因为相对位置是相对初始位置的位移，网络还要记住初始位置...
+
+env给出的几个可行的小目标 g，有的长度偏大的也不容易收敛，要挑绝对值小的做为小目标
+
+```
+# reset后立即执行 g = obs['desired_goal'] - obs['achieved_goal']，
+# 可以得到有下面这些值：
+g=[-0.05197624  0.41593705 -0.38898413]
+g=[-0.08951826  0.62014015 -0.35802831]
+g=[-0.16458111  0.42454838 -0.15700847]
+g=[-0.21737     0.40604419 -0.16089385]
+g=[ 0.03985209  0.4883993  -0.10840308]
+g=[-0.00156387  0.57738327 -0.24667852]
+g=[-0.08161544  0.4379823  -0.29055602]
+g=[-0.05553611  0.60416518 -0.16857048]
+g=[-0.14497306  0.63118409 -0.30566294]
+g=[ 0.01801001  0.4210462  -0.22033174]
+g=[ 0.04373577  0.39730558 -0.15274272]
+g=[-0.20449369  0.4847844  -0.22082668]
+g=[-0.16781741  0.61902692 -0.34448007]
+g=[ 0.01637453  0.59159179 -0.15796917]
+g=[ 0.00623025  0.44328504 -0.1904544 ]
+g=[-0.03524174  0.57974617 -0.29795416]
+```
+
+小目标位移[-0.08951826,  0.12014015, +0.15802831]，收敛得很好
+
+![image-20250702160419049](img/image-20250702160419049.png)
+
+```python
+import random
+import time
+
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor
+from stable_baselines3.common.monitor import Monitor
+import numpy as np
+import gymnasium_robotics
+import math
+
+
+
+# 环境的再封装
+# 环境返回的state里要包含desired_goal
+# 环境的observation_space需要相应的改动
+# 手动构造reward，根据举例desired_goal的距离变化，返回reward
+class CustomFetchReachEnv(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        super().__init__()
+
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10+3,))  # 简化后的状态, 10个observe，3个desired_goal，一起拼接为state返回
+
+
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+        self.desired_goal = None
+        self.g = None
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+        obs, info = self._env.reset(seed=seed, options=options)
+
+        #尝试固定目标位置进行训练，结果显示可以到达100%成功率
+
+
+        self.g = np.array( [-0.08951826,  0.12014015, +0.15802831] )
+        self.desired_goal = obs['achieved_goal'] + self.g
+
+
+        state = np.concatenate( [obs['observation'], self.desired_goal ] ) #这里把self.g编码进去也是可以的
+
+        info['desired_goal'] = self.desired_goal
+
+
+
+        return state, info
+
+    def step(self, action):
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        state = np.concatenate( [obs['observation'], self.desired_goal ] )#这里把self.g编码进去也是可以的
+        info['desired_goal'] = self.desired_goal
+
+        # 获取 gripper 位置和目标位置（FetchReach 的 obs 包含这些信息）
+        gripper_pos = obs["observation"][:3]  # 前 3 维是 gripper 的 (x, y, z)
+        target_pos = self.desired_goal # 目标位置
+
+        # 计算 gripper 到目标的欧氏距离
+        distance = np.linalg.norm(gripper_pos - target_pos)
+
+        success = np.linalg.norm(obs['achieved_goal'] - self.desired_goal) < 0.05
+        if success:
+            external_reward = 1
+            terminated = True
+        else:
+            external_reward = -distance
+
+        # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
+        info["is_success"] = success
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+
+# 1. 多进程环境创建
+def make_env(seed):
+    def _init():
+        env = CustomFetchReachEnv()
+        env = Monitor(env)  # 单环境监控
+        env.reset(seed=seed)
+        return env
+    return _init
+
+if __name__ == '__main__':
+    n_envs = 16
+    env = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+    env = VecMonitor(env)  # ➕ 记录每回合 reward/length
+    env = VecNormalize(env, norm_obs=False, norm_reward=False)  # 和 Hugging Face 模型一致
+
+
+    def linear_schedule(initial_value):
+        def func(progress_remaining):
+            return initial_value * progress_remaining  # 1 → 0
+        return func
+
+
+    policy_kwargs = dict(
+        net_arch=dict(
+            pi=[256, 256, 256],  # actor 网络结构
+            qf=[256, 256, 256]  # critic (Q-network) 结构
+        )
+    )
+
+
+    # 2. SAC 训练超参数（参考 RL Zoo）
+    model = SAC(
+        "MlpPolicy",
+        env,
+        batch_size=256,
+        buffer_size=1_000_000,
+        learning_starts=10_000,
+        learning_rate=3e-4,
+        tau=0.005,
+        gamma=0.97,
+        train_freq=1,
+        gradient_steps=1,
+        ent_coef=0.01,
+        verbose=0,
+        tensorboard_log='logs/',
+        policy_kwargs=policy_kwargs,
+    )
+
+    #训练
+    total_timesteps = int(1e6)
+    model.learn(
+        total_timesteps=total_timesteps,
+    )
+```
+
+###### step2：确保SB3的SAC可以搞定多个短距离小目标
+
+这次 g 不是固定的，是变化的一批，能够收敛。
+
+![image-20250702171352797](img/image-20250702171352797.png)
+
+```python
+import random
+import time
+
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor
+from stable_baselines3.common.monitor import Monitor
+import numpy as np
+import gymnasium_robotics
+import math
+
+
+
+
+# 环境的再封装
+# 环境返回的state里要包含desired_goal
+# 环境的observation_space需要相应的改动
+# 手动构造reward，根据举例desired_goal的距离变化，返回reward
+class CustomFetchReachEnv(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        super().__init__()
+
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10+3,))  # 简化后的状态, 10个observe，3个desired_goal，一起拼接为state返回
+
+
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+        self.desired_goal = None
+        self.g = None
+        self.g_list = []
+        self.generate_g()
+
+    # 产生随机的可达的10个位移很小的低层目标，用来训练
+    def generate_g(self):
+        self.g_list = []
+        while len(self.g_list) < 10:
+            obs, _ = self._env.reset()
+            g = (obs["desired_goal"] - obs["achieved_goal"])
+            while np.linalg.norm(g) > 0.15:
+                g = g * random.uniform(0.7, 0.9)
+            self.g_list.append(g)
+        print(f"get {len(self.g_list)} little goals ")
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+        obs, info = self._env.reset(seed=seed, options=options)
+
+
+        self.g = self.g_list[ random.randint(0, len(self.g_list)-1) ]
+        self.desired_goal = obs['achieved_goal'] + self.g
+
+
+        state = np.concatenate( [obs['observation'], self.desired_goal ] ) #这里把self.g编码进去也是可以的
+
+        info['desired_goal'] = self.desired_goal
+
+
+
+        return state, info
+
+    def step(self, action):
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        state = np.concatenate( [obs['observation'], self.desired_goal ] )#这里把self.g编码进去也是可以的
+        info['desired_goal'] = self.desired_goal
+
+        # 获取 gripper 位置和目标位置（FetchReach 的 obs 包含这些信息）
+        gripper_pos = obs["observation"][:3]  # 前 3 维是 gripper 的 (x, y, z)
+
+        # 计算 gripper 到目标的欧氏距离
+        distance = np.linalg.norm(gripper_pos - self.desired_goal)
+
+        success = distance < 0.05
+        if success:
+            external_reward = 1
+            terminated = True
+        else:
+            external_reward = -distance
+
+        # 确保 info 包含 is_success（SB3 的 success_rate 依赖此字段）
+        info["is_success"] = success
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+
+# 1. 多进程环境创建
+def make_env(seed):
+    def _init():
+        env = CustomFetchReachEnv()
+        env = Monitor(env)  # 单环境监控
+        env.reset(seed=seed)
+        return env
+    return _init
+
+if __name__ == '__main__':
+    n_envs = 16
+    env = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+    env = VecMonitor(env)  # ➕ 记录每回合 reward/length
+    env = VecNormalize(env, norm_obs=False, norm_reward=False)  # 和 Hugging Face 模型一致
+
+
+    def linear_schedule(initial_value):
+        def func(progress_remaining):
+            return initial_value * progress_remaining  # 1 → 0
+        return func
+
+
+    policy_kwargs = dict(
+        net_arch=dict(
+            pi=[256, 256, 256],  # actor 网络结构
+            qf=[256, 256, 256]  # critic (Q-network) 结构
+        )
+    )
+
+
+    # 2. SAC 训练超参数（参考 RL Zoo）
+    model = SAC(
+        "MlpPolicy",
+        env,
+        batch_size=256,
+        buffer_size=1_000_000,
+        learning_starts=10_000,
+        learning_rate=3e-4,
+        tau=0.005,
+        gamma=0.97,
+        train_freq=1,
+        gradient_steps=1,
+        ent_coef=0.01,
+        verbose=0,
+        tensorboard_log='logs/',
+        policy_kwargs=policy_kwargs,
+    )
+
+    #训练
+    total_timesteps = int(1e6)
+    model.learn(
+        total_timesteps=total_timesteps,
+    )
+```
+
+###### step3：确保SB3的SAC可以用低层小回合搞定固定的小目标
+
+![image-20250702161211316](img/image-20250702161211316.png)
+
+```python
+import random
+import time
+
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor
+from stable_baselines3.common.monitor import Monitor
+import numpy as np
+import gymnasium_robotics
+import math
+
+
+
+class CustomFetchReachEnv_v2(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        super().__init__()
+
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        #目前定义的 observation_space 为 shape=(13,)，实际由 10 维原始 observation + 3 维 desired_goal 拼接而成
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10+3,))
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+        self.desired_goal = None
+
+        # 记录一个小回合的相关信息，包括目标，开始的状态，步数
+        self.g = None
+        self.lo_episode_start_s = None
+        self.lo_episode_step_cnt = 0
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+
+        # 固定小目标为这么多，也就是希望手臂末端在x,y,z方向位移0.1m
+        self.g = np.array([-0.08951826,  0.12014015, +0.15802831])
+        obs, info = self._env.reset(seed=seed, options=options)
+
+        init_pos = obs['achieved_goal']
+        self.desired_goal = init_pos + self.g
+
+
+        state = np.concatenate( [obs['observation'],self.desired_goal ] )
+        self.lo_episode_start_s = state #记录小回合的开始状态
+        self.lo_episode_step_cnt = 0 # 小回合步数清0
+        info['desired_goal'] = self.desired_goal
+
+        return state, info
+
+    def step(self, action):
+
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        self.lo_episode_step_cnt += 1
+        state = np.concatenate( [obs['observation'],self.desired_goal ] )
+        info['desired_goal'] = self.desired_goal
+
+        # 计算当前状态与小回合开始状态的差值
+
+        dist = np.linalg.norm(self.desired_goal - obs['achieved_goal'])
+
+        if dist < 0.05: #很接近小目标了，认为成功完成目标
+            terminated = True
+            success = True
+            external_reward = 1
+        else:
+            success = False
+            external_reward = -dist
+
+
+        # 小回合允许的最大步数到了（20步）
+        if self.lo_episode_step_cnt >=20 and not terminated:
+            truncated = True
+
+        info["is_success"] = success
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+# 1. 多进程环境创建
+def make_env(seed):
+    def _init():
+        env = CustomFetchReachEnv_v2()
+        env = Monitor(env)  # 单环境监控
+        env.reset(seed=seed)
+        return env
+    return _init
+
+if __name__ == '__main__':
+    n_envs = 16
+    env = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+    env = VecMonitor(env)  # ➕ 记录每回合 reward/length
+    env = VecNormalize(env, norm_obs=False, norm_reward=False)  # 和 Hugging Face 模型一致
+
+
+    def linear_schedule(initial_value):
+        def func(progress_remaining):
+            return initial_value * progress_remaining  # 1 → 0
+        return func
+
+
+    policy_kwargs = dict(
+        net_arch=dict(
+            pi=[256, 256, 256],  # actor 网络结构
+            qf=[256, 256, 256]  # critic (Q-network) 结构
+        )
+    )
+
+
+    # 2. SAC 训练超参数（参考 RL Zoo）
+    model = SAC(
+        "MlpPolicy",
+        env,
+        batch_size=256,
+        buffer_size=1_000_000,
+        learning_starts=10_000,
+        learning_rate=3e-4,
+        tau=0.005,
+        gamma=0.97,
+        train_freq=1,
+        gradient_steps=1,
+        ent_coef=0.01,
+        verbose=0,
+        tensorboard_log='logs/',
+        policy_kwargs=policy_kwargs,
+    )
+
+    #训练
+    total_timesteps = int(1e6)
+    model.learn(
+        total_timesteps=total_timesteps,
+    )
+```
+
+###### step4:确保SB3的SAC可以用低层小回合搞定多个小目标
+
+可以收敛：
+
+![image-20250702174953042](img/image-20250702174953042.png)
+
+```python
+import random
+import time
+
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor
+from stable_baselines3.common.monitor import Monitor
+import numpy as np
+import gymnasium_robotics
+import math
+
+
+
+class CustomFetchReachEnv_v2(gym.Env):
+    """
+    自定义封装 FetchReach-v3 环境，符合 Gymnasium 接口规范。
+    兼容 SB3 训练，支持 TensorBoard 记录 success_rate。
+    """
+
+    def __init__(self, render_mode=None):
+        """
+        初始化环境。
+        Args:
+            render_mode (str, optional): 渲染模式，支持 "human" 或 "rgb_array"。
+        """
+        super().__init__()
+
+
+        # 创建原始 FetchReach-v3 环境
+        self._env = gym.make("FetchReach-v3", render_mode=render_mode, max_episode_steps=100)
+
+        # 继承原始的动作和观测空间
+        self.action_space = self._env.action_space
+        #目前定义的 observation_space 为 shape=(13,)，实际由 10 维原始 observation + 3 维 desired_goal 拼接而成
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(10+3,))
+
+        self.total_step = 0
+
+        # 初始化渲染模式
+        self.render_mode = render_mode
+        self.desired_goal = None
+
+        # 记录一个小回合的相关信息，包括目标，开始的状态，步数
+        self.g = None
+        self.lo_episode_start_s = None
+        self.lo_episode_step_cnt = 0
+        self.g_list = []
+        self.generate_g()
+
+        # 产生随机的可达的10个位移很小的低层目标，用来训练
+
+    def generate_g(self):
+        self.g_list = []
+        while len(self.g_list) < 10:
+            obs, _ = self._env.reset()
+            g = (obs["desired_goal"] - obs["achieved_goal"])
+            while np.linalg.norm(g) > 0.15:
+                g = g * random.uniform(0.7, 0.9)
+            self.g_list.append(g)
+        print(f"get {len(self.g_list)} little goals ")
+
+
+    def reset(self, seed=None, options=None):
+        """
+        重置环境，返回初始观测和 info。
+        """
+
+        # 固定小目标为这么多，也就是希望手臂末端在x,y,z方向位移0.1m
+        self.g = self.g_list[ random.randint(0, len(self.g_list)-1) ]
+        obs, info = self._env.reset(seed=seed, options=options)
+
+        init_pos = obs['achieved_goal']
+        self.desired_goal = init_pos + self.g
+
+
+        state = np.concatenate( [obs['observation'],self.desired_goal ] )
+        self.lo_episode_start_s = state #记录小回合的开始状态
+        self.lo_episode_step_cnt = 0 # 小回合步数清0
+        info['desired_goal'] = self.desired_goal
+
+        return state, info
+
+    def step(self, action):
+
+        """
+        执行动作，返回 (obs, reward, done, truncated, info)。
+        注意：Gymnasium 的 step() 返回 5 个值（包括 truncated）。
+        """
+        obs, external_reward, terminated, truncated, info = self._env.step(action)
+        self.total_step += 1
+        self.lo_episode_step_cnt += 1
+        state = np.concatenate( [obs['observation'],self.desired_goal ] )
+        info['desired_goal'] = self.desired_goal
+
+        # 计算当前状态与小回合开始状态的差值
+
+        dist = np.linalg.norm(self.desired_goal - obs['achieved_goal'])
+
+        if dist < 0.05: #很接近小目标了，认为成功完成目标
+            terminated = True
+            success = True
+            external_reward = 1
+        else:
+            success = False
+            external_reward = -dist
+
+
+        # 小回合允许的最大步数到了（20步）
+        if self.lo_episode_step_cnt >=20 and not terminated:
+            truncated = True
+
+        info["is_success"] = success
+
+        return state, external_reward, terminated, truncated, info
+
+    def render(self):
+        """
+        渲染环境（可选）。
+        """
+        return self._env.render()
+
+    def close(self):
+        """
+        关闭环境，释放资源。
+        """
+        self._env.close()
+
+    @property
+    def unwrapped(self):
+        """
+        返回原始环境（用于访问原始方法）。
+        """
+        return self._env
+
+
+# 1. 多进程环境创建
+def make_env(seed):
+    def _init():
+        env = CustomFetchReachEnv_v2()
+        env = Monitor(env)  # 单环境监控
+        env.reset(seed=seed)
+        return env
+    return _init
+
+if __name__ == '__main__':
+    n_envs = 16
+    env = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+    env = VecMonitor(env)  # ➕ 记录每回合 reward/length
+    env = VecNormalize(env, norm_obs=False, norm_reward=False)  # 和 Hugging Face 模型一致
+
+
+    def linear_schedule(initial_value):
+        def func(progress_remaining):
+            return initial_value * progress_remaining  # 1 → 0
+        return func
+
+
+    policy_kwargs = dict(
+        net_arch=dict(
+            pi=[256, 256, 256],  # actor 网络结构
+            qf=[256, 256, 256]  # critic (Q-network) 结构
+        )
+    )
+
+
+    # 2. SAC 训练超参数（参考 RL Zoo）
+    model = SAC(
+        "MlpPolicy",
+        env,
+        batch_size=256,
+        buffer_size=1_000_000,
+        learning_starts=10_000,
+        learning_rate=3e-4,
+        tau=0.005,
+        gamma=0.97,
+        train_freq=1,
+        gradient_steps=1,
+        ent_coef=0.01,
+        verbose=0,
+        tensorboard_log='logs/',
+        policy_kwargs=policy_kwargs,
+    )
+
+    #训练
+    total_timesteps = int(1e6)
+    model.learn( total_timesteps=total_timesteps)
+```
+
+###### step5：确保我的SAC代码可以搞定固定的低层目标
+
+只有40%的成功率
+
+![image-20250702195627796](img/image-20250702195627796.png)
+
+```python
+import datetime
+from collections import deque
+
+import numpy
+import numpy as np
+
+import my_hi_sac
+import my_low_sac
+import my_fetchreach_env
+import os
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+class Config:
+    max_episodes = 1000
+    pretrain_lo_episodes = 1000
+    max_episode_steps = 100
+    new_g_interval = 20
+
+def modify_desired_in_state(state:numpy.ndarray, desired:numpy.ndarray):
+    assert state.shape[0] ==13  and desired.shape[0] == 3, ""
+    new_state = numpy.concat( [ state[0:10], desired] , axis=-1)
+    return new_state
+
+
+
+def intrinsic_reward(desired:numpy.ndarray, next_state: numpy.ndarray):
+
+    diff = desired - next_state[:3]
+    assert diff.shape==(3,), ""
+    dist = np.linalg.norm(diff)
+    if dist <= 0.05:
+        return 1, True, dist
+    else:
+        return -dist, False, dist
+
+
+def generate_g():
+    return np.array([-0.08951826,  0.12014015, +0.15802831]) # todo:临时限制
+
+def pretrain_low_policy(env, lo:my_low_sac.HIRO_LOW_SAC):
+    lo_episode_cnt = 0 #低层回合个数，方便tb上报做横坐标
+    lo_result=deque(maxlen=100)
+    for episode in range(1, Config.pretrain_lo_episodes):
+        state, _ = env.reset()
+
+        episode_reward = 0 #高层回合的奖励累计
+        lo_episode_rewards = [] #低层一个回合每个时间步的内部奖励
+        lo_rw = 0 #低层内部奖励
+        lo_done = False # 标识低层回合是否结束
+        step_cnt = 0 # 用来决定lo episode的起止
+        g = None # 高层给到低层的子目标
+        for i in range(Config.max_episode_steps):  # 一个大回合最多与环境交互xx次
+
+            if step_cnt % Config.new_g_interval == 0:
+                # 固定长度的lo episode开始了
+                lo_episode_cnt += 1
+                g = generate_g()
+                lo_desired = g + state[:3]
+
+                lo_done = False
+                lo_episode_rewards = []
+
+            assert g is not None, ""
+            state = modify_desired_in_state(state, lo_desired) # 修改
+            # 选择动作
+            action = lo.select_action(state)
+
+            # 执行动作
+            next_state, env_reward, term, trunc, _ = env.step(action)
+            done = term or trunc
+            step_cnt += 1
+            episode_reward += env_reward
+            # 可能出现低层已经完成了目标，但低层的回合长度还没有到换新目标的时候。
+            # 这种情况下，继续与环境交互，但是不再计算内部奖励、不记录低层的时间步信息
+            # 如果当前lo episode还没有结束，那么就要计算内部奖励、确定是否结束、存储时间步
+            if not lo_done:
+                lo_rw, lo_done, dist = intrinsic_reward(lo_desired, next_state)
+                lo_done = lo_done or done or (step_cnt % Config.new_g_interval == 0)  # 低层回合截断了,lo_done也必须设置为True
+                # 存储transition
+                lo.replay_buffer.push(state, action, lo_rw, next_state, lo_done)
+                # 更新网络参数
+                lo.update_parameters()
+                lo_episode_rewards.append( lo_rw)
+                if lo_done:
+                    # 固定长度的lo episode结束了， 主要是上报是否成功、内部奖励的均值
+                    if lo_rw == 1:
+                        lo_result.append(1)
+                    else:
+                        lo_result.append(0)
+                    lo.writer.add_scalar('lo/avg_intrinsic_reward', np.mean(lo_episode_rewards), lo_episode_cnt)
+                    lo.writer.add_scalar('lo/dist', dist, lo_episode_cnt)
+            # 更新状态
+            state = next_state
+            if done:
+                break
+
+        # 记录到TensorBoard
+        lo.writer.add_scalar('lo/episode_reward', episode_reward, episode)
+        lo.writer.add_scalar('lo/suc_ratio', np.mean(lo_result), episode)
+
+# 主函数
+def main():
+    # 创建环境
+    env = my_fetchreach_env.CustomFetchReachEnv()
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    print(f"state_dim:{state_dim}, action_dim:{action_dim}, max_action:{max_action}")
+
+    writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+    # 创建SAC代理
+    hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 1, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
+    lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
+
+    # 创建检查点目录
+    os.makedirs("checkpoints", exist_ok=True)
+
+    pretrain_low_policy(env, lo)
+
+
+
+if __name__ == '__main__':
+    main()
+```
