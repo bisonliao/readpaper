@@ -2401,31 +2401,21 @@ if __name__ == '__main__':
 
 结果如下：
 
-```python
-begin a trajectory...
-	try sub gaol [1.38792137 0.38960179 0.7105527 ]...
-	sub goal [1.38792137 0.38960179 0.7105527 ] reached!
-	try sub gaol [1.34094274 0.51510359 0.6351054 ]...
-	sub goal [1.34094274 0.51510359 0.6351054 ] reached!
-	try sub gaol [1.29396411 0.64060538 0.5596581 ]...
-	sub goal [1.29396411 0.64060538 0.5596581 ] reached!
-	try sub gaol [1.24698547 0.76610717 0.4842108 ]...
-	sub goal [1.24698547 0.76610717 0.4842108 ] reached!
-	try sub gaol [1.20000684 0.89160897 0.4087635 ]...
-	sub goal [1.20000684 0.89160897 0.4087635 ] missed! #奇怪，最后一站为什么大概率到不了...
-```
+1. 能够较好的收敛，单步的成功率是0.9
+2. 那大回合是5步，5步都成功大回合才成功，大回合的成功率就不太高：0.9^5 = 0.6。还需要进一步提高成功率
 
 ![image-20250703165124431](img/image-20250703165124431.png)
 
-后来发现FetchReach环境有bug，红球的位置和 obs['desired_goal']对不上...
 
-至此，至少证明了用手搓的SAC代码可以实现小位移的低层目标的goal conditional 达成。
+
+至此，证明了用手搓的SAC代码可以实现小位移的低层目标的goal conditional 达成。
 
 下一步就是冻结低层模型，训练高层模型，使其具备规划的能力。对于FetchReach这样的简单任务，还可以直接求空间直线上的点的方式。
 
 ```python
 import datetime
 import random
+import time
 from collections import deque, defaultdict
 
 import numpy
@@ -2469,20 +2459,21 @@ def generate_anchors(env, repeat=20):
     num = 5
     rp_cnt = 0
     while rp_cnt < repeat:
-        state, _ = env.reset()
+        state, info = env.reset()
         start_pos = state[:3]
-        end_pos = state[10:]
+        end_pos = info['desired_goal']
         diff = end_pos - start_pos
-
-        if np.linalg.norm(diff / num) > 0.15:
+        step = diff / num
+        print(f"step:{step},{np.linalg.norm(step):.4f}")
+        if np.linalg.norm(step) > 0.15:
             rp_cnt += 1
-            step = diff / num
+
             #print(f'step:{step}, {np.linalg.norm(step)}')
             for i in range(num):
                 a = start_pos + i * step
                 b = a + step
                 anchors.append( (a, b) )
-                #print(f'route:{a}->{b}')
+                print(f'route:{a}->{b}')
     return anchors
 
 def get_lo_desired(current_state:np.ndarray, anchors):
@@ -2496,7 +2487,8 @@ def get_lo_desired(current_state:np.ndarray, anchors):
     return None, -1
 
 def show_case(env, lo:my_low_sac.HIRO_LOW_SAC):
-    for _ in range(5):
+    for _ in range(10):
+        time.sleep(1)
         anchors = generate_anchors(env, 1)
 
         state, _ = env.reset()
@@ -2513,6 +2505,7 @@ def show_case(env, lo:my_low_sac.HIRO_LOW_SAC):
                     lo_done = False  # 标识低层回合是否结束
                     lo_step_cnt = 0  # 开始计步
                     print(f"\ttry sub gaol {lo_desired}...")
+                    time.sleep(1)
 
             if lo_desired is not None:
                 state = modify_desired_in_state(state, lo_desired)  # 修改
@@ -2647,8 +2640,24 @@ def main():
 
     pretrain_low_policy(env, lo)
 
+    #lo.actor = torch.load('./checkpoints/low_sac.pth', weights_only=False)
+    #show_case(env, lo)
+
 
 
 if __name__ == '__main__':
     main()
 ```
+
+###### FetchReach是个坑
+
+以前一直用FetchReach-v3，观察到红球距离初始化位置比较远，所以选择作为HIRO、HER的任务，结果今天发现了：
+
+1. v3里有bug，红球渲染的位置和obs['desired_goal']不一致。不过幸好他们位置距离初始手臂位置确实比较远（近 1m）。似乎不影响训练，但是影响视觉观察
+2. 通过安装github上gymnasium-robotics包升级到v4，又有surprise：obs['desired_goal']距离手臂初始化位置不超过0.15m，FetchReach本意就是作为很小距离移动的控制任务设计的。这点可以在文档里看到，但我平时没有注意。
+
+```
+The gripper’s target position is randomly selected by adding an offset to the initial grippers position (x,y,z) sampled from a uniform distribution with a range of [-0.15, 0.15] m
+```
+
+算逑，还是继续用v3来训练HIRO吧。视觉上不要去看它，不要开human渲染模式。
