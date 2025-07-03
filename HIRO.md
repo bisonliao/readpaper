@@ -476,12 +476,12 @@ class HIRO_LOW_SAC:
         # 超参数
         self.gamma = 0.97
         self.tau = 0.005
-        self.alpha = 0.001
+        self.alpha = 0.2
         self.lr = 3e-4
         self.batch_size = 256
         self.buffer_size = 100000
         self.target_entropy = -action_dim
-        self.automatic_entropy_tuning = False
+        self.automatic_entropy_tuning = True
         self.step_cnt = 0
         self.writer = writer
 
@@ -895,6 +895,8 @@ class HIRO_HI_SAC:
 
 ##### 训练
 
+不能收敛，需要分段训练，见下面稳打稳扎的详细过程。
+
 ```python
 import datetime
 
@@ -1168,7 +1170,7 @@ if __name__ == '__main__':
 
 上面的一气呵成的代码并不能收敛，那就一步一步来，慢慢上复杂度
 
-###### step1：确保SB3的SAC 可以搞定固定的短距离小目标
+###### step1：用SB3的SAC 搞定固定的短距离小目标
 
 两个发现：
 
@@ -1258,10 +1260,10 @@ class CustomFetchReachEnv(gym.Env):
         重置环境，返回初始观测和 info。
         """
         obs, info = self._env.reset(seed=seed, options=options)
-
+		
+        # 关键代码：
         #尝试固定目标位置进行训练，结果显示可以到达100%成功率
-
-
+        # 这个位移p可不能乱写，血的教训。
         self.g = np.array( [-0.08951826,  0.12014015, +0.15802831] )
         self.desired_goal = obs['achieved_goal'] + self.g
 
@@ -1379,7 +1381,7 @@ if __name__ == '__main__':
     )
 ```
 
-###### step2：确保SB3的SAC可以搞定多个短距离小目标
+###### step2：用SB3的SAC搞定多个短距离小目标
 
 这次 g 不是固定的，是变化的一批，能够收敛。
 
@@ -1438,6 +1440,7 @@ class CustomFetchReachEnv(gym.Env):
         self.g_list = []
         self.generate_g()
 
+    # 关键代码：
     # 产生随机的可达的10个位移很小的低层目标，用来训练
     def generate_g(self):
         self.g_list = []
@@ -1573,7 +1576,7 @@ if __name__ == '__main__':
     )
 ```
 
-###### step3：确保SB3的SAC可以用低层小回合搞定固定的小目标
+###### step3：用SB3的SAC搞定带固定目标的低层小回合
 
 ![image-20250702161211316](img/image-20250702161211316.png)
 
@@ -1632,6 +1635,7 @@ class CustomFetchReachEnv_v2(gym.Env):
         重置环境，返回初始观测和 info。
         """
 
+        # 关键代码：
         # 固定小目标为这么多，也就是希望手臂末端在x,y,z方向位移0.1m
         self.g = np.array([-0.08951826,  0.12014015, +0.15802831])
         obs, info = self._env.reset(seed=seed, options=options)
@@ -1660,7 +1664,6 @@ class CustomFetchReachEnv_v2(gym.Env):
         info['desired_goal'] = self.desired_goal
 
         # 计算当前状态与小回合开始状态的差值
-
         dist = np.linalg.norm(self.desired_goal - obs['achieved_goal'])
 
         if dist < 0.05: #很接近小目标了，认为成功完成目标
@@ -1755,7 +1758,7 @@ if __name__ == '__main__':
     )
 ```
 
-###### step4:确保SB3的SAC可以用低层小回合搞定多个小目标
+###### step4：用SB3的SAC搞定不同小目标的低层小回合
 
 可以收敛：
 
@@ -1812,8 +1815,8 @@ class CustomFetchReachEnv_v2(gym.Env):
         self.g_list = []
         self.generate_g()
 
-        # 产生随机的可达的10个位移很小的低层目标，用来训练
-
+    # 关键代码
+    # 产生随机的可达的10个位移很小的低层目标，用来训练
     def generate_g(self):
         self.g_list = []
         while len(self.g_list) < 10:
@@ -1830,6 +1833,7 @@ class CustomFetchReachEnv_v2(gym.Env):
         重置环境，返回初始观测和 info。
         """
 
+        # 关键代码：
         # 固定小目标为这么多，也就是希望手臂末端在x,y,z方向位移0.1m
         self.g = self.g_list[ random.randint(0, len(self.g_list)-1) ]
         obs, info = self._env.reset(seed=seed, options=options)
@@ -1951,11 +1955,140 @@ if __name__ == '__main__':
     model.learn( total_timesteps=total_timesteps)
 ```
 
-###### step5：确保我的SAC代码可以搞定固定的低层目标
+###### step5：开始上手搓SAC，搞定固定目标的大回合
 
-只有40%的成功率
+后面各步骤都是手搓SAC代码。
+
+一个完整的FetchReach回合，起始状态是确定的，目的位置也是确定的，且目的位置相比起始位置的位移是确定的小位移g。可以认为是最简单的连续动作任务。
 
 ![image-20250702195627796](img/image-20250702195627796.png)
+
+```python
+import datetime
+from collections import deque
+
+import numpy
+import numpy as np
+
+import my_hi_sac
+import my_low_sac
+import my_fetchreach_env
+import os
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+class Config:
+    max_episodes = 1000
+    pretrain_lo_episodes = 1000
+    max_episode_steps = 100
+    #new_g_interval = 20
+
+def modify_desired_in_state(state:numpy.ndarray, desired:numpy.ndarray):
+    assert state.shape[0] ==13  and desired.shape[0] == 3, ""
+    new_state = numpy.concat( [ state[0:10], desired] , axis=-1)
+    return new_state
+
+
+
+def intrinsic_reward(desired:numpy.ndarray, next_state: numpy.ndarray):
+
+    diff = desired - next_state[:3]
+    assert diff.shape==(3,), ""
+    dist = np.linalg.norm(diff)
+    if dist <= 0.05:
+        return 1, True, dist
+    else:
+        return -dist, False, dist
+
+
+def generate_g():
+    return np.array([-0.08951826,  0.12014015, +0.15802831]) # todo:临时限制
+
+
+def pretrain_low_policy(env, lo:my_low_sac.HIRO_LOW_SAC):
+    lo_episode_cnt = 0 #低层回合个数，方便tb上报做横坐标
+    lo_result=deque(maxlen=100)
+    for episode in range(1, Config.pretrain_lo_episodes):
+        state, _ = env.reset()
+        g = generate_g()
+        lo_desired = g + state[:3]
+
+        lo_episode_rewards = [] #低层一个回合每个时间步的内部奖励
+
+        lo_done = False # 标识低层回合是否结束
+        step_cnt = 0 # 用来决定lo episode的起止
+        for i in range(Config.max_episode_steps):  # 一个大回合最多与环境交互xx次
+
+            assert lo_desired is not None, ""
+            state = modify_desired_in_state(state, lo_desired) # 修改
+            # 选择动作
+            action = lo.select_action(state)
+
+            # 执行动作
+            next_state, env_reward, term, trunc, _ = env.step(action)
+            # 确保写入buffer的数据严格统一,因为update的时候会用到。
+            next_state = modify_desired_in_state(next_state, lo_desired)
+            done = term or trunc
+            step_cnt += 1
+
+            # 可能出现低层已经完成了目标，但低层的回合长度还没有到换新目标的时候。
+            # 这种情况下，继续与环境交互，但是不再计算内部奖励、不记录低层的时间步信息
+            # 如果当前lo episode还没有结束，那么就要计算内部奖励、确定是否结束、存储时间步
+            if not lo_done:
+                lo_rw, lo_done, dist = intrinsic_reward(lo_desired, next_state)
+                lo_done = (lo_done or done  ) # 低层回合截断了,lo_done也必须设置为True
+                # 存储transition
+                lo.replay_buffer.push(state, action, lo_rw, next_state, lo_done)
+                #print(f"add transition:{state}, {action}, {lo_rw}, {next_state}, {lo_done}")
+                # 更新网络参数
+                lo.update_parameters()
+                lo_episode_rewards.append( lo_rw)
+                if lo_done:
+                    # 固定长度的lo episode结束了， 主要是上报是否成功、内部奖励的均值
+                    if lo_rw >= 0:
+                        lo_result.append(1)
+                    else:
+                        lo_result.append(0)
+                    lo.writer.add_scalar('lo/avg_intrinsic_reward', np.mean(lo_episode_rewards), episode)
+            # 更新状态
+            state = next_state
+            if done:
+                break
+
+        lo.writer.add_scalar('lo/suc_ratio', np.mean(lo_result), episode)
+
+# 主函数
+def main():
+    # 创建环境
+    env = my_fetchreach_env.CustomFetchReachEnv()
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    print(f"state_dim:{state_dim}, action_dim:{action_dim}, max_action:{max_action}")
+
+    writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+    # 创建SAC代理
+    hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 1, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
+    lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
+
+    # 创建检查点目录
+    os.makedirs("checkpoints", exist_ok=True)
+
+    pretrain_low_policy(env, lo)
+
+if __name__ == '__main__':
+    main()
+```
+
+###### step6：搞定固定位移的小回合
+
+这个任务比step5要难，step5的任务的起始状态和目标都是固定的，是最简单的任务，且允许100步；step6的每个小回合的起始状态和目标都不是一样的（虽然目前位移g还是固定的），且小回合长度只有20步。本质上就是不同的低层目标的完成能力了。
+
+加深了神经网络，成功率也没有提升，只能到40%的成功率。
+
+**我百思不得其解，后来想明白了，同样的小位移g常量，在机械臂移动到某些状态下可能就是不可达的**，不能作为这个状态起始的小回合的目的位移。
+
+![image-20250703115630836](img/image-20250703115630836.png)
 
 ```python
 import datetime
@@ -1998,66 +2131,502 @@ def intrinsic_reward(desired:numpy.ndarray, next_state: numpy.ndarray):
 def generate_g():
     return np.array([-0.08951826,  0.12014015, +0.15802831]) # todo:临时限制
 
+
 def pretrain_low_policy(env, lo:my_low_sac.HIRO_LOW_SAC):
     lo_episode_cnt = 0 #低层回合个数，方便tb上报做横坐标
     lo_result=deque(maxlen=100)
     for episode in range(1, Config.pretrain_lo_episodes):
         state, _ = env.reset()
 
-        episode_reward = 0 #高层回合的奖励累计
-        lo_episode_rewards = [] #低层一个回合每个时间步的内部奖励
-        lo_rw = 0 #低层内部奖励
-        lo_done = False # 标识低层回合是否结束
         step_cnt = 0 # 用来决定lo episode的起止
-        g = None # 高层给到低层的子目标
         for i in range(Config.max_episode_steps):  # 一个大回合最多与环境交互xx次
 
             if step_cnt % Config.new_g_interval == 0:
-                # 固定长度的lo episode开始了
-                lo_episode_cnt += 1
+                #开始一个小回合，应用固定位移后的位置作为目标，关键代码
+                # 后来想明白了，这时候state不是机械臂的大回合起始位置，是中途某个位置 state+g可能是机械臂不可达的，操
                 g = generate_g()
                 lo_desired = g + state[:3]
+                lo_episode_rewards = []  # 低层一个回合每个时间步的内部奖励
+                lo_done = False  # 标识低层回合是否结束
 
-                lo_done = False
-                lo_episode_rewards = []
-
-            assert g is not None, ""
+            assert lo_desired is not None, ""
             state = modify_desired_in_state(state, lo_desired) # 修改
             # 选择动作
             action = lo.select_action(state)
 
             # 执行动作
             next_state, env_reward, term, trunc, _ = env.step(action)
+            # 确保写入buffer的数据严格统一,因为update的时候会用到。
+            next_state = modify_desired_in_state(next_state, lo_desired)
             done = term or trunc
             step_cnt += 1
-            episode_reward += env_reward
+
             # 可能出现低层已经完成了目标，但低层的回合长度还没有到换新目标的时候。
             # 这种情况下，继续与环境交互，但是不再计算内部奖励、不记录低层的时间步信息
             # 如果当前lo episode还没有结束，那么就要计算内部奖励、确定是否结束、存储时间步
+            assert lo_done is not None, ""
             if not lo_done:
                 lo_rw, lo_done, dist = intrinsic_reward(lo_desired, next_state)
-                lo_done = lo_done or done or (step_cnt % Config.new_g_interval == 0)  # 低层回合截断了,lo_done也必须设置为True
+                lo_done = (lo_done or done or (step_cnt % Config.new_g_interval == 0) ) # 低层回合截断了,lo_done也必须设置为True
                 # 存储transition
                 lo.replay_buffer.push(state, action, lo_rw, next_state, lo_done)
+                #print(f"add transition:{state}, {action}, {lo_rw}, {next_state}, {lo_done}")
                 # 更新网络参数
                 lo.update_parameters()
+                assert lo_episode_rewards is not None, ""
                 lo_episode_rewards.append( lo_rw)
                 if lo_done:
                     # 固定长度的lo episode结束了， 主要是上报是否成功、内部奖励的均值
-                    if lo_rw == 1:
+                    if lo_rw >= 0:
                         lo_result.append(1)
                     else:
                         lo_result.append(0)
-                    lo.writer.add_scalar('lo/avg_intrinsic_reward', np.mean(lo_episode_rewards), lo_episode_cnt)
-                    lo.writer.add_scalar('lo/dist', dist, lo_episode_cnt)
+                    lo.writer.add_scalar('lo/avg_intrinsic_reward', np.mean(lo_episode_rewards), episode)
             # 更新状态
             state = next_state
             if done:
                 break
 
-        # 记录到TensorBoard
-        lo.writer.add_scalar('lo/episode_reward', episode_reward, episode)
         lo.writer.add_scalar('lo/suc_ratio', np.mean(lo_result), episode)
+
+# 主函数
+def main():
+    # 创建环境
+    env = my_fetchreach_env.CustomFetchReachEnv()
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    print(f"state_dim:{state_dim}, action_dim:{action_dim}, max_action:{max_action}")
+
+    writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+    # 创建SAC代理
+    hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 1, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
+    lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
+
+    # 创建检查点目录
+    os.makedirs("checkpoints", exist_ok=True)
+
+    pretrain_low_policy(env, lo)
+
+
+
+if __name__ == '__main__':
+    main()
+```
+
+###### step7： 搞定固定的路线中途小目标
+
+基于step6的问题，我就挑一个大回合，把achieved_goal和desired goal之间的直线上的5个等距离的点作为小回合的目标，有5个目标，移动位移都是其中一个小段，尝试训练低层策略。
+
+能够很好的收敛，且中途每个小目标都有较平衡的覆盖到：
+
+![image-20250703151233267](img/image-20250703151233267.png)
+
+```python
+import datetime
+from collections import deque, defaultdict
+
+import numpy
+import numpy as np
+
+import my_hi_sac
+import my_low_sac
+import my_fetchreach_env
+import os
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+class Config:
+    max_episodes = 3000
+    pretrain_lo_episodes = 3000
+    max_episode_steps = 100
+    new_g_interval = 20
+
+def modify_desired_in_state(state:numpy.ndarray, desired:numpy.ndarray):
+    assert state.shape[0] ==13  and desired.shape[0] == 3, ""
+    new_state = numpy.concat( [ state[0:10], desired] , axis=-1)
+    return new_state
+
+
+
+def intrinsic_reward(desired:numpy.ndarray, next_state: numpy.ndarray):
+
+    diff = desired - next_state[:3]
+    assert diff.shape==(3,), ""
+    dist = np.linalg.norm(diff)
+    if dist <= 0.05:
+        return 1, True, dist
+    else:
+        return -dist, False, dist
+
+# 关键代码，取一条直线上的5个位置作为我们的固定的小目标
+def generate_anchors(env):
+
+    anchors=[]
+    num = 5
+    while True:
+        state, _ = env.reset()
+        start_pos = state[:3]
+        end_pos = state[10:]
+        diff = end_pos - start_pos
+
+        if np.linalg.norm(diff / num) > 0.15:
+
+            step = diff / num
+            print(f'step:{step}, {np.linalg.norm(step)}')
+            for i in range(num):
+                a = start_pos + i * step
+                b = a + step
+                anchors.append( (a, b) )
+                print(f'route:{a}->{b}')
+            break
+
+    return anchors
+# 关键代码，根据当前位置，找可以作为小目标的anchor
+def get_lo_desired(current_state:np.ndarray, anchors):
+    idx = 0
+    for (a, b) in anchors:
+        if np.linalg.norm(a-current_state[:3]) < 0.05:
+            return b, idx
+        idx += 1
+    return None, idx
+
+def pretrain_low_policy(env, lo:my_low_sac.HIRO_LOW_SAC):
+    lo_episode_cnt = 0 #低层回合个数，方便tb上报做横坐标
+    lo_result=deque(maxlen=100)
+    anchors = generate_anchors(env)
+    total_steps = 0
+    sample_num = defaultdict(int) #记录每一个lo_desire为目标的回合的次数
+    sample_suc = defaultdict(int) #记录每一个lo_desire为目标的回合的成功次数
+    for episode in range(1, Config.pretrain_lo_episodes):
+        state, _ = env.reset()
+        lo_step_cnt = 0 # 用来决定lo episode的起止
+        lo_desired = None
+        lo_done = True
+
+        for i in range(Config.max_episode_steps):  # 一个大回合最多与环境交互xx次
+
+            if lo_done: # low episode 结束了，或者没有开始
+                lo_desired, anchor_idx = get_lo_desired(state, anchors)  # 看看有没有合适的锚点用作下一个低层目标
+                if lo_desired is not None:
+                    sample_num[anchor_idx] += 1
+                    lo.writer.add_scalar('lo/lo_desired', anchor_idx, total_steps)
+                    lo_episode_rewards = []  # 低层一个回合每个时间步的内部奖励
+                    lo_done = False  # 标识低层回合是否结束
+                    lo_step_cnt = 0 # 开始计步
+
+
+            if lo_desired is not None:
+                state = modify_desired_in_state(state, lo_desired) # 修改
+            # 选择动作
+            action = lo.select_action(state)
+
+            # 执行动作
+            next_state, env_reward, term, trunc, _ = env.step(action)
+            # 确保写入buffer的数据严格统一,因为update的时候会用到。
+            if lo_desired is not None:
+                next_state = modify_desired_in_state(next_state, lo_desired)
+            done = term or trunc
+            lo_step_cnt += 1
+            total_steps += 1
+
+            # 可能出现低层已经完成了目标，但低层的回合长度还没有到换新目标的时候。
+            # 这种情况下，继续与环境交互，但是不再计算内部奖励、不记录低层的时间步信息
+            # 如果当前lo episode还没有结束，那么就要计算内部奖励、确定是否结束、存储时间步
+            if not lo_done: #low episode 进行中
+                lo_rw, lo_done, dist = intrinsic_reward(lo_desired, next_state)
+                lo_done = (lo_done or done or (lo_step_cnt % Config.new_g_interval == 0) ) # 低层回合截断了,lo_done也必须设置为True
+                # 存储transition
+                lo.replay_buffer.push(state, action, lo_rw, next_state, lo_done)
+
+                #print(f"add transition:{state}, {action}, {lo_rw}, {next_state}, {lo_done}")
+                # 更新网络参数
+                lo.update_parameters()
+                assert lo_episode_rewards is not None, ""
+                lo_episode_rewards.append( lo_rw)
+                if lo_done:
+                    # 固定长度的lo episode结束了， 主要是上报是否成功、内部奖励的均值
+                    if lo_rw >= 0:
+                        lo_result.append(1)
+                        sample_suc[anchor_idx] += 1
+                    else:
+                        lo_result.append(0)
+                    lo.writer.add_scalar('lo/avg_intrinsic_reward', np.mean(lo_episode_rewards), episode)
+
+            # 更新状态
+            state = next_state
+            if done:
+                break
+
+        lo.writer.add_scalar('lo/suc_ratio', np.mean(lo_result), episode)
+        if episode % 200 == 0:
+            total = 1e-7
+            for k, c in sample_num.items():
+                total += c
+            print(f"samples distribution,total={int(total)}:")
+            for k, c in sample_num.items():
+                print(f"{k}:{c},{c/total:.2f},{(sample_suc[k] / (c+1e-8)):.2f}")
+
+# 主函数
+def main():
+    # 创建环境
+    env = my_fetchreach_env.CustomFetchReachEnv()
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    print(f"state_dim:{state_dim}, action_dim:{action_dim}, max_action:{max_action}")
+
+    writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+    # 创建SAC代理
+    hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 1, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
+    lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
+
+    # 创建检查点目录
+    os.makedirs("checkpoints", exist_ok=True)
+
+    pretrain_low_policy(env, lo)
+
+
+
+if __name__ == '__main__':
+    main()
+```
+
+###### step8：搞定各种线路中的中途小目标
+
+基于step7，进一步的，挑20个大回合，
+
+1. 对每个大回合，把achieved_goal和desired goal之间的直线上的5个等距离的点作为小回合的目标，有5个目标，移动位移都是其中一个小段，尝试训练低层策略。
+2. 20个大回合，就得到100个小回合
+
+结果如下：
+
+```python
+begin a trajectory...
+	try sub gaol [1.38792137 0.38960179 0.7105527 ]...
+	sub goal [1.38792137 0.38960179 0.7105527 ] reached!
+	try sub gaol [1.34094274 0.51510359 0.6351054 ]...
+	sub goal [1.34094274 0.51510359 0.6351054 ] reached!
+	try sub gaol [1.29396411 0.64060538 0.5596581 ]...
+	sub goal [1.29396411 0.64060538 0.5596581 ] reached!
+	try sub gaol [1.24698547 0.76610717 0.4842108 ]...
+	sub goal [1.24698547 0.76610717 0.4842108 ] reached!
+	try sub gaol [1.20000684 0.89160897 0.4087635 ]...
+	sub goal [1.20000684 0.89160897 0.4087635 ] missed! #奇怪，最后一站为什么大概率到不了...
+```
+
+![image-20250703165124431](img/image-20250703165124431.png)
+
+后来发现FetchReach环境有bug，红球的位置和 obs['desired_goal']对不上...
+
+至此，至少证明了用手搓的SAC代码可以实现小位移的低层目标的goal conditional 达成。
+
+下一步就是冻结低层模型，训练高层模型，使其具备规划的能力。对于FetchReach这样的简单任务，还可以直接求空间直线上的点的方式。
+
+```python
+import datetime
+import random
+from collections import deque, defaultdict
+
+import numpy
+import numpy as np
+
+import my_hi_sac
+import my_low_sac
+import my_fetchreach_env
+import os
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+
+
+class Config:
+    max_episodes = 3000
+    pretrain_lo_episodes = 3000
+    max_episode_steps = 100
+    new_g_interval = 20
+
+def modify_desired_in_state(state:numpy.ndarray, desired:numpy.ndarray):
+    assert state.shape[0] ==13  and desired.shape[0] == 3, ""
+    new_state = numpy.concat( [ state[0:10], desired] , axis=-1)
+    return new_state
+
+
+
+def intrinsic_reward(desired:numpy.ndarray, next_state: numpy.ndarray):
+
+    diff = desired - next_state[:3]
+    assert diff.shape==(3,), ""
+    dist = np.linalg.norm(diff)
+    if dist <= 0.05:
+        return 1, True, dist
+    else:
+        return -dist, False, dist
+
+
+def generate_anchors(env, repeat=20):
+    anchors=[]
+    num = 5
+    rp_cnt = 0
+    while rp_cnt < repeat:
+        state, _ = env.reset()
+        start_pos = state[:3]
+        end_pos = state[10:]
+        diff = end_pos - start_pos
+
+        if np.linalg.norm(diff / num) > 0.15:
+            rp_cnt += 1
+            step = diff / num
+            #print(f'step:{step}, {np.linalg.norm(step)}')
+            for i in range(num):
+                a = start_pos + i * step
+                b = a + step
+                anchors.append( (a, b) )
+                #print(f'route:{a}->{b}')
+    return anchors
+
+def get_lo_desired(current_state:np.ndarray, anchors):
+    # 从列表中的某个随机位置开始往后查找，这样有利于打散遇到不同大回合的起始位置
+    start_index = random.randint(0, len(anchors)-1)
+    for _ in range(len(anchors)):
+        (a, b) = anchors[start_index]
+        if np.linalg.norm(a-current_state[:3]) < 0.05:
+            return b, start_index
+        start_index = (start_index + 1) % len(anchors) #继续查找
+    return None, -1
+
+def show_case(env, lo:my_low_sac.HIRO_LOW_SAC):
+    for _ in range(5):
+        anchors = generate_anchors(env, 1)
+
+        state, _ = env.reset()
+        lo_step_cnt = 0  # 用来决定lo episode的起止
+        lo_desired = None
+        lo_done = True
+        print("begin a trajectory...")
+
+        for i in range(Config.max_episode_steps):  # 一个大回合最多与环境交互xx次
+
+            if lo_done:  # low episode 结束了，或者没有开始
+                lo_desired, anchor_idx = get_lo_desired(state, anchors)  # 看看有没有合适的锚点用作下一个低层目标
+                if lo_desired is not None:
+                    lo_done = False  # 标识低层回合是否结束
+                    lo_step_cnt = 0  # 开始计步
+                    print(f"\ttry sub gaol {lo_desired}...")
+
+            if lo_desired is not None:
+                state = modify_desired_in_state(state, lo_desired)  # 修改
+            # 选择动作
+            action = lo.select_action(state)
+
+            # 执行动作
+            next_state, env_reward, term, trunc, _ = env.step(action)
+            # 确保写入buffer的数据严格统一,因为update的时候会用到。
+            if lo_desired is not None:
+                next_state = modify_desired_in_state(next_state, lo_desired)
+            done = term or trunc
+            lo_step_cnt += 1
+
+            # 可能出现低层已经完成了目标，但低层的回合长度还没有到换新目标的时候。
+            # 这种情况下，继续与环境交互，但是不再计算内部奖励、不记录低层的时间步信息
+            # 如果当前lo episode还没有结束，那么就要计算内部奖励、确定是否结束、存储时间步
+            if not lo_done:  # low episode 进行中
+                lo_rw, lo_done, dist = intrinsic_reward(lo_desired, next_state)
+                lo_done = (lo_done or done or (lo_step_cnt % Config.new_g_interval == 0))  # 低层回合截断了,lo_done也必须设置为True
+
+                if lo_done:
+                    # 固定长度的lo episode结束了， 主要是上报是否成功、内部奖励的均值
+                    if lo_rw >= 0:
+                        print(f"\tsub goal {lo_desired} reached!")
+                    else:
+                        print(f"\tsub goal {lo_desired} missed!")
+                        break
+
+            # 更新状态
+            state = next_state
+            if done:
+                break
+
+
+
+
+def pretrain_low_policy(env, lo:my_low_sac.HIRO_LOW_SAC):
+    lo_episode_cnt = 0 #低层回合个数，方便tb上报做横坐标
+    lo_result=deque(maxlen=100)
+    anchors = generate_anchors(env)
+    total_steps = 0
+    sample_num = defaultdict(int) #记录每一个lo_desire为目标的回合的次数
+    sample_suc = defaultdict(int) #记录每一个lo_desire为目标的回合的成功次数
+    for episode in range(1, Config.pretrain_lo_episodes):
+        state, _ = env.reset()
+        lo_step_cnt = 0 # 用来决定lo episode的起止
+        lo_desired = None
+        lo_done = True
+
+        for i in range(Config.max_episode_steps):  # 一个大回合最多与环境交互xx次
+
+            if lo_done: # low episode 结束了，或者没有开始
+                lo_desired, anchor_idx = get_lo_desired(state, anchors)  # 看看有没有合适的锚点用作下一个低层目标
+                if lo_desired is not None:
+                    sample_num[anchor_idx] += 1
+                    lo.writer.add_scalar('lo/lo_desired', anchor_idx, total_steps)
+                    lo_episode_rewards = []  # 低层一个回合每个时间步的内部奖励
+                    lo_done = False  # 标识低层回合是否结束
+                    lo_step_cnt = 0 # 开始计步
+
+
+            if lo_desired is not None:
+                state = modify_desired_in_state(state, lo_desired) # 修改
+            # 选择动作
+            action = lo.select_action(state)
+
+            # 执行动作
+            next_state, env_reward, term, trunc, _ = env.step(action)
+            # 确保写入buffer的数据严格统一,因为update的时候会用到。
+            if lo_desired is not None:
+                next_state = modify_desired_in_state(next_state, lo_desired)
+            done = term or trunc
+            lo_step_cnt += 1
+            total_steps += 1
+
+            # 可能出现低层已经完成了目标，但低层的回合长度还没有到换新目标的时候。
+            # 这种情况下，继续与环境交互，但是不再计算内部奖励、不记录低层的时间步信息
+            # 如果当前lo episode还没有结束，那么就要计算内部奖励、确定是否结束、存储时间步
+            if not lo_done: #low episode 进行中
+                lo_rw, lo_done, dist = intrinsic_reward(lo_desired, next_state)
+                lo_done = (lo_done or done or (lo_step_cnt % Config.new_g_interval == 0) ) # 低层回合截断了,lo_done也必须设置为True
+                # 存储transition
+                lo.replay_buffer.push(state, action, lo_rw, next_state, lo_done)
+
+                #print(f"add transition:{state}, {action}, {lo_rw}, {next_state}, {lo_done}")
+                # 更新网络参数
+                lo.update_parameters()
+                assert lo_episode_rewards is not None, ""
+                lo_episode_rewards.append( lo_rw)
+                if lo_done:
+                    # 固定长度的lo episode结束了， 主要是上报是否成功、内部奖励的均值
+                    if lo_rw >= 0:
+                        lo_result.append(1)
+                        sample_suc[anchor_idx] += 1
+                    else:
+                        lo_result.append(0)
+                    lo.writer.add_scalar('lo/avg_intrinsic_reward', np.mean(lo_episode_rewards), episode)
+
+            # 更新状态
+            state = next_state
+            if done:
+                break
+
+        lo.writer.add_scalar('lo/suc_ratio', np.mean(lo_result), episode)
+        if episode % 200 == 0:
+            total = 1e-7
+            for k, c in sample_num.items():
+                total += c
+            print(f"\nsamples distribution,total={int(total)}:")
+            for k, c in sample_num.items():
+                print(f"{k}:\t{c},\t{c/total:.2f},\t{(sample_suc[k]*100 / (c+1e-8)):.1f}%")
+    torch.save(lo.actor, './checkpoints/low_sac_actor.pth')
+    show_case(env, lo)
 
 # 主函数
 def main():
