@@ -2937,3 +2937,168 @@ def main(mode):
 if __name__ == '__main__':
     main('eval')
 ```
+
+###### step10：冻结低层模型训练高层模型
+
+没有收敛，而且高层模型更新的计算量很大导致很慢
+
+![image-20250704203708475](img/image-20250704203708475.png)
+
+
+
+```python
+import datetime
+import random
+import time
+from collections import deque, defaultdict
+
+import numpy
+import numpy as np
+
+import my_hi_sac
+import my_low_sac
+import my_fetchreach_env
+import os
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+
+
+class Config:
+    max_episodes = 3000
+    pretrain_lo_episodes = 3000
+    max_episode_steps = 100
+    new_g_interval = 20
+
+def modify_desired_in_state(state:numpy.ndarray, desired:numpy.ndarray):
+    assert state.shape[0] ==13  and desired.shape[0] == 3, ""
+    new_state = numpy.concat( [ state[0:10], desired] , axis=-1)
+    return new_state
+
+
+
+def intrinsic_reward(desired:numpy.ndarray, next_state: numpy.ndarray):
+
+    diff = desired - next_state[:3]
+    assert diff.shape==(3,), ""
+    dist = np.linalg.norm(diff)
+    if dist <= 0.05:
+        return 1, True, dist
+    else:
+        return -dist, False, dist
+
+def train(env, hi:my_hi_sac.HIRO_HI_SAC, lo:my_low_sac.HIRO_LOW_SAC):
+
+    def lo_policy(state):
+        return lo.select_action(state, True)
+
+    def state_diff(end, start):
+        return end[:3] - start[:3]
+
+    best_reward = -float('inf')
+    lo_episode_cnt = 0
+    for episode in range(1, Config.max_episodes + 1):
+        state, _ = env.reset()
+        episode_reward = 0
+        lo_desired = None
+        step_cnt = 0 #一定要初始化为0，因为下面利用了这个值模c等于0产生g
+        g = None
+        low_states = []
+        low_actions = []
+        env_rewards = []
+        print(f'开始一个大回合')
+        s_hi = None
+        for i in range(Config.max_episode_steps):  #一个回合最多与环境交互xx次
+
+            if step_cnt % Config.new_g_interval == 0: # 开始一个新的低层episode
+                lo_episode_cnt += 1
+                g = hi.select_action(state)
+                g = g[0]
+                assert g.shape == (3,), ""
+                s_hi = state
+                lo_desired = g + state[:3]
+                low_states = []
+                low_actions = []
+                env_rewards = []
+                lo_done = False
+                print(f"\n\t开始一个小回合, {lo_desired}")
+
+            assert lo_desired is not None,  ""
+            state = modify_desired_in_state(state, lo_desired)
+            # 选择动作
+            action = lo.select_action(state)
+            print(f"\t执行动作{action}")
+            # 执行动作
+            next_state, reward, term, trunc,_ = env.step(action)
+            done = term or trunc
+            step_cnt += 1
+            episode_reward += reward
+            next_state = modify_desired_in_state(next_state, lo_desired)
+
+
+            if not lo_done:
+
+                lo_rw, lo_done, _ = intrinsic_reward(lo_desired, next_state)
+                lo_done = lo_done  or done or (step_cnt%Config.new_g_interval==0) #低层回合截断了,lo_done也必须设置为True
+
+                low_states.append(state)
+                low_actions.append(action)
+                env_rewards.append(reward)
+
+                if lo_done: #即使完成了，也不开始一个新的低层episode，一定是间隔c步；但通过这个变量，会让后续的时间步不会继续计算内部奖励等
+                    print(f'\t结束一个小回合,{lo_desired}, {done}, {step_cnt%Config.new_g_interval==0}')
+                    if lo_rw >= 0:
+                        lo.writer.add_scalar('lo/lo_episode_suc', 1, lo_episode_cnt)
+                    else:
+                        lo.writer.add_scalar('lo/lo_episode_suc', 0, lo_episode_cnt)
+                    s_hi_next = next_state
+                    r_sum = sum(env_rewards)
+                    low_states.append(next_state)  # 加入最后的 s_t+c
+                    low_states = numpy.array(low_states)
+                    low_actions = numpy.array(low_actions)
+                    hi.replay_buffer.push(s_hi, g, r_sum, s_hi_next, done, low_states, low_actions)
+                    hi.update_parameters(lo_policy, state_diff, modify_desired_in_state)
+
+                # 更新状态
+                state = next_state
+
+                if done:
+                    break
+
+        # 记录到TensorBoard
+        lo.writer.add_scalar('lo/episode_reward', episode_reward, episode)
+# 主函数
+def main(mode):
+    # 创建环境
+    if mode == 'train':
+        env = my_fetchreach_env.CustomFetchReachEnv()
+        state_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.shape[0]
+        max_action = float(env.action_space.high[0])
+        print(f"state_dim:{state_dim}, action_dim:{action_dim}, max_action:{max_action}")
+
+        writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+        # 创建SAC代理
+        hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 0.1, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
+        lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
+
+        # 创建检查点目录
+        os.makedirs("checkpoints", exist_ok=True)
+
+        train(env, hi, lo)
+    else:
+        env = my_fetchreach_env.CustomFetchReachEnv()
+        state_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.shape[0]
+        max_action = float(env.action_space.high[0])
+        writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
+        lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
+        lo.actor = torch.load('./checkpoints/low_sac.pth', weights_only=False)
+        #show_case(env, lo)
+        #reach(env, lo)
+
+
+
+if __name__ == '__main__':
+    main('train')
+```
