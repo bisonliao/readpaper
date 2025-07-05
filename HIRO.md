@@ -3089,7 +3089,7 @@ def main(mode):
 
         writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
         # 创建SAC代理
-        hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 0.1, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
+        hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 0.3, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
         lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
         lo.actor = torch.load('./checkpoints/low_sac.pth', weights_only=False)
 
