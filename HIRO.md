@@ -2938,7 +2938,7 @@ if __name__ == '__main__':
     main('eval')
 ```
 
-###### step10：冻结低层模型训练高层模型
+###### step10：冻结低层模型训练高层模型（失败）
 
 ![image-20250705150810686](img/image-20250705150810686.png)
 
@@ -3088,8 +3088,10 @@ def main(mode):
         print(f"state_dim:{state_dim}, action_dim:{action_dim}, max_action:{max_action}")
 
         writer = SummaryWriter(log_dir=f'logs/HIRO_FetchReach_{datetime.datetime.now().strftime("%m%d_%H%M%S")}')
-        # 创建SAC代理
-        hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 0.3, writer) # 高层策略输出的是g,相对于当前的位置的xyz偏移量，假设偏移量最多1米
+        # 创建SAC代理, g的是xyz位移，所以action_dim=3，而max_action=0.11则大有讲究：
+        # xyz方向上最大位移0.11m，那么位移的距离不超过 (0.11^2 * 3) ^0.5 = 0.19m
+        # 我前面预训练低层SAC的时候，它获得的能力就是能够达成位移0.15m左右的小目标。
+        hi = my_hi_sac.HIRO_HI_SAC(state_dim, 3, 0.11, writer) 
         lo = my_low_sac.HIRO_LOW_SAC(state_dim, action_dim, max_action, writer)
         lo.actor = torch.load('./checkpoints/low_sac.pth', weights_only=False)
 
@@ -3104,3 +3106,41 @@ def main(mode):
 if __name__ == '__main__':
     main('train')
 ```
+
+###### step11：加入“专家”的经验做引导（失败）
+
+在高层策略参与rollout的时候，对高层的select_action()融入一点“专家”规划的“路线”，那就是在当前位置和最终目的位置直接的直线上找到一个锚点，它距离当前位置不超过0.15m，作为高层产生的下一个动作。然后逐步降低专家接入的比例。
+
+```python
+    def get_g_from_expert(self, current_state, desired):
+        start_pos = current_state[:3]
+        end_pos = desired
+        seg_len = 0.15
+        diff = end_pos - start_pos
+        seg = diff / (np.linalg.norm(diff)+1e-8) * seg_len
+        if np.linalg.norm(end_pos-start_pos) > seg_len:
+            return seg
+        else:
+            return diff
+
+    def select_action(self, state, evaluate=False, desired_goal=None):
+        """选择动作"""
+        stateTensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        if evaluate:
+            # 评估时不添加噪声
+            with torch.no_grad():
+                mean, _ = self.actor(stateTensor)
+                # 评估时希望表现稳定，因此直接使用均值（概率密度最大的点）.  tanh后把值映射到[-1,1]， 乘以max_action就 映射到环境动作空间
+                action = torch.tanh(mean) * self.actor.max_action
+                return action.detach().cpu().numpy()[0]
+        else:
+            if random.random() < self.epsilon:
+                action = self.get_g_from_expert(state, desired_goal)
+                return action
+            else:
+                # 训练时采样动作
+                action, _ = self.actor.sample(stateTensor)
+                return action.detach().cpu().numpy()[0]
+```
+
+结果没有什么改善。
