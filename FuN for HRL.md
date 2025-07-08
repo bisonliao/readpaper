@@ -116,7 +116,420 @@ Baseline
 
 #### MountainCar
 
-先来个简单的任务。
+以为是个简单的任务，结果发现不是这样的，这个任务是每一步到奖励-1（包括即使是最后一步成功也是返回-1奖励），达到目的地就提前结束，或者最大200步的时候截断结束。
+
+##### SB3 PPO
+
+用默认的PPO超参数设置不能收敛，参考了SB3在hugging face上的预训练模型的参数，可以收敛到110步成功：
+
+![image-20250708130342227](img/image-20250708130342227.png)
+
+代码如下：
+
+```python
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+import gymnasium as gym
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor, DummyVecEnv
+
+class MountainCarSuccessReward(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        if terminated and obs[0] >= 0.5:
+            info['is_success'] = True
+            #reward = 1.0  # 成功回合最后一步奖励设为 1
+        else:
+            info['is_success'] = False
+            #reward = 0.0
+        return obs, reward, terminated, truncated, info
+
+global_render_mode=None
+
+def make_env(seed):
+    global  global_render_mode
+    def _init():
+        env = MountainCarSuccessReward(gym.make("MountainCar-v0", render_mode=global_render_mode))
+        env = Monitor(env)  # 单环境监控
+        env.reset(seed=seed)
+        return env
+    return _init
+
+if __name__ == '__main__':
+
+    n_envs = 16
+    env = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+    env = VecMonitor(env)  #
+    env = VecNormalize(env, norm_obs=True, norm_reward=False)  # 和 Hugging Face 模型一致
+
+    # 创建 agent
+    model = PPO("MlpPolicy", env, verbose=1, tensorboard_log='logs/',
+                learning_rate=3e-4,
+                n_steps=16,           # rollout 长度,出乎意料的短
+                batch_size=256,
+                n_epochs=4,
+                gamma=0.99,
+                gae_lambda=0.98,
+                clip_range=0.2,
+                ent_coef=0.00)
+    model.learn(total_timesteps=2_000_000)
+    env.save('./checkpoints/vec_normalize.pkl')
+    env.close()
+
+    global_render_mode = 'human'
+    env = DummyVecEnv([make_env(0)])
+
+    # === Step 3: 加载训练期间保存的 VecNormalize 参数 ===
+    # 假设你之前保存了 VecNormalize 到路径 './vec_normalize.pkl'
+    env = VecNormalize.load("./checkpoints/vec_normalize.pkl", env)
+
+    # === Step 4: 设置为评估模式，不再更新 running stats ===
+    env.training = False
+    env.norm_reward = False  # 根据需要关闭 reward normalization
+    env.norm_obs = True
+    obs = env.reset()
+    for _ in range(200):
+        action, _ = model.predict(obs)
+        obs, reward, done, info = env.step(action)
+```
+
+##### 手搓PPO
+
+可以收敛，
+
+1. 收敛的其中的关键是对obs进行归一化，也就是代码里的NormalizeWrapper。 ppo_epoch, entropy_coef等参数不是最关键的。我以为除以每个维度的最大值就可以实现归一化，试了发现没有效果，纠正了我一个认知错误。
+2. 对reward做reshape：成功返回1，其他情况都返回0，也可以收敛
+
+
+
+![image-20250708165010152](img/image-20250708165010152.png)
+
+```python
+import datetime
+
+import gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+from collections import deque
+import random
+import gymnasium as gym
+import numpy as np
+import pickle
+
+class NormalizeWrapper(gym.Wrapper):
+    def __init__(self, env, norm_obs=True, norm_reward=False, clip_obs=10.0, clip_reward=10.0, epsilon=1e-8):
+        super().__init__(env)
+        self.norm_obs = norm_obs
+        self.norm_reward = norm_reward
+        self.clip_obs = clip_obs
+        self.clip_reward = clip_reward
+        self.epsilon = epsilon
+
+        obs_shape = self.observation_space.shape
+        self.obs_rms_count = 0
+        self.obs_mean = np.zeros(obs_shape, dtype=np.float32)
+        self.obs_var = np.ones(obs_shape, dtype=np.float32)
+
+        self.ret_rms_count = 0
+        self.ret_mean = 0.0
+        self.ret_var = 1.0
+
+        self.ret = 0.0  # running return
+        self.training = True  # if False, stop updating statistics
+
+    def reset(self, **kwargs):
+        self.ret = 0.0
+        obs, info = self.env.reset(**kwargs)
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+
+        if self.norm_reward:
+            self.ret = self.ret * self.env.spec.reward_threshold + reward
+            self._update_ret_rms(self.ret)
+            reward = self._normalize_reward(reward)
+
+        if done:
+            self.ret = 0.0
+
+        return obs, reward, terminated, truncated, info
+
+    def _update_obs_rms(self, obs):
+        if not self.training:
+            return
+        self.obs_rms_count += 1
+        delta = obs - self.obs_mean
+        self.obs_mean += delta / self.obs_rms_count
+        self.obs_var += (obs - self.obs_mean) * delta
+
+    def _update_ret_rms(self, ret):
+        if not self.training:
+            return
+        self.ret_rms_count += 1
+        delta = ret - self.ret_mean
+        self.ret_mean += delta / self.ret_rms_count
+        self.ret_var += (ret - self.ret_mean) * delta
+
+    def _normalize_obs(self, obs):
+        std = np.sqrt(self.obs_var / (self.obs_rms_count + 1e-8)) + self.epsilon
+        obs_normalized = (obs - self.obs_mean) / std
+        return np.clip(obs_normalized, -self.clip_obs, self.clip_obs)
+
+    def _normalize_reward(self, reward):
+        std = np.sqrt(self.ret_var / (self.ret_rms_count + 1e-8)) + self.epsilon
+        reward_normalized = (reward - self.ret_mean) / std
+        return np.clip(reward_normalized, -self.clip_reward, self.clip_reward)
+
+    def save_stats(self, path):
+        data = {
+            "obs_mean": self.obs_mean,
+            "obs_var": self.obs_var,
+            "obs_rms_count": self.obs_rms_count,
+            "ret_mean": self.ret_mean,
+            "ret_var": self.ret_var,
+            "ret_rms_count": self.ret_rms_count
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+
+    def load_stats(self, path):
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        self.obs_mean = data["obs_mean"]
+        self.obs_var = data["obs_var"]
+        self.obs_rms_count = data["obs_rms_count"]
+        self.ret_mean = data["ret_mean"]
+        self.ret_var = data["ret_var"]
+        self.ret_rms_count = data["ret_rms_count"]
+
+# ============================ 超参数配置 ============================
+class Args:
+    env_id = "MountainCar-v0"
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    seed = 42
+
+    hidden_dim = 128
+    lr = 3e-4
+    gamma = 0.99
+    gae_lambda = 0.98
+    eps_clip = 0.20
+    entropy_coef = 0.01
+    vf_coef = 0.5
+    max_grad_norm = 0.5
+
+    rollout_steps = 1024 # 更快的更新
+    mini_batch_size = 256
+    ppo_epochs = 10
+
+    max_rollout_num = 2000
+    eval_every = 100
+    eval_episodes = 10
+
+
+    log_dir = f"./logs/ppo_mountaincar_{datetime.datetime.now().strftime('%m%d_%H%M%S')}"
+
+args = Args()
+writer = SummaryWriter(args.log_dir)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+
+# ============================ Actor-Critic 网络 ============================
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, action_dim):
+        super().__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(obs_dim, args.hidden_dim),
+            nn.Tanh(),
+        )
+        self.actor = nn.Sequential(
+            nn.Linear(args.hidden_dim, args.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(args.hidden_dim, action_dim),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(args.hidden_dim, args.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(args.hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        x = self.shared(x)
+        logits = self.actor(x)
+        value = self.critic(x)
+        return logits, value
+
+# ============================ PPO Agent 封装 ============================
+class PPOAgent:
+    def __init__(self, obs_dim, action_dim):
+        self.net = ActorCritic(obs_dim, action_dim).to(args.device)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr)
+
+    def get_action(self, obs):
+        obs = torch.tensor(obs, dtype=torch.float32).to(args.device)
+        logits, value = self.net(obs)
+        probs = torch.softmax(logits, dim=-1)
+        dist = Categorical(probs)
+        action = dist.sample()
+        return action.item(), dist.log_prob(action), dist.entropy(), value.squeeze()
+
+    def evaluate(self, obs, actions):
+        logits, values = self.net(obs)
+        probs = torch.softmax(logits, dim=-1)
+        dist = Categorical(probs)
+        log_probs = dist.log_prob(actions)
+        entropy = dist.entropy()
+        return log_probs, entropy, values.squeeze()
+
+# ============================ GAE Advantage 计算 ============================
+def compute_gae(rewards, values, dones, next_value):
+    advantages = []
+    gae = 0
+    values = values + [next_value]
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + args.gamma * values[t + 1] * (1 - dones[t]) - values[t]
+        gae = delta + args.gamma * args.gae_lambda * (1 - dones[t]) * gae
+        advantages.insert(0, gae)
+    returns = [adv + val for adv, val in zip(advantages, values[:-1])]
+    return advantages, returns
+
+# ============================ 评估函数 ============================
+def evaluate(agent, env):
+    total_rewards = []
+    success = 0
+    for _ in range(args.eval_episodes):
+        obs, _ = env.reset()
+        total = 0
+        for _ in range(200):
+            obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(args.device)
+            with torch.no_grad():
+                logits, _ = agent.net(obs_tensor)
+            action = torch.argmax(logits, dim=-1).item()
+            obs, reward, term, trunc, _ = env.step(action)
+            total += reward
+            if term or trunc:
+                break
+        total_rewards.append(total)
+        if obs[0] >= 0.5:
+            success += 1
+    return np.mean(total_rewards), success / args.eval_episodes
+
+# ============================ 主训练循环 ============================
+def train():
+    env = gym.make(args.env_id)
+    env = NormalizeWrapper(env)
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    agent = PPOAgent(obs_dim, action_dim)
+
+    obs, _ = env.reset()
+    rollout_num = 0
+    episode_num = 0
+    ep_reward = 0
+
+    while rollout_num < args.max_rollout_num:
+        # rollout buffer
+        obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf, ent_buf = [], [], [], [], [], [], []
+
+        for _ in range(args.rollout_steps):
+            action, logp, entropy, value = agent.get_action(obs)
+            next_obs, reward, term, trunc, _ = env.step(action)
+            ep_reward += reward
+
+            obs_buf.append(obs)
+            act_buf.append(action)
+            logp_buf.append(logp)
+            rew_buf.append(reward)
+            val_buf.append(value.item())
+            done_buf.append(term or trunc)
+            ent_buf.append(entropy.item())
+
+            obs = next_obs
+            if term or trunc:
+                obs, _ = env.reset()
+                episode_num += 1
+                writer.add_scalar("train/ep_reward", ep_reward, episode_num)
+                ep_reward = 0
+
+        rollout_num += 1
+
+        with torch.no_grad():
+            obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(args.device)
+            _, next_value = agent.net(obs_tensor)
+
+        advs, rets = compute_gae(rew_buf, val_buf, done_buf, next_value.item())
+        advs = torch.tensor(advs, dtype=torch.float32).to(args.device)
+        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+        rets = torch.tensor(rets, dtype=torch.float32).to(args.device)
+
+        obs_tensor = torch.tensor(obs_buf, dtype=torch.float32).to(args.device)
+        act_tensor = torch.tensor(act_buf, dtype=torch.int64).to(args.device)
+        old_logp_tensor = torch.stack(logp_buf).detach().to(args.device)
+
+        for _ in range(args.ppo_epochs):
+            idxs = np.arange(len(obs_buf))
+            np.random.shuffle(idxs)
+            for start in range(0, len(obs_buf), args.mini_batch_size):
+                end = start + args.mini_batch_size
+                mb_idx = idxs[start:end]
+
+                mb_obs = obs_tensor[mb_idx]
+                mb_act = act_tensor[mb_idx]
+                mb_adv = advs[mb_idx]
+                mb_ret = rets[mb_idx]
+                mb_old_logp = old_logp_tensor[mb_idx]
+
+                logp, entropy, value = agent.evaluate(mb_obs, mb_act)
+                ratio = torch.exp(logp - mb_old_logp)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - args.eps_clip, 1 + args.eps_clip) * mb_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = ((mb_ret - value) ** 2).mean()
+                entropy_bonus = entropy.mean()
+
+                loss = policy_loss + args.vf_coef * value_loss - args.entropy_coef * entropy_bonus
+
+                agent.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.net.parameters(), args.max_grad_norm)
+                agent.optimizer.step()
+
+        writer.add_scalar("train/loss_policy", policy_loss.item(), rollout_num)
+        writer.add_scalar("train/loss_value", value_loss.item(), rollout_num)
+        writer.add_scalar("train/entropy", np.mean(ent_buf), rollout_num)
+
+        if rollout_num % args.eval_every == 0:
+            avg_rew, success = evaluate(agent, env)
+            print(f"[Ep {rollout_num}] Eval Reward: {avg_rew:.2f} | Success Rate: {success:.1%}")
+            writer.add_scalar("eval/avg_reward", avg_rew, rollout_num)
+            writer.add_scalar("eval/success_rate", success, rollout_num)
+
+    env.close()
+    writer.close()
+
+# ============================ 程序入口 ============================
+if __name__ == "__main__":
+    train()
+```
+
+##### FuN HRL
 
 有一些成功的回合，但是效果明显不好：
 ![image-20250707183802175](img/image-20250707183802175.png)
