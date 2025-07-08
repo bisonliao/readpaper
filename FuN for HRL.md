@@ -537,6 +537,20 @@ if __name__ == "__main__":
 
 ##### FuN HRL
 
+这里的FuN实现，Manager和Worker都只用了朴素的REINFORCE算法。受限于REINFORCE算法本身的局限性（高方差不稳定、样本效率低等），训练的效果并不好。可能需要把PPO等算法更好的实践融汇进来，例如实现：
+
+1.  Manager 使用 TD-style 更新（带 value 网络）
+
+2.  Worker 使用 PPO（含 clipped surrogate objective）
+
+3.  内部结构保持感知模块共享
+
+4.  reward shaping 沿用可调的 intrinsic/extrinsic 模块
+
+5.  保留 GRU 结构，兼容 goal stacking
+
+   
+
 有一些成功的回合，但是效果明显不好：
 ![image-20250707183802175](img/image-20250707183802175.png)
 
@@ -553,6 +567,79 @@ import torch.nn.functional as F
 from collections import deque
 import random
 import time
+class NormalizeWrapper(gym.Wrapper):
+    def __init__(self, env, norm_obs=True, norm_reward=False, clip_obs=10.0, clip_reward=10.0, epsilon=1e-8):
+        super().__init__(env)
+        self.norm_obs = norm_obs
+        self.norm_reward = norm_reward
+        self.clip_obs = clip_obs
+        self.clip_reward = clip_reward
+        self.epsilon = epsilon
+
+        obs_shape = self.observation_space.shape
+        self.obs_rms_count = 0
+        self.obs_mean = np.zeros(obs_shape, dtype=np.float32)
+        self.obs_var = np.ones(obs_shape, dtype=np.float32)
+
+        self.ret_rms_count = 0
+        self.ret_mean = 0.0
+        self.ret_var = 1.0
+
+        self.ret = 0.0  # running return
+        self.training = True  # if False, stop updating statistics
+
+    def reset(self, **kwargs):
+        self.ret = 0.0
+        obs, info = self.env.reset(**kwargs)
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+
+        if self.norm_reward:
+            self.ret = self.ret * self.env.spec.reward_threshold + reward
+            self._update_ret_rms(self.ret)
+            reward = self._normalize_reward(reward)
+
+        if done:
+            self.ret = 0.0
+
+        return obs, reward, terminated, truncated, info
+
+    def _update_obs_rms(self, obs):
+        if not self.training:
+            return
+        self.obs_rms_count += 1
+        delta = obs - self.obs_mean
+        self.obs_mean += delta / self.obs_rms_count
+        self.obs_var += (obs - self.obs_mean) * delta
+
+    def _update_ret_rms(self, ret):
+        if not self.training:
+            return
+        self.ret_rms_count += 1
+        delta = ret - self.ret_mean
+        self.ret_mean += delta / self.ret_rms_count
+        self.ret_var += (ret - self.ret_mean) * delta
+
+    def _normalize_obs(self, obs):
+        std = np.sqrt(self.obs_var / (self.obs_rms_count + 1e-8)) + self.epsilon
+        obs_normalized = (obs - self.obs_mean) / std
+        return np.clip(obs_normalized, -self.clip_obs, self.clip_obs)
+
+    def _normalize_reward(self, reward):
+        std = np.sqrt(self.ret_var / (self.ret_rms_count + 1e-8)) + self.epsilon
+        reward_normalized = (reward - self.ret_mean) / std
+        return np.clip(reward_normalized, -self.clip_reward, self.clip_reward)
+
 
 # ===== Config and Device =====
 class Args:
@@ -563,7 +650,7 @@ class Args:
     dilated_interval = 10
     gamma_worker = 0.99
     gamma_manager = 0.99
-    intrinsic_reward_weight = 1.0
+    intrinsic_reward_weight = 100 #根据对内外returns的值的观察，得出这样一个weight，让他们两者的值在同一个量级
     lr_worker = 1e-3
     lr_manager = 5e-4
     eval_every = 50
@@ -576,11 +663,13 @@ class Args:
 
 writer = SummaryWriter(f"logs/MountainCar_FuN_{datetime.datetime.now().strftime('%m%d_%H%M%S')}")
 
+
 # ===== Utils =====
 def cosine_similarity(a, b):
     a_norm = F.normalize(a, dim=-1)
     b_norm = F.normalize(b, dim=-1)
     return torch.sum(a_norm * b_norm, dim=-1)
+
 
 def discount_rewards(rewards, gamma):
     R = 0
@@ -589,6 +678,7 @@ def discount_rewards(rewards, gamma):
         R = r + gamma * R
         returns.insert(0, R)
     return returns
+
 
 # ===== Modules =====
 class PerceptualModule(nn.Module):
@@ -602,6 +692,7 @@ class PerceptualModule(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
+
 class Manager(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -609,14 +700,14 @@ class Manager(nn.Module):
         self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
         self.goal_fc = nn.Linear(hidden_dim, hidden_dim)
 
-
     def forward(self, z, h):
         assert z.shape[0] == 1, "batch size should be 1 exactly."
-        s = F.relu( self.f_mspace(z) )
+        s = F.relu(self.f_mspace(z))
         h = self.rnn(s, h)
         g_hat = self.goal_fc(h)
         g = F.normalize(g_hat, dim=-1)
         return g, h, s
+
 
 class Worker(nn.Module):
     def __init__(self, hidden_dim, action_dim, embed_dim):
@@ -638,6 +729,7 @@ class Worker(nn.Module):
         probs = F.softmax(logits, dim=-1)
         return probs, h
 
+
 # ===== Agent =====
 class FuNAgent:
     def __init__(self, env):
@@ -649,7 +741,8 @@ class FuNAgent:
         self.worker = Worker(Args.hidden_dim, action_dim, Args.embed_dim).to(Args.device)
 
         self.optim_manager = optim.Adam(self.manager.parameters(), lr=Args.lr_manager)
-        self.optim_worker = optim.Adam(list(self.worker.parameters()) + list(self.percept.parameters()), lr=Args.lr_worker)
+        self.optim_worker = optim.Adam(list(self.worker.parameters()) + list(self.percept.parameters()),
+                                       lr=Args.lr_worker)
 
     # manager内部的前向传播已经完成，并把g保存到goal_stack了，
     # 也完成了obs到z的转换
@@ -686,15 +779,15 @@ class FuNAgent:
     def evaluate(self, env):
         rewards = []
         for _ in range(Args.eval_episodes):
-            obs,_ = env.reset()
+            obs, _ = env.reset()
             done = False
             total = 0
             step = 0
             h = torch.zeros(1, Args.hidden_dim).to(Args.device)
             dilated_h = torch.zeros(Args.dilated_interval, Args.hidden_dim).to(Args.device)
-            goal_stack = deque([torch.zeros(Args.hidden_dim).to(Args.device)] * Args.manager_interval, maxlen=Args.manager_interval)
+            goal_stack = deque([torch.zeros(Args.hidden_dim).to(Args.device)] * Args.manager_interval,
+                               maxlen=Args.manager_interval)
             while not done:
-                
                 with torch.no_grad():
                     obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(Args.device)
                     z = self.percept(obs_tensor)
@@ -716,22 +809,25 @@ class FuNAgent:
             rewards.append(total)
         return np.mean(rewards)
 
+
 # ===== Main Training Loop =====
 def train():
     env = gym.make(Args.env_id)
+    env = NormalizeWrapper(env)
     torch.manual_seed(Args.seed)
     np.random.seed(Args.seed)
     random.seed(Args.seed)
     agent = FuNAgent(env)
 
     for episode in range(Args.max_episodes):
-        obs,_ = env.reset()
+        obs, _ = env.reset()
         h = torch.zeros(1, Args.hidden_dim).to(Args.device)
         dilated_h = torch.zeros(Args.dilated_interval, Args.hidden_dim).to(Args.device)
         done = False
         step = 0
         # last c goal smoothing window 滑动窗口
-        goal_stack = deque([torch.zeros(Args.hidden_dim).to(Args.device)] * Args.manager_interval, maxlen=Args.manager_interval)
+        goal_stack = deque([torch.zeros(Args.hidden_dim).to(Args.device)] * Args.manager_interval,
+                           maxlen=Args.manager_interval)
 
         s_list, g_list, r_list = [], [], []
         log_probs = []
@@ -739,14 +835,13 @@ def train():
 
         while not done and step < Args.max_steps:
 
-
             # f_percept前向传播
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(Args.device)
             z = agent.percept(obs_tensor)
 
             # manager内部的前向传播
-            h_M = dilated_h[step%Args.dilated_interval]
-            g, h_M, st = agent.manager(z.detach(), h_M.unsqueeze(0)) # z前面的梯度不归manager管，所以用detach截断
+            h_M = dilated_h[step % Args.dilated_interval]
+            g, h_M, st = agent.manager(z.detach(), h_M.unsqueeze(0))  # z前面的梯度不归manager管，所以用detach截断
             g = g.squeeze(0)
             h_M = h_M.squeeze(0)
             st = st.squeeze(0)
@@ -799,7 +894,7 @@ def train():
         worker_loss = agent.compute_worker_loss(log_probs, worker_returns)
 
         agent.optim_worker.zero_grad()
-        worker_loss.backward(retain_graph=True)
+        worker_loss.backward()
         agent.optim_worker.step()
 
         #######################################################
@@ -827,6 +922,7 @@ def train():
 
     env.close()
     writer.close()
+
 
 if __name__ == "__main__":
     train()
