@@ -38,6 +38,22 @@ FRL 的一些关键思想包括：目标可以**自上而下地生成**，并且
 
 ![image-20250706200806435](img/image-20250706200806435.png)
 
+#### 算法理解
+
+##### 任务类型
+
+连续动作空间 / 离散动作空间？ on-policy / off-policy ?
+
+![image-20250707112937689](img/image-20250707112937689.png)
+
+##### g 的可解释性
+
+![image-20250707114406186](img/image-20250707114406186.png)
+
+##### 内部奖励的计算方法
+
+![image-20250707115325352](img/image-20250707115325352.png)
+
 #### 3.1 Goal Embedding
 
 Goal的嵌入编码维度 k 远低于 内部表示的维度 d
@@ -49,3 +65,352 @@ Goal的嵌入编码维度 k 远低于 内部表示的维度 d
 #### 3.3 Transition Policy Gradients
 
 ![image-20250706204126397](img/image-20250706204126397.png)
+
+### 4、Architecture details
+
+1. f_percept 由 CNN + FCN 构成，每一层都跟了非线性层
+2. f_Mspace 是FCN构成，每一层都跟了非线性层
+3. 为了鼓励探索，Manager每一步都有小的概率 ε 产生一个随机的goal，这个goal从高斯分布中采样
+4. f_Wrnn是一个标准的LSTM网络
+5. f_Mrnn是一个扩展的LSTM网络，延迟更新隐藏层，这两个rnn网络的隐藏层的维度是256
+6. 在本论文的实验里，r和c都被设置为10
+
+#### 4.1 dilated LSTM
+
+![image-20250707094435962](img/image-20250707094435962.png)
+
+### 5、Experiments
+
+Baseline
+
+1. Our main baseline is a recurrent LSTM network on top of a representation learned by a CNN. 
+2. It was demonstrated to perform very well on a suite of reinforcement learning problem. 
+3. LSTM uses 316 hidden units and its inputs are the feature representation of an observation and the previous action of the agent. 
+4. Action probabilities and the value function estimate are regressed from its hidden state. 
+5. All the methods the same CNN architecture, input pre-processing, and an action repeat of 4. 这句的意思是：
+   1. 实验中所有的方法，用了相同的CNN网络结构和输入预处理方法（通道数、是否归一化、堆叠帧）
+   2. 动作重复四次，这个是atari任务中常见的处理技巧，这样可以减少决策频率、加快训练速度，同时也能平滑动作效果。
+6. We use the A3C method (Mnih et al.,2016) for all reinforcement learning experiments. 
+
+补充一下RL中使用LSTM的知识：
+
+![image-20250707101655591](img/image-20250707101655591.png)
+
+实验效果（之一）：
+
+![image-20250707102003583](img/image-20250707102003583.png)
+
+### 6、Discussion and future work
+
+训练agent 让它学会把自己的行为解构为有语义的原语并加以复用、组合成新的行为并解决问题，是一个长期的研究过程。
+
+本论文提出的FuN HRL方法：
+
+1. 把sub goal定义为隐藏的状态空间中的变化方向，是一种有意义的原语。
+2. 把发现和设定方向的模块与执行原子动作的模块分开，形成了一种自然稳定且相互补充的层次式RL架构
+3. 实验显示我们的方法在长时间轴上的归因（credit assignment）和记忆更好驾驭
+
+这个工作为未来进一步的研究带来了很多好处，例如更深的层次架构，以应对更复杂的低奖励和部分观测的环境
+
+### 7、Bison的实验
+
+#### MountainCar
+
+先来个简单的任务。
+
+有一些成功的回合，但是效果明显不好：
+![image-20250707183802175](img/image-20250707183802175.png)
+
+```python
+import datetime
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
+from collections import deque
+import random
+import time
+
+# ===== Config and Device =====
+class Args:
+    env_id = 'MountainCar-v0'
+    max_episodes = 2000
+    max_steps = 200
+    manager_interval = 10  # c in the paper
+    dilated_interval = 10
+    gamma_worker = 0.99
+    gamma_manager = 0.99
+    intrinsic_reward_weight = 1.0
+    lr_worker = 1e-3
+    lr_manager = 5e-4
+    eval_every = 50
+    eval_episodes = 5
+    hidden_dim = 128
+    embed_dim = 16
+    seed = 42
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+
+writer = SummaryWriter(f"logs/MountainCar_FuN_{datetime.datetime.now().strftime('%m%d_%H%M%S')}")
+
+# ===== Utils =====
+def cosine_similarity(a, b):
+    a_norm = F.normalize(a, dim=-1)
+    b_norm = F.normalize(b, dim=-1)
+    return torch.sum(a_norm * b_norm, dim=-1)
+
+def discount_rewards(rewards, gamma):
+    R = 0
+    returns = []
+    for r in reversed(rewards):
+        R = r + gamma * R
+        returns.insert(0, R)
+    return returns
+
+# ===== Modules =====
+class PerceptualModule(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+class Manager(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.f_mspace = nn.Linear(hidden_dim, hidden_dim)
+        self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
+        self.goal_fc = nn.Linear(hidden_dim, hidden_dim)
+
+
+    def forward(self, z, h):
+        assert z.shape[0] == 1, "batch size should be 1 exactly."
+        s = F.relu( self.f_mspace(z) )
+        h = self.rnn(s, h)
+        g_hat = self.goal_fc(h)
+        g = F.normalize(g_hat, dim=-1)
+        return g, h, s
+
+class Worker(nn.Module):
+    def __init__(self, hidden_dim, action_dim, embed_dim):
+        super().__init__()
+        self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
+        self.embed = nn.Linear(hidden_dim, embed_dim, bias=False)
+        self.U = nn.Linear(hidden_dim, action_dim * embed_dim, bias=False)
+        self.action_dim = action_dim
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+
+    def forward(self, z, h, goal_stack):
+        assert z.shape[0] == 1, "batch size should be 1 exactly."
+        h = self.rnn(z, h)
+        g_sum = torch.sum(goal_stack, dim=0)
+        w = self.embed(g_sum)
+        U_out = self.U(h).view(self.action_dim, self.embed_dim)
+        logits = torch.matmul(U_out, w)
+        probs = F.softmax(logits, dim=-1)
+        return probs, h
+
+# ===== Agent =====
+class FuNAgent:
+    def __init__(self, env):
+        obs_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.n
+
+        self.percept = PerceptualModule(obs_dim, Args.hidden_dim).to(Args.device)
+        self.manager = Manager(Args.hidden_dim).to(Args.device)
+        self.worker = Worker(Args.hidden_dim, action_dim, Args.embed_dim).to(Args.device)
+
+        self.optim_manager = optim.Adam(self.manager.parameters(), lr=Args.lr_manager)
+        self.optim_worker = optim.Adam(list(self.worker.parameters()) + list(self.percept.parameters()), lr=Args.lr_worker)
+
+    # manager内部的前向传播已经完成，并把g保存到goal_stack了，
+    # 也完成了obs到z的转换
+    def select_action(self, z, h_worker, goal_stack):
+        probs, h_new = self.worker(z, h_worker, goal_stack)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        return action.item(), dist.log_prob(action), h_new
+
+    def compute_manager_loss(self, s_list, g_list, R_list):
+        losses = []
+        for t in range(len(g_list)):
+            if t + Args.manager_interval >= len(s_list):
+                continue
+            st = s_list[t]
+            st_c = s_list[t + Args.manager_interval]
+            gt = g_list[t]
+            cos_sim = cosine_similarity(st_c - st, gt)
+            advantage = R_list[t]  # using REINFORCE style, baseline omitted
+            losses.append(-advantage * cos_sim)
+        return torch.stack(losses).mean()
+
+    def compute_worker_loss(self, log_probs, advantages):
+        log_probs = torch.stack(log_probs)
+        return -(log_probs * advantages).mean()
+
+    def reshape_external_reward(self, reward):
+        '''if reward == -1:
+            reward = 0
+        else:
+            reward = 1'''
+        return reward
+
+    def evaluate(self, env):
+        rewards = []
+        for _ in range(Args.eval_episodes):
+            obs,_ = env.reset()
+            done = False
+            total = 0
+            step = 0
+            h = torch.zeros(1, Args.hidden_dim).to(Args.device)
+            dilated_h = torch.zeros(Args.dilated_interval, Args.hidden_dim).to(Args.device)
+            goal_stack = deque([torch.zeros(Args.hidden_dim).to(Args.device)] * Args.manager_interval, maxlen=Args.manager_interval)
+            while not done:
+                
+                with torch.no_grad():
+                    obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(Args.device)
+                    z = self.percept(obs_tensor)
+
+                    h_M = dilated_h[step % Args.dilated_interval]
+                    g, h_M, st = self.manager(z, h_M.unsqueeze(0))
+                    g = g.squeeze(0)
+                    h_M = h_M.squeeze(0)
+                    st = st.squeeze(0)
+                    dilated_h[step % Args.dilated_interval] = h_M
+
+                    goal_stack.append(g.detach().clone())
+                    action, _, h = self.select_action(z, h, torch.stack(list(goal_stack)))
+                obs, reward, term, trunc, _ = env.step(action)
+                reward = self.reshape_external_reward(reward)
+                done = term or trunc
+                step += 1
+                total += reward
+            rewards.append(total)
+        return np.mean(rewards)
+
+# ===== Main Training Loop =====
+def train():
+    env = gym.make(Args.env_id)
+    torch.manual_seed(Args.seed)
+    np.random.seed(Args.seed)
+    random.seed(Args.seed)
+    agent = FuNAgent(env)
+
+    for episode in range(Args.max_episodes):
+        obs,_ = env.reset()
+        h = torch.zeros(1, Args.hidden_dim).to(Args.device)
+        dilated_h = torch.zeros(Args.dilated_interval, Args.hidden_dim).to(Args.device)
+        done = False
+        step = 0
+        # last c goal smoothing window 滑动窗口
+        goal_stack = deque([torch.zeros(Args.hidden_dim).to(Args.device)] * Args.manager_interval, maxlen=Args.manager_interval)
+
+        s_list, g_list, r_list = [], [], []
+        log_probs = []
+        intrinsic_rewards = []
+
+        while not done and step < Args.max_steps:
+
+
+            # f_percept前向传播
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(Args.device)
+            z = agent.percept(obs_tensor)
+
+            # manager内部的前向传播
+            h_M = dilated_h[step%Args.dilated_interval]
+            g, h_M, st = agent.manager(z.detach(), h_M.unsqueeze(0)) # z前面的梯度不归manager管，所以用detach截断
+            g = g.squeeze(0)
+            h_M = h_M.squeeze(0)
+            st = st.squeeze(0)
+            # 为了避免破坏梯度计算图，复制一份dilated_h用于更新
+            new_dilated_h = dilated_h.clone()
+            new_dilated_h[step % Args.dilated_interval] = h_M
+            dilated_h = new_dilated_h
+
+            goal_stack.append(g.detach().clone())
+
+            action, log_prob, h = agent.select_action(z, h, torch.stack(list(goal_stack)))
+            next_obs, reward, term, trunc, _ = env.step(action)
+            reward = agent.reshape_external_reward(reward)
+            done = term or trunc
+
+            s_list.append(st)
+            g_list.append(g)
+            log_probs.append(log_prob)
+
+            # compute intrinsic reward
+            # 当前 step 是否已经超过 manager 的时间分辨率（c步）
+            if step >= Args.manager_interval:
+                # 取当前状态的嵌入向量 z（即 s_t），以及 c 步前的状态 s_{t-c}
+                # 再构造方向向量：s_t - s_{t-c}
+                direction = st - s_list[step - Args.manager_interval]
+
+                # 取 c 步前的目标向量 g_{t-c}
+                goal = g_list[step - Args.manager_interval]
+
+                # 计算这个方向向量与目标 g 之间的余弦相似度，作为“是否遵循目标方向”的指标
+                # cosine_similarity 越大，说明 Worker 的轨迹越符合 Manager 当时设定的目标方向
+                cos = cosine_similarity(direction, goal)
+            else:
+                # 前期步数不足，无法计算方向和目标之间的一致性，所以设为0
+                cos = torch.tensor(0.0).to(Args.device)
+            intrinsic_rewards.append(cos.item())
+            r_list.append(reward)
+
+            obs = next_obs
+            step += 1
+        #######################################################
+        # 更新worker
+        # worker 的 Advantage来自外部奖励和内部奖励, loss= -A*log_prob
+        ext_returns = discount_rewards(r_list, Args.gamma_worker)
+        int_returns = discount_rewards(intrinsic_rewards, Args.gamma_worker)
+        worker_returns = [er + Args.intrinsic_reward_weight * ir for er, ir in zip(ext_returns, int_returns)]
+        # 归一化
+        worker_returns = torch.FloatTensor(worker_returns).to(Args.device)
+        worker_returns = (worker_returns - worker_returns.mean()) / (worker_returns.std() + 1e-8)
+        worker_loss = agent.compute_worker_loss(log_probs, worker_returns)
+
+        agent.optim_worker.zero_grad()
+        worker_loss.backward(retain_graph=True)
+        agent.optim_worker.step()
+
+        #######################################################
+        # 更新manager
+        # manager 的 Advantage来自外部奖励， loss = - cos() * A
+        manager_returns = discount_rewards(r_list, Args.gamma_manager)
+        manager_returns = torch.FloatTensor(manager_returns).to(Args.device)
+        manager_returns = (manager_returns - manager_returns.mean()) / (manager_returns.std() + 1e-8)
+        manager_loss = agent.compute_manager_loss(s_list, g_list, manager_returns)
+
+        agent.optim_manager.zero_grad()
+        manager_loss.backward()
+        agent.optim_manager.step()
+
+        writer.add_scalar("train/loss_manager", manager_loss.item(), episode)
+        writer.add_scalar("train/loss_worker", worker_loss.item(), episode)
+        writer.add_scalar("train/episode_total_reward", sum(r_list), episode)
+        writer.add_scalar("train/intrinsic_rew_mean", np.mean(intrinsic_rewards), episode)
+        writer.add_scalar("train/episode_len", step, episode)
+
+        if episode % Args.eval_every == 0:
+            avg_reward = agent.evaluate(env)
+            print(f"[Episode {episode}] Eval reward: {avg_reward}")
+            writer.add_scalar("eval/avg_reward", avg_reward, episode)
+
+    env.close()
+    writer.close()
+
+if __name__ == "__main__":
+    train()
+
+```
+
