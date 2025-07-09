@@ -540,14 +540,14 @@ if __name__ == "__main__":
 这里的FuN实现，Manager和Worker都只用了朴素的REINFORCE算法。受限于REINFORCE算法本身的局限性（高方差不稳定、样本效率低等），训练的效果并不好。可能需要把PPO等算法更好的实践融汇进来，例如实现：
 
 1.  Manager 使用 TD-style 更新（带 value 网络）
-
 2.  Worker 使用 PPO（含 clipped surrogate objective）
-
 3.  内部结构保持感知模块共享
-
 4.  reward shaping 沿用可调的 intrinsic/extrinsic 模块
-
 5.  保留 GRU 结构，兼容 goal stacking
+
+上面的修改让AI来做的话，还是很多漏洞，manager的实现我看不懂没法帮它review代码，这个事情先放一放，有些复杂。
+
+我想这也是FuN没有被SB3这样的库收录的原因，实现比较复杂且不好抽象。
 
    
 
