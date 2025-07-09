@@ -114,3 +114,18 @@
 | ------------------ | ------------------------------------------------------------ | -------------------------------- |
 | PPO+KL（RLHF基础） | Learning to Summarize with Human Feedback                    | https://arxiv.org/abs/2009.01325 |
 | DPO                | Direct Preference Optimization: Your Language Model is Secretly a Reward Model | https://arxiv.org/abs/2305.18290 |
+
+
+
+| 序号 | 论文标题                                                     | 作者 / 会议 / 年份              | 关键贡献                                                  |
+| ---- | ------------------------------------------------------------ | ------------------------------- | --------------------------------------------------------- |
+| 1    | Simple Statistical Gradient-Following Algorithms for Connectionist RL (REINFORCE) | Ronald J. Williams / ML / 1992  | 提出最早的策略梯度方法，为后续基于策略的方法奠定基础      |
+| 2    | Policy Gradient Methods for RL with Function Approximation(Actor-Critic) | Sutton et al. / NIPS / 2000     | 引入 baseline 减少梯度方差，提高策略梯度稳定性            |
+| 3    | Playing Atari with Deep Reinforcement Learning (DQN)         | Mnih et al. / arXiv / 2013      | 首次使用深度网络成功训练智能体玩 Atari 游戏，深度RL的起点 |
+| 4    | Trust Region Policy Optimization (TRPO)                      | Schulman et al. / ICML / 2015   | 提出收敛保障的策略优化方法，引入信赖域思想                |
+| 5    | Generalized Advantage Estimation (GAE)                       | Schulman et al. / arXiv / 2015  | 通过优势函数平滑估计，提高策略梯度方法的样本效率          |
+| 6    | Asynchronous Methods for Deep RL (A3C)                       | Mnih et al. / ICML / 2016       | 提出多线程并行学习策略，极大提升训练速度与稳定性          |
+| 7    | Proximal Policy Optimization Algorithms (PPO)                | Schulman et al. / arXiv / 2017  | 主流策略优化算法，兼顾稳定性与实现简洁性，应用最广泛      |
+| 8    | Soft Actor-Critic: Off-Policy Maximum Entropy RL             | Haarnoja et al. / ICML / 2018   | 最大熵策略框架，适用于连续动作空间，鲁棒且高效            |
+| 9    | FeUdal Networks for Hierarchical RL (FuN)                    | Vezhnevets et al. / ICML / 2017 | 提出 manager-worker 架构，引入基于方向的子目标表示        |
+| 10   | Unifying Count-Based Exploration and Intrinsic Motivation    | Bellemare et al. / NIPS / 2016  | 使用伪计数激励探索，解决稀疏奖励问题，促进主动学习        |
