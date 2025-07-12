@@ -31,6 +31,8 @@
 
 ### 3、Learning Options
 
+懵懵懂懂的，没有搞明白
+
 ![image-20250709145637007](img/image-20250709145637007.png)
 
 ### 4、Algorithms and Architecture
