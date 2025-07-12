@@ -139,9 +139,13 @@ while not done:
 
 ### 8、bison的实验
 
+论文作者提供了官方代码：
 
+```
+https://github.com/jeanharb/option_critic
+```
 
-AI帮我写的，还没有来得及调试。总觉得不那么踏实，太复杂了。下来还要加上对obs的normalize，拷贝FuN笔记里的代码就好
+AI帮我写代码如下：
 
 ```python
 import datetime
@@ -157,13 +161,87 @@ from torch.utils.tensorboard import SummaryWriter
 import random
 import time
 
+class NormalizeWrapper(gym.Wrapper):
+    def __init__(self, env, norm_obs=True, norm_reward=False, clip_obs=10.0, clip_reward=10.0, epsilon=1e-8):
+        super().__init__(env)
+        self.norm_obs = norm_obs
+        self.norm_reward = norm_reward
+        self.clip_obs = clip_obs
+        self.clip_reward = clip_reward
+        self.epsilon = epsilon
+
+        obs_shape = self.observation_space.shape
+        self.obs_rms_count = 0
+        self.obs_mean = np.zeros(obs_shape, dtype=np.float32)
+        self.obs_var = np.ones(obs_shape, dtype=np.float32)
+
+        self.ret_rms_count = 0
+        self.ret_mean = 0.0
+        self.ret_var = 1.0
+
+        self.ret = 0.0  # running return
+        self.training = True  # if False, stop updating statistics
+
+    def reset(self, **kwargs):
+        self.ret = 0.0
+        obs, info = self.env.reset(**kwargs)
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+
+        if self.norm_reward:
+            self.ret = self.ret * self.env.spec.reward_threshold + reward
+            self._update_ret_rms(self.ret)
+            reward = self._normalize_reward(reward)
+
+        if done:
+            self.ret = 0.0
+
+        return obs, reward, terminated, truncated, info
+
+    def _update_obs_rms(self, obs):
+        if not self.training:
+            return
+        self.obs_rms_count += 1
+        delta = obs - self.obs_mean
+        self.obs_mean += delta / self.obs_rms_count
+        self.obs_var += (obs - self.obs_mean) * delta
+
+    def _update_ret_rms(self, ret):
+        if not self.training:
+            return
+        self.ret_rms_count += 1
+        delta = ret - self.ret_mean
+        self.ret_mean += delta / self.ret_rms_count
+        self.ret_var += (ret - self.ret_mean) * delta
+
+    def _normalize_obs(self, obs):
+        std = np.sqrt(self.obs_var / (self.obs_rms_count + 1e-8)) + self.epsilon
+        obs_normalized = (obs - self.obs_mean) / std
+        return np.clip(obs_normalized, -self.clip_obs, self.clip_obs)
+
+    def _normalize_reward(self, reward):
+        std = np.sqrt(self.ret_var / (self.ret_rms_count + 1e-8)) + self.epsilon
+        reward_normalized = (reward - self.ret_mean) / std
+        return np.clip(reward_normalized, -self.clip_reward, self.clip_reward)
+
+
 # ==================== 超参数集中配置 ====================
 class Args:
     env_id = "MountainCar-v0"
     num_options = 4
     total_steps = 1_000_000
     update_freq = 2048
-    eval_interval = 100_000
+    eval_interval = 100
     max_ep_len = 200
     gamma = 0.99
     gae_lambda = 0.95
@@ -182,11 +260,15 @@ writer = SummaryWriter(f'logs/OptionCritic_MountainCar_{datetime.datetime.now().
 
 # ==================== 环境和种子 ====================
 env = gym.make(args.env_id)
+env = NormalizeWrapper(env)
 obs_dim = env.observation_space.shape[0]
 act_dim = env.action_space.n
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 random.seed(args.seed)
+
+eval_env = gym.make(args.env_id)
+eval_env = NormalizeWrapper(eval_env)
 
 # ==================== 模块定义 ====================
 class SharedEncoder(nn.Module):
@@ -221,13 +303,15 @@ class Termination(nn.Module):
     def forward(self, h):
         return self.net(h).squeeze(-1)
 
-class PolicyOverOptions(nn.Module):
-    def __init__(self, hidden_dim, num_options):
-        super().__init__()
-        self.head = nn.Linear(hidden_dim, num_options)
-    def forward(self, h):
-        return F.softmax(self.head(h), dim=-1)
+class EpsilonScheduler:
+    def __init__(self, start=1.0, end=0.1, decay_steps=Args.total_steps / 2):
+        self.start = start
+        self.end = end
+        self.decay_steps = decay_steps
 
+    def get(self, current_step):
+        epsilon = self.start - (self.start - self.end) * min(1.0, current_step / self.decay_steps)
+        return epsilon
 # ==================== 存储器 ====================
 class TrajectoryBuffer:
     def __init__(self):
@@ -238,7 +322,7 @@ class TrajectoryBuffer:
     def get(self):
         return {k: torch.stack(v) for k, v in self.data.items()}
     def reset(self):
-        self.data = {k: [] for k in ['obs','action','option','logp','reward','value','done','terminate','mask','hidden','term_prob', 'hi_logp', 'hi_hidden','hi_option']}
+        self.data = {k: [] for k in ['obs','action','option','logp','reward','value','done','terminate','mask','hidden','term_prob']}
 
 
 # ==================== 主体结构 ====================
@@ -251,17 +335,26 @@ class OptionCriticAgent:
         self.terminations = nn.ModuleList([
             Termination(128).to(args.device) for _ in range(args.num_options)
         ])
-        self.pi_hi = PolicyOverOptions(128, args.num_options).to(args.device)
+
+        # 新增：Q(s, o) 网络，用于高层 option 策略（ε-greedy）
+        self.q_option_head = nn.Linear(128, args.num_options).to(args.device)
+        self.q_option_optim = torch.optim.Adam(list(self.encoder.parameters()) + list(self.q_option_head.parameters()),
+                                               lr=args.lr)
 
         self.optims = []
         for i in range(args.num_options):
-            self.optims.append(torch.optim.Adam(list(self.options[i].parameters()) + list(self.terminations[i].parameters()), lr=args.lr))
+            self.optims.append( torch.optim.Adam(list(self.options[i].parameters()) + list(self.terminations[i].parameters()), lr=args.lr))
 
-        self.pi_hi_optim = torch.optim.Adam(list(self.encoder.parameters())+list(self.pi_hi.parameters()), lr=args.lr)
+        self.epsilon_scheduler = EpsilonScheduler()
+        self.update_cnt = 0
 
     # 进行低层微观动作
     def act(self, obs, option:int, eval_mode=False):
-        obs = torch.tensor(obs, dtype=torch.float32).to(args.device)
+        if not hasattr(self, "act_cnt"):
+            self.act_cnt = 0  # 初始化
+        self.act_cnt += 1
+
+        obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(args.device)
         with torch.no_grad():
             h = self.encoder(obs)
             logits, value = self.options[option](h)
@@ -269,18 +362,28 @@ class OptionCriticAgent:
             action = dist.sample() if not eval_mode else dist.probs.argmax()
             logp = dist.log_prob(action)
             term_prob = self.terminations[option](h)
+
+        if self.act_cnt % 100 ==0:
+            writer.add_scalar('train/action', action.item(), self.act_cnt)
         return action.item(), logp, value.squeeze(), h.detach(), term_prob
 
     # 选择 option（高层策略 π_hi），返回 sampled option 和其 logp，用于 PG
-    def choose_option(self, obs, eval_mode=False):
-        obs = torch.tensor(obs, dtype=torch.float32).to(args.device)
+    def choose_option(self, obs, eval_mode=False, epsilon=0.1):
+        if not hasattr(self, "choose_option_cnt"):
+            self.choose_option_cnt = 0  # 初始化
+        self.choose_option_cnt += 1
+
+        obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(args.device)
         with torch.no_grad():
             h = self.encoder(obs)
-            probs = self.pi_hi(h)
-            dist = Categorical(probs)
-            option = dist.sample() if not eval_mode else dist.probs.argmax()
-            logp_hi = dist.log_prob(option)
-        return option.item(), logp_hi.item(), h.detach()  # 返回高层 logp 及 encoder 表征
+            q_o = self.q_option_head(h).squeeze(0)  # [num_options]
+            if eval_mode or random.random() > epsilon:
+                option = torch.argmax(q_o).item()
+            else:
+                option = random.randint(0, args.num_options - 1)
+        if self.choose_option_cnt % 100 == 0:
+            writer.add_scalar('train/choose_option', option, self.choose_option_cnt)
+        return option
 
     def compute_gae(self, buffer: TrajectoryBuffer, next_state: np.ndarray, option: int):
         data = buffer.get()
@@ -311,40 +414,50 @@ class OptionCriticAgent:
         return advantages.detach(), returns.detach()
 
     def update(self, buffer: TrajectoryBuffer, next_obs: np.ndarray, option: int):
-        data = buffer.get() #把所有rollout数据拿出来
+        data = buffer.get()
+        rewards = data['reward']
+        masks = data['mask']
+        done_flags = data['done'].float()
 
-        adv, ret = self.compute_gae( buffer, next_obs, option)
-
-        assert adv.shape[0] == data['obs'].shape[0], ""
-        # ============= π_hi Policy Gradient =============
-        # 使用起始状态对应的 high-level logp 和 encoder hidden，优化 π_hi
-        hi_logp = data['hi_logp']  # 每次 option 切换时记录的 logp_hi
-        hi_hidden = data['hi_hidden']  # 对应的 encoder 表征
-        hi_option = data['hi_option']  # 实际选择的 option
-
+        # ---------- Q(s, o) 目标估计 ----------
         with torch.no_grad():
-            hi_return = ret[data['terminate'].bool()]  # 仅对发生 option 切换的位置更新
-        if hi_logp.shape[0] > 0:  # 防止一轮未发生 option 切换
-            probs = self.pi_hi(hi_hidden)
-            dist = Categorical(probs)
-            logp_hi = dist.log_prob(hi_option)
-            entropy_hi = dist.entropy().mean()
-            pi_hi_loss = -torch.mean(logp_hi * hi_return- 0.01 * entropy_hi)  # 使用 return 权重 PG
-            self.pi_hi_optim.zero_grad()
-            pi_hi_loss.backward()
-            self.pi_hi_optim.step()
+            next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0).to(args.device)
+            h_next = self.encoder(next_obs_tensor)
+            q_next = self.q_option_head(h_next).squeeze(0)  # Q(s_{T+1}, ·)
+        q_targets = []
 
-        ############################# 更新 option相关参数 #################################
+        for t in range(len(rewards)):
+            o_t = data['option'][t]
+            beta_t1 = data['term_prob'][t+1] if t+1 < len(data['term_prob']) else torch.tensor(1.0).unsqueeze(0).to(args.device)
+            h_t1 = data['hidden'][t+1] if t+1 < len(data['hidden']) else h_next
+            q_next_all = self.q_option_head(h_t1).squeeze(0).detach()
+            q_next_max = q_next_all.max()
+
+            q_val = rewards[t] + args.gamma * (
+                (1 - beta_t1) * q_next_all[o_t] + beta_t1 * q_next_max
+            ) * masks[t]
+            q_targets.append(q_val)
+
+        q_targets = torch.stack(q_targets)
+        h_batch = data['hidden']
+        o_batch = data['option']
+        q_pred = self.q_option_head(h_batch)[range(len(o_batch)), o_batch]
+        loss_q = F.mse_loss(q_pred, q_targets.detach())
+        self.q_option_optim.zero_grad()
+        loss_q.backward()
+        self.q_option_optim.step()
+        writer.add_scalar('train/hi_q_loss', loss_q.item(), self.update_cnt)
+
+        # ---------- Option-level PPO 更新 ----------
+        adv, ret = self.compute_gae(buffer, next_obs, option)
+        loss_list = []
         for option_id in range(args.num_options):
-            idx = (data['option'][:-1] == option_id)  # 用于 t 时刻的 state-action
-            next_idx = (data['option'][1:] == option_id)  # 用于 t+1 时刻的 termination/value
+            idx = (data['option'][:-1] == option_id)
+            next_idx = (data['option'][1:] == option_id)
 
-            if idx.sum() == 0 and next_idx.sum() == 0: #如果数据里没有这个option的相关transition
+            if idx.sum() == 0 and next_idx.sum() == 0:
                 continue
 
-            # idx 变成了一个mask，用于把buffer里的属于 option_id的数据筛选出来
-
-            # 这里都只取 [0:-1]，最后一个时间步不取，是为了计算term_loss的错位需要
             obs = data['obs'][:-1][idx]
             action = data['action'][:-1][idx]
             logp_old = data['logp'][:-1][idx]
@@ -363,32 +476,59 @@ class OptionCriticAgent:
             v_loss = F.mse_loss(value.squeeze(), ret_opt)
             entropy = dist.entropy().mean()
 
-            beta = self.terminations[option_id](h)
-            term = data['terminate'][1:][next_idx].float() #错位，得到next_terminate
-            advantage_term = (data['value'][1:][next_idx] - data['value'][1:][next_idx].max()).detach() #错位，得到next_value
+            h_next = data['hidden'][1:][next_idx]  # 注意是 t+1 时刻的 hidden state
+            beta = self.terminations[option_id](h_next)
+            term = data['terminate'][1:][next_idx].float()
+            advantage_term = (data['value'][1:][next_idx] - data['value'][1:][next_idx].max()).detach()
             term_loss = -torch.mean(term * torch.log(beta + 1e-6) * advantage_term +
                                     (1 - term) * torch.log(1 - beta + 1e-6) * advantage_term)
 
             loss = pg_loss + args.vf_coef * v_loss - args.entropy_coef * entropy + args.term_reg * term_loss
+            loss_list.append(loss.item())
             self.optims[option_id].zero_grad()
             loss.backward()
             self.optims[option_id].step()
-
-        # 高层策略简单强化为概率策略，不使用 PG
+        writer.add_scalar('train/lo_loss_mean', np.mean(np.array(loss_list)), self.update_cnt)
         buffer.reset()
+        self.update_cnt += 1
+
+    def evaluate(self,  total_steps):
+        eval_reward = 0
+        eval_steps = 0
+        obs, _ = eval_env.reset()
+        option = self.choose_option(obs, eval_mode=True)
+
+        while eval_steps < args.max_ep_len:
+            action, _, _, _, term_prob = self.act(obs, option, eval_mode=True)
+            obs, reward, terminated, truncated, _ = eval_env.step(action)
+            done = terminated or truncated
+            eval_reward += reward
+            eval_steps += 1
+
+            should_terminate = torch.bernoulli(term_prob).bool()
+            if should_terminate and not done:
+                option = self.choose_option(obs, eval_mode=True)
+
+            if done:
+                break
+        writer.add_scalar("eval/episode_return", eval_reward, total_steps)
+
 
 # ==================== 主训练循环 ====================
 def train():
     agent = OptionCriticAgent()
     buffer = TrajectoryBuffer()
+    epsilon = agent.epsilon_scheduler.get(0)
     obs, _ = env.reset()
-    option, hi_logp, hi_h = agent.choose_option(obs)
+    option = agent.choose_option(obs, epsilon=epsilon)
     total_steps = 0
     ep_reward = 0
     episode = 0
     ep_return_list = []
 
     while total_steps < args.total_steps:
+        epsilon = agent.epsilon_scheduler.get(total_steps)
+        writer.add_scalar('train/epsilon', epsilon, total_steps)
         for _ in range(args.update_freq): #PPO Style，收集固定步数的transition
             action, logp, value, h, term_prob = agent.act(obs, option) #低层策略输出微观动作等
             next_obs, reward, terminated, truncated, _ = env.step(action) #与环境交互
@@ -399,23 +539,20 @@ def train():
 
             should_terminate = torch.bernoulli(term_prob).bool()
             if should_terminate and not done:
-                next_option, hi_logp, hi_h = agent.choose_option(next_obs)
+                next_option = agent.choose_option(next_obs, epsilon=epsilon)
 
             buffer.store(
-                obs=torch.tensor(obs, dtype=torch.float32),
-                action=torch.tensor(action),
-                logp=logp.detach(),
-                reward=torch.tensor(reward, dtype=torch.float32),
-                value=value.detach(),
-                done=torch.tensor(done),
-                option=torch.tensor(option),
-                terminate=torch.tensor(option != next_option),
-                mask=torch.tensor(mask),
-                hidden=h,
-                term_prob=term_prob.detach(),
-                hi_logp=torch.tensor(hi_logp),
-                hi_hidden=hi_h,
-                hi_option=torch.tensor(option),
+                obs=torch.tensor(obs, dtype=torch.float32).to(args.device),
+                action=torch.tensor(action).to(args.device),
+                logp=logp.detach().to(args.device),
+                reward=torch.tensor(reward, dtype=torch.float32).to(args.device),
+                value=value.detach().to(args.device),
+                done=torch.tensor(done).to(args.device),
+                option=torch.tensor(option).to(args.device),
+                terminate=torch.tensor(option != next_option).to(args.device),
+                mask=torch.tensor(mask).to(args.device),
+                hidden=h.squeeze(0).to(args.device),
+                term_prob=term_prob.detach().to(args.device),
             )
 
             obs = next_obs
@@ -428,25 +565,12 @@ def train():
                 ep_reward = 0
                 episode += 1
                 obs, _ = env.reset()
-                option, hi_logp, hi_h = agent.choose_option(obs)
+                option = agent.choose_option(obs, epsilon=epsilon)
 
         agent.update(buffer, obs, option)
 
-        if total_steps % args.eval_interval == 0:
-            eval_reward = 0
-            eval_steps = 0
-            obs, _ = env.reset()
-            option, _, _ = agent.choose_option(obs, eval_mode=True)
-
-            while eval_steps < args.max_ep_len:
-                action, _, _, _, _ = agent.act(obs, option, eval_mode=True)
-                obs, reward, terminated, truncated, _ = env.step(action)
-                eval_reward += reward
-                eval_steps += 1
-                if terminated or truncated:
-                    break
-
-            writer.add_scalar("eval/episode_return", eval_reward, total_steps)
+        if agent.update_cnt % args.eval_interval == 0:
+            agent.evaluate(total_steps)
 
     writer.close()
 
