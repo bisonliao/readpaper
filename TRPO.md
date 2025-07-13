@@ -367,7 +367,7 @@ class TRPOAgent:
 
         shs = 0.5 * (step_direction @ self.hessian_vector_product(obs, act, old_logp, adv, step_direction))
         step_size = torch.sqrt(args.max_kl / (shs + 1e-8))
-        step_size = torch.clamp(step_size, max=1.0)  # 或者更稳健的 0.5
+        #step_size = torch.clamp(step_size, max=1.0)  # 或者更稳健的 0.5
 
         full_step = step_size * step_direction
         old_params = self.flat_params()
@@ -452,7 +452,9 @@ if __name__ == "__main__":
 
 ##### 手搓多环境并行
 
-不收敛，百思不得其解
+不稳定，不能超过100个epoch，后面会恶化...
+
+![image-20250713193610947](img/image-20250713193610947.png)
 
 ```python
 import datetime
@@ -482,7 +484,7 @@ class Args:
     max_kl = 0.01
     damping = 0.1               # For Fisher matrix regularization
     lr_value = 1e-3
-    epochs = 400
+    epochs = 1000
     steps_per_epoch = 500
     eval_interval = 10
     cuda = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -497,6 +499,7 @@ args = Args()
 def make_env(seed, index):
     def _init():
         env = gym.make(args.env_name) #max_episode_steps这样修改没有用，内部还是500步最大，需要继续研究
+        env.reset(seed=seed+index)
         #env = NormalizeWrapper(env)
         return env
     return _init
@@ -563,7 +566,7 @@ class TrajectoryBuffer:
 
 
     def compute_advantages(self, gamma, lam, last_value):
-        # 一次计算1个环境的adv/returns，并把他们拉平，包括obs  act logp都要拉平
+        # 一次计算n个环境的adv/returns，并把他们拉平，包括obs  act logp都要拉平
         all_adv = []
         all_ret = []
 
@@ -592,6 +595,79 @@ class TrajectoryBuffer:
 
     def clear(self):
         self.__init__()
+
+class NormalizeWrapper(gym.Wrapper):
+    def __init__(self, env, norm_obs=True, norm_reward=False, clip_obs=10.0, clip_reward=10.0, epsilon=1e-8):
+        super().__init__(env)
+        self.norm_obs = norm_obs
+        self.norm_reward = norm_reward
+        self.clip_obs = clip_obs
+        self.clip_reward = clip_reward
+        self.epsilon = epsilon
+
+        obs_shape = self.observation_space.shape
+        self.obs_rms_count = 0
+        self.obs_mean = np.zeros(obs_shape, dtype=np.float32)
+        self.obs_var = np.ones(obs_shape, dtype=np.float32)
+
+        self.ret_rms_count = 0
+        self.ret_mean = 0.0
+        self.ret_var = 1.0
+
+        self.ret = 0.0  # running return
+        self.training = True  # if False, stop updating statistics
+
+    def reset(self, **kwargs):
+        self.ret = 0.0
+        obs, info = self.env.reset(**kwargs)
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+
+        if self.norm_obs:
+            self._update_obs_rms(obs)
+            obs = self._normalize_obs(obs)
+
+        if self.norm_reward:
+            self.ret = self.ret * self.env.spec.reward_threshold + reward
+            self._update_ret_rms(self.ret)
+            reward = self._normalize_reward(reward)
+
+        if done:
+            self.ret = 0.0
+
+        return obs, reward, terminated, truncated, info
+
+    def _update_obs_rms(self, obs):
+        if not self.training:
+            return
+        self.obs_rms_count += 1
+        delta = obs - self.obs_mean
+        self.obs_mean += delta / self.obs_rms_count
+        self.obs_var += (obs - self.obs_mean) * delta
+
+    def _update_ret_rms(self, ret):
+        if not self.training:
+            return
+        self.ret_rms_count += 1
+        delta = ret - self.ret_mean
+        self.ret_mean += delta / self.ret_rms_count
+        self.ret_var += (ret - self.ret_mean) * delta
+
+    def _normalize_obs(self, obs):
+        std = np.sqrt(self.obs_var / (self.obs_rms_count + 1e-8)) + self.epsilon
+        obs_normalized = (obs - self.obs_mean) / std
+        return np.clip(obs_normalized, -self.clip_obs, self.clip_obs)
+
+    def _normalize_reward(self, reward):
+        std = np.sqrt(self.ret_var / (self.ret_rms_count + 1e-8)) + self.epsilon
+        reward_normalized = (reward - self.ret_mean) / std
+        return np.clip(reward_normalized, -self.clip_reward, self.clip_reward)
 
 # ============================
 # 主 TRPO 算法逻辑
@@ -628,7 +704,7 @@ class TRPOAgent:
         return act.cpu().numpy(), val, logp
 
     def collect_trajectories(self):
-        obs = self.env.reset() # (n_envs, 2)
+        obs = self.env.reset()  # (n_envs, 2)
         for _ in range(args.steps_per_epoch):
             act, val, logp = self.run_one_step(obs)
             next_obs, rew, done, info = self.env.step(act)
@@ -800,7 +876,7 @@ class TRPOAgent:
 # ============================
 
 def main():
-    env_fns = [make_env(seed=i, index=i) for i in range(args.n_envs)]
+    env_fns = [make_env(seed=args.seed, index=i) for i in range(args.n_envs)]
     envs = SubprocVecEnv(env_fns)
     envs = VecNormalize(envs, norm_obs=True, norm_reward=False)
 
@@ -814,12 +890,10 @@ def main():
 
     for epoch in range(args.epochs):
         t0 = time.time()
-        last_obs = agent.collect_trajectories()
+        last_obs = agent.collect_trajectories() # 因为一次收集500步，只有2个完整的回合和一个不完整的回合，所以我尝试让obs
         obs, act, ret, adv, old_logp = agent.estimate_adv_and_return(last_obs)
         value_loss = agent.update_value_function(obs, ret) #居然没有分mini-batch
         agent.writer.add_scalar("train/Loss_value", value_loss, epoch)
-
-
         agent.update_policy(obs, act, adv, old_logp)
 
         if (epoch+1) % args.eval_interval == 0:
@@ -833,4 +907,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 ```
+
+##### 关于rollout长度的思考
+
+![image-20250713212202990](img/image-20250713212202990.png)
