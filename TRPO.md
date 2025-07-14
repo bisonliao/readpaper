@@ -26,6 +26,8 @@ TRPO的优势：
 
 ![image-20250713085124051](img/image-20250713085124051.png)
 
+![image-20250714082001604](img/image-20250714082001604.png)
+
 ### 8、Expertiments
 
 ![image-20250713092836411](img/image-20250713092836411.png)
@@ -596,78 +598,6 @@ class TrajectoryBuffer:
     def clear(self):
         self.__init__()
 
-class NormalizeWrapper(gym.Wrapper):
-    def __init__(self, env, norm_obs=True, norm_reward=False, clip_obs=10.0, clip_reward=10.0, epsilon=1e-8):
-        super().__init__(env)
-        self.norm_obs = norm_obs
-        self.norm_reward = norm_reward
-        self.clip_obs = clip_obs
-        self.clip_reward = clip_reward
-        self.epsilon = epsilon
-
-        obs_shape = self.observation_space.shape
-        self.obs_rms_count = 0
-        self.obs_mean = np.zeros(obs_shape, dtype=np.float32)
-        self.obs_var = np.ones(obs_shape, dtype=np.float32)
-
-        self.ret_rms_count = 0
-        self.ret_mean = 0.0
-        self.ret_var = 1.0
-
-        self.ret = 0.0  # running return
-        self.training = True  # if False, stop updating statistics
-
-    def reset(self, **kwargs):
-        self.ret = 0.0
-        obs, info = self.env.reset(**kwargs)
-        if self.norm_obs:
-            self._update_obs_rms(obs)
-            obs = self._normalize_obs(obs)
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        done = terminated or truncated
-
-        if self.norm_obs:
-            self._update_obs_rms(obs)
-            obs = self._normalize_obs(obs)
-
-        if self.norm_reward:
-            self.ret = self.ret * self.env.spec.reward_threshold + reward
-            self._update_ret_rms(self.ret)
-            reward = self._normalize_reward(reward)
-
-        if done:
-            self.ret = 0.0
-
-        return obs, reward, terminated, truncated, info
-
-    def _update_obs_rms(self, obs):
-        if not self.training:
-            return
-        self.obs_rms_count += 1
-        delta = obs - self.obs_mean
-        self.obs_mean += delta / self.obs_rms_count
-        self.obs_var += (obs - self.obs_mean) * delta
-
-    def _update_ret_rms(self, ret):
-        if not self.training:
-            return
-        self.ret_rms_count += 1
-        delta = ret - self.ret_mean
-        self.ret_mean += delta / self.ret_rms_count
-        self.ret_var += (ret - self.ret_mean) * delta
-
-    def _normalize_obs(self, obs):
-        std = np.sqrt(self.obs_var / (self.obs_rms_count + 1e-8)) + self.epsilon
-        obs_normalized = (obs - self.obs_mean) / std
-        return np.clip(obs_normalized, -self.clip_obs, self.clip_obs)
-
-    def _normalize_reward(self, reward):
-        std = np.sqrt(self.ret_var / (self.ret_rms_count + 1e-8)) + self.epsilon
-        reward_normalized = (reward - self.ret_mean) / std
-        return np.clip(reward_normalized, -self.clip_reward, self.clip_reward)
 
 # ============================
 # 主 TRPO 算法逻辑
@@ -913,3 +843,39 @@ if __name__ == "__main__":
 ##### 关于rollout长度的思考
 
 ![image-20250713212202990](img/image-20250713212202990.png)
+
+##### rl_sb3_zoo的实现
+
+在当前虚拟环境安装好rl_sb3_zoo后，执行下面的语句，收敛非常快。相比之下，上面手搓的代码是一坨 shit
+
+```
+python .\train.py --algo trpo --env MountainCar-v0 --eval-freq 10000 --eval-episodes 10 --n-eval-envs 4
+```
+
+![image-20250714090649493](img/image-20250714090649493.png)
+
+也可以写代码调用rl_sb3_zoo的库：
+
+```python
+from sb3_contrib import TRPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import VecNormalize
+
+# 创建向量化环境
+env_id = "MountainCar-v0"
+env = make_vec_env(env_id, n_envs=8, seed=42)
+env = VecNormalize(env)
+
+# 创建 TRPO 模型
+model = TRPO("MlpPolicy", env, verbose=1, tensorboard_log='logs')
+
+# 开始训练
+model.learn(total_timesteps=500_000)
+
+# 保存模型
+model.save("trpo_mountaincar_v0")
+```
+
+收敛效果很好：
+
+![image-20250714101758640](img/image-20250714101758640.png)

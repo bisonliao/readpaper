@@ -20,6 +20,7 @@
 | PPG       | 离散 / 连续         | on                   | 基于actor-critic架构，actor和critic两部分之间不共享特征提取的CNN或者MLP。actor自带一个辅助的价值头 | 解耦了Actor-Critic更新的时候相互影响，更加稳定；且在辅助阶段可以更充分的利用样本，所以有更高的样本效率。 | PPG的actor和critic两部分之间不共享特征提取的CNN或者MLP：  第一部分：Policy网络（带了一个辅助价值头），可以认为就是一个标准的Actor-Critic网络 第二部分：独立的Critic网络 <br />训练分两阶段：  第一阶段，Policy Phase，用GAE方法分别训练Policy网络和Critic网络 第二阶段，Auxiliary Phase，专门训练Policy网络里的 auxiliary value head和特征提取部分。 | 动作概率抽样 / 熵正则化 |
 | HER       | 连续                | off                  | HER是附加套件，通过修改ReplayBuffer进行relabel。可以和任何使用ReplayBuffer的off-policy算法搭配 | 对于奖励稀疏的场景有明显提升                                 | 通常的off-policy方法是训练在确定目标g 下的策略 Pi(state) --> action，而对于HER训练的策略，输入参数不只有state，还有目标g'，也就是HER训练策略 Pi(state, g')-->action，通过深度神经网络的泛化能力，策略网络能学会不同目标下的行为映射。训练收敛后，输入desired goal的时候，策略网络能够指挥agent执行正确的动作，到达desired goal | 取决于基础算法          |
 | QDagger   | 离散/连续           | off                  | 取决于基础算法                                               | 重生强化学习，尽量利用已经训练的网络参数或者已经收集的环境交互数据，来加速训练 | 通过蒸馏teacher模型（例如让学生模型输出的动作概率分布尽量逼近teacher的输出）、复用teacher与环境交互得到的样本数据、并逐步减少teacher的参与并最终断奶 | 取决于基础算法          |
+| TRPO      | 离散/连续           | on                   | Actor-Critic架构，Advantage函数                              | KL散度约束让训练过程更平滑，单调性能提升有理论支持，但实现复杂，计算开销大， | 通过KL散度约束，避免策略剧烈变化，保证训练过程平滑；单调性能提升有理论支持，更新方向更可信 | 随机策略采样            |
 
 
 
