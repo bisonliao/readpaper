@@ -129,3 +129,14 @@
 | 8    | Soft Actor-Critic: Off-Policy Maximum Entropy RL             | Haarnoja et al. / ICML / 2018   | 最大熵策略框架，适用于连续动作空间，鲁棒且高效            |
 | 9    | FeUdal Networks for Hierarchical RL (FuN)                    | Vezhnevets et al. / ICML / 2017 | 提出 manager-worker 架构，引入基于方向的子目标表示        |
 | 10   | Unifying Count-Based Exploration and Intrinsic Motivation    | Bellemare et al. / NIPS / 2016  | 使用伪计数激励探索，解决稀疏奖励问题，促进主动学习        |
+
+
+
+
+
+如果你想深入函数逼近与深度RL，可以补充这几本/几套资源：
+
+- **《Deep Reinforcement Learning Hands-On》 by Maxim Lapan**   工程导向，非常适合用 PyTorch 动手做 DRL 算法
+- **SpinningUp by OpenAI**   理论与代码结合的极佳教程，PPO 和 TRPO 都讲得很清晰
+- **RL Course by David Silver（DeepMind）**   视频讲解和幻灯片，涵盖函数逼近但更通俗直观
+- **Berkeley CS285 (Sergey Levine)**   深度强化学习的黄金课程，从理论讲到实际应用，含 homework 和 policy gradient 样例
