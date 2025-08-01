@@ -31,8 +31,12 @@ The pseudo-counts we introduce here are best thought of as “function approxima
 
 In the introduction we argued that the visit count Nn(x) (and consequently, Nn(x, a)) is not directly useful in practical settings, since states are rarely revisited. Specifically, Nn(x) is almost always zero and cannot help answer the question “How novel is this state?”
 
-o estimate the uncertainty of an agent’s knowledge, we must instead look for a quantity which generalizes across states. Guided by ideas from the intrinsic motivation literature, we now derive such a quantity. 
+In order to estimate the uncertainty of an agent’s knowledge, we must instead look for a quantity which generalizes across states. Guided by ideas from the intrinsic motivation literature, we now derive such a quantity. 
 
 We call it a pseudo-count as it extends the familiar notion from Bayesian estimation.
 
 ### 4 The Connection to Intrinsic Motivation
+
+### 6 Empirical Evaluation
+
+![image-20250801150152853](img/image-20250801150152853.png)
