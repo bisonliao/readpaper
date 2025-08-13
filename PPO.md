@@ -98,6 +98,8 @@ for iteration in range(max_iterations):
 
 #### PPO相比传统Actor-Critic方法的优势：
 
+![image-20250813113527991](img/image-20250813113527991.png)
+
 ![image-20250520095951439](img/image-20250520095951439.png)
 
 #### 环境初始化的问题：
