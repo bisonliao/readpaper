@@ -61,3 +61,7 @@ In future work, we plan to apply evolution strategies to those problems for whic
 1. problems with long time horizons and complicated reward structure. 
 2. We are particularly interested in meta-learning, or learning-to-learn. A proof of concept for meta-learning in an RL setting was given by Duan et al. [2016b]: Using black-box optimization we hope to be able to extend these results. 
 3. We also plan to examine combining ES with fast low precision neural network implementations to fully make use of the gradient-free nature of ES.
+
+### 7、bison的实验
+
+#### 7.1 疯狂的赛车

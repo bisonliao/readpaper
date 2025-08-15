@@ -1800,6 +1800,8 @@ if __name__ == "__main__":
 
 下面这个代码，改为使用自己的ReplayBuffer。使用Pendulum-v1任务和BipedalWalker-v3任务验证能收敛（参考huggingface上SB3预训练的超参数）。
 
+BipedalWalkerHardcore-v3任务训练24小时/ 3千万步，机器人偶尔能走完全程，明显学习到了一些东西了。[评估视频](img/bwhc.mp4)和[模型](models/ppo_bwhc_999_103.09.pth)在这里
+
 ![image-20250815110307892](img/image-20250815110307892.png)
 
 一开始怎么都不收敛，搞了一天，最后莫名其妙收敛了。其中艰辛只有自己知道。特意记录下来：
