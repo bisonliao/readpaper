@@ -1568,6 +1568,7 @@ class Config:
         3.1415927, 5., 5., 5., 3.1415927, 5., 3.1415927, 5., 5., 3.1415927,
         5., 3.1415927, 5., 5., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.
     ], dtype=torch.float32)  # shape: [24]
+    action_magnitude = 1 #动作的最大幅度
 
 # ----------------------------
 # ✅ 策略网络
@@ -1595,19 +1596,33 @@ class PolicyNet(nn.Module):
         mean, std = self.forward(state)
         dist = torch.distributions.Normal(mean, std)
         raw_action = dist.rsample()
-        action = torch.tanh(raw_action)
-        log_prob = dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
+        y = torch.tanh(raw_action)  # in [-1,1]
+        action = y * Config.action_magnitude
+
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - y.pow(2) + 1e-6)
         log_prob = log_prob.sum(-1, keepdim=True)
+        scale_tensor = torch.tensor(Config.action_magnitude, device=log_prob.device, dtype=log_prob.dtype)
+        log_prob -= torch.log(scale_tensor) * Config.action_dim  # 缩放修正
+
         entropy = dist.entropy().sum(-1, keepdim=True)
         return action, log_prob, entropy
 
     def get_log_prob(self, state, action):
         mean, std = self.forward(state)
         dist = torch.distributions.Normal(mean, std)
-        raw_action = torch.atanh(action.clamp(-0.999999, 0.999999))
-        log_prob = dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
-        return log_prob.sum(-1, keepdim=True)
+        y = action / Config.action_magnitude
+        # 2. 防止数值越界
+        y = y.clamp(-0.999999, 0.999999)
+        # 3. 反 tanh 得到 raw_action
+        raw_action = torch.atanh(y)
+        # 4. 计算 log_prob，tanh 修正
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - y.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        # 5. 缩放修正（每个维度）
+        log_prob -= torch.log(torch.tensor(Config.action_magnitude, device=log_prob.device)) * Config.action_dim
 
+        return log_prob
+    
 # ----------------------------
 # ✅ 值函数网络
 # ----------------------------
@@ -1671,8 +1686,7 @@ class PPOAgent:
                     done
                     and infos[idx].get("terminal_observation") is not None
                     and infos[idx].get("TimeLimit.truncated", False)
-                ): #是真的回合结束，不是截断,
-                    #取得真的回合最后一个观测和它的值，累加到当前时间步的reward里
+                ): #发生了截断,取得最后一个观测和它的值，累加到当前时间步的reward里
                     terminal_obs = torch.FloatTensor(infos[idx]["terminal_observation"]).to(Config.device).unsqueeze(0)
                     with torch.no_grad():
                         terminal_value = self.value(terminal_obs)[0]
@@ -1781,3 +1795,413 @@ if __name__ == "__main__":
     agent = PPOAgent()
     agent.train()
 ```
+
+##### 手搓的并发多环境且使用自己的ReplayBuffer的PPO
+
+下面这个代码，改为使用自己的ReplayBuffer。使用Pendulum-v1任务和BipedalWalker-v3任务验证能收敛（参考huggingface上SB3预训练的超参数）。
+
+![image-20250815110307892](img/image-20250815110307892.png)
+
+一开始怎么都不收敛，搞了一天，最后莫名其妙收敛了。其中艰辛只有自己知道。特意记录下来：
+
+```python
+import datetime
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.buffers import RolloutBuffer
+
+class MyRolloutBuffer:
+    def __init__(self, buffer_size, obs_shape, action_shape, device, gamma=0.99, gae_lambda=0.95, n_envs=1):
+        self.buffer_size = buffer_size
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.n_envs = n_envs
+        self.device = device
+
+        # Allocate storage
+        self.observations = np.zeros( (buffer_size, n_envs) + obs_shape, dtype=np.float32)
+        self.actions = np.zeros((buffer_size, n_envs) + action_shape, dtype=np.float32)
+        self.rewards = np.zeros((buffer_size, n_envs), dtype=np.float32)
+        self.values = np.zeros((buffer_size, n_envs), dtype=np.float32)
+        self.log_probs = np.zeros((buffer_size, n_envs), dtype=np.float32)
+        self.terminals = np.zeros((buffer_size, n_envs), dtype=np.bool_)
+
+        self.advantages = np.zeros((buffer_size, n_envs), dtype=np.float32)
+        self.returns = np.zeros((buffer_size, n_envs), dtype=np.float32)
+
+        self.pos = 0
+        self.full = False
+
+    def reset(self):
+        self.pos = 0
+        self.full = False
+
+    def add(self, obs, actions, rewards, terminals, values, log_probs):
+        """
+        terminals: 布尔数组 [n_envs]，表示当前这一步是否为终止
+        """
+        self.observations[self.pos] = obs
+        self.actions[self.pos] = actions
+        self.rewards[self.pos] = rewards
+        self.values[self.pos] = values.squeeze(-1) if values.ndim == 2 else values
+        self.log_probs[self.pos] = log_probs
+        self.terminals[self.pos] = terminals
+
+        self.pos += 1
+        if self.pos >= self.buffer_size:
+            self.full = True
+            self.pos = 0
+
+    def compute_returns_and_advantage(self, last_values, last_terminals):
+        """
+        last_values: tensor/np.array [n_envs]，最后一个状态的价值
+        last_terminals: 布尔数组 [n_envs]，最后一个状态是否终止
+        """
+
+
+        last_gae_lam = np.zeros(self.n_envs, dtype=np.float32)
+
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_non_terminal = 1.0 - last_terminals.astype(np.float32)
+                next_values = last_values
+            else:
+                next_non_terminal = 1.0 - self.terminals[step + 1].astype(np.float32)
+                next_values = self.values[step + 1]
+
+            delta = self.rewards[step] + self.gamma * next_values * next_non_terminal - self.values[step]
+            last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+            self.advantages[step] = last_gae_lam
+
+        self.returns = self.advantages + self.values
+
+
+
+    def get(self, batch_size):
+        # Flatten buffer
+        n_steps = self.buffer_size * self.n_envs
+        obs = self.observations.reshape((n_steps,) + self.observations.shape[2:])
+        actions = self.actions.reshape((n_steps,) + self.actions.shape[2:])
+        log_probs = self.log_probs.reshape((n_steps, ))
+        advantages = self.advantages.reshape((n_steps, ))
+        returns = self.returns.reshape((n_steps, ))
+        values = self.values.reshape((n_steps, ))
+
+        # 标准化优势（可选，和SB3一致）
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        indices = np.arange(n_steps)
+        np.random.shuffle(indices)
+
+        for start in range(0, n_steps, batch_size):
+            end = start + batch_size
+            batch_idx = indices[start:end]
+
+            yield {
+                "observations": torch.tensor(obs[batch_idx], dtype=torch.float32, device=self.device),
+                "actions": torch.tensor(actions[batch_idx], dtype=torch.float32, device=self.device),
+                "old_log_prob": torch.tensor(log_probs[batch_idx], dtype=torch.float32, device=self.device),
+                "advantages": torch.tensor(advantages[batch_idx], dtype=torch.float32, device=self.device),
+                "returns": torch.tensor(returns[batch_idx], dtype=torch.float32, device=self.device),
+                "values": torch.tensor(values[batch_idx], dtype=torch.float32, device=self.device),
+            }
+
+def make_env(seed, index):
+    def _init():
+        env = gym.make(Config.env_name)  # max_episode_steps这样修改没有用，内部还是500步最大，需要继续研究
+        return env
+
+    return _init
+
+
+# ----------------------------
+# ✅ Config 配置超参数
+# ----------------------------
+class Config:
+    #env_name = "BipedalWalkerHardcore-v3"
+    env_name = "Pendulum-v1"
+    max_episode_length = 200
+    log_dir = f'logs/PPO_{datetime.datetime.now().strftime("%m%d_%H%M%S")}'
+    '''obs_scale = torch.tensor([
+        3.1415927, 5., 5., 5., 3.1415927, 5., 3.1415927, 5., 5., 3.1415927, 5., 3.1415927, 5., 5., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.
+    ], dtype=torch.float32)  # shape: [24]'''
+    obs_scale = torch.tensor([1, 1, 1], dtype=torch.float32)
+    state_dim = 3 #24
+    action_dim = 1 #4
+    action_magnitude = 2 #1
+
+    hidden_dim = 128
+    n_envs = 4
+    critic_clip = True
+    min_rollout_steps = 1024
+
+    gamma = 0.9
+    lam = 0.95  # GAE lambda
+    train_iters = 10
+
+    clip_ratio = 0.2
+    clip_ratio_initial = 0.2
+    entropy_coef = 0.01
+    lr = 2.5e-4
+    batch_size = 128
+    max_iters = 200
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+
+# ----------------------------
+# ✅ 策略网络
+# ----------------------------
+class PolicyNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(Config.state_dim, Config.hidden_dim)
+        self.fc2 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
+        self.mean = nn.Linear(Config.hidden_dim, Config.action_dim)
+        self.log_std = nn.Linear(Config.hidden_dim, Config.action_dim)
+        self.log_std_min = -10
+        self.log_std_max = 2
+
+    def forward(self, state):
+        state = state / Config.obs_scale.to(Config.device)
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        mean = self.mean(x)
+        log_std = torch.clamp(self.log_std(x), self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std)
+        return mean, std
+
+    def sample(self, state):
+        mean, std = self.forward(state)
+        dist = torch.distributions.Normal(mean, std)
+        raw_action = dist.rsample()
+        y = torch.tanh(raw_action)  # in [-1,1]
+        action = y * Config.action_magnitude
+
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - y.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        scale_tensor = torch.tensor(Config.action_magnitude, device=log_prob.device, dtype=log_prob.dtype)
+        log_prob -= torch.log(scale_tensor) * Config.action_dim  # 缩放修正
+
+        entropy = dist.entropy().sum(-1, keepdim=True)
+        return action, log_prob, entropy
+
+    def get_log_prob(self, state, action):
+        mean, std = self.forward(state)
+        dist = torch.distributions.Normal(mean, std)
+
+
+        y = action / Config.action_magnitude
+
+        # 2. 防止数值越界
+        y = y.clamp(-0.999999, 0.999999)
+
+        # 3. 反 tanh 得到 raw_action
+        raw_action = torch.atanh(y)
+
+        # 4. 计算 log_prob，tanh 修正
+        log_prob = dist.log_prob(raw_action) - torch.log(1 - y.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+
+        # 5. 缩放修正（每个维度）
+        log_prob -= torch.log(torch.tensor(Config.action_magnitude, device=log_prob.device)) * Config.action_dim
+
+        return log_prob
+
+
+# ----------------------------
+# ✅ 值函数网络
+# ----------------------------
+class ValueNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(Config.state_dim, Config.hidden_dim)
+        self.fc2 = nn.Linear(Config.hidden_dim, Config.hidden_dim)
+        self.v = nn.Linear(Config.hidden_dim, 1)
+
+    def forward(self, state):
+        state = state / Config.obs_scale.to(Config.device)
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        return self.v(x)
+
+
+# ----------------------------
+# ✅ PPO Agent
+# ----------------------------
+class PPOAgent:
+    def __init__(self):
+        # self.env = gym.make(Config.env_name)
+        env_fns = [make_env(seed=i, index=i) for i in range(Config.n_envs)]
+        self.env = SubprocVecEnv(env_fns)
+        self.policy = PolicyNet().to(Config.device)
+        self.value = ValueNet().to(Config.device)
+        self.buffer = MyRolloutBuffer(Config.min_rollout_steps, self.env.observation_space.shape, self.env.action_space.shape,
+                                    Config.device, gae_lambda=Config.lam, gamma=Config.gamma, n_envs=Config.n_envs)
+
+        # 创建线性调度函数：从 1 → 0
+        lr_lambda = lambda current_iter: 1.0 - current_iter / float(Config.max_iters)
+
+        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=Config.lr)
+        self.optimizer_value = optim.Adam(self.value.parameters(), lr=Config.lr)
+
+        self.scheduler_policy = torch.optim.lr_scheduler.LambdaLR(self.optimizer_policy, lr_lambda)
+        self.scheduler_value = torch.optim.lr_scheduler.LambdaLR(self.optimizer_value, lr_lambda)
+
+        self.writer = SummaryWriter(Config.log_dir)
+
+        self.actor_update_cnt = 0
+        self.critic_update_cnt = 0
+
+    def rollout(self):
+        n_steps = 0
+        state = self.env.reset()
+        self.buffer.reset()
+        episode_returns = []
+        reward_sum = 0
+        while n_steps < Config.min_rollout_steps:
+            s = torch.FloatTensor(state).to(Config.device)
+            with torch.no_grad():
+                action, log_prob, entropy = self.policy.sample(s)
+                value = self.value(s)
+            action_np = action.cpu().numpy()
+            next_state, reward, dones, infos = self.env.step(action_np)
+            reward_sum += reward[0]
+            if dones[0]:
+                episode_returns.append(reward_sum)
+                reward_sum = 0
+            # 中途发生了截断（没有发生在收集的步数的最后一步）需要特殊处理：从info中取得最后一个观测并计算它的值，累加到当前时间步的reward里。
+            # 并且不论是截断还是自然结束，存入buffer的终止信号都是True，避免跨回合累加错误的价值
+            for idx, done in enumerate(dones):
+                if (
+                        done
+                        and infos[idx].get("terminal_observation") is not None
+                        and infos[idx].get("TimeLimit.truncated", False)
+                ):  #
+
+                    terminal_obs = torch.FloatTensor(infos[idx]["terminal_observation"]).to(Config.device).unsqueeze(0)
+                    with torch.no_grad():
+                        terminal_value = self.value(terminal_obs)[0]
+                    terminal_value = terminal_value.cpu().item()
+                    reward[idx] += Config.gamma * terminal_value
+
+            self.buffer.add(state, action_np, reward, dones, value.cpu().numpy(), log_prob.sum(-1).cpu().numpy())
+            state = next_state
+
+            n_steps += 1
+
+
+        # rollout结束后，如果dones标记为0，也就是回合没有结束，那么下一个状态的价值要计算出来，用于GAE计算
+        # 其实发生了截断，也需要特别处理，但这个情况已经在while循环里处理过了，就不重复
+        with torch.no_grad():
+            # Compute value for the last timestep
+            next_state_tensor = torch.FloatTensor(next_state).to(Config.device)
+            last_values = self.value(next_state_tensor)
+        # 传给 buffer
+        self.buffer.compute_returns_and_advantage(last_values.squeeze(-1).cpu().numpy(), done)
+
+        return sum(episode_returns) / (len(episode_returns)+1e-8)
+
+    def update(self):
+
+        # Critic
+        for _ in range(Config.train_iters):
+            for rollout_data in self.buffer.get(Config.batch_size):
+
+                self.critic_update_cnt += 1
+                v_pred = self.value(rollout_data['observations']).squeeze(-1)
+                v_target = rollout_data['returns']
+                value_loss = F.mse_loss(v_pred, v_target)
+                self.optimizer_value.zero_grad()
+                value_loss.backward()
+                self.optimizer_value.step()
+                if self.critic_update_cnt % 100 == 0:
+                    self.writer.add_scalar('train/critic_loss', value_loss.item(), self.critic_update_cnt)
+                    self.writer.add_scalar('train/critic_value', v_pred.mean().item(), self.critic_update_cnt)
+
+        # Actor
+        for _ in range(Config.train_iters):
+            for rollout_data in self.buffer.get(Config.batch_size):
+                self.actor_update_cnt += 1
+                new_logp = self.policy.get_log_prob(rollout_data['observations'], rollout_data['actions'])
+                ratio = torch.exp(new_logp - rollout_data['old_log_prob'].unsqueeze(-1))
+                surr1 = ratio * rollout_data['advantages'].unsqueeze(-1)
+                surr2 = torch.clamp(ratio, 1 - Config.clip_ratio,
+                                    1 + Config.clip_ratio) * rollout_data['advantages'].unsqueeze(-1)
+                policy_loss = - torch.min(surr1, surr2).mean()
+                _, _, entropy = self.policy.sample(rollout_data['observations'])
+                loss = policy_loss - Config.entropy_coef * entropy.mean()
+                self.optimizer_policy.zero_grad()
+                loss.backward()
+                self.optimizer_policy.step()
+
+                # check kl div
+                log_ratio = new_logp.detach() - rollout_data['old_log_prob'].unsqueeze(-1)
+                approx_kl_div = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+
+                if self.actor_update_cnt % 100 == 0:
+                    self.writer.add_scalar('train/entropy', entropy.mean().item(), self.actor_update_cnt)
+                    self.writer.add_scalar('train/actor_loss', loss.item(), self.actor_update_cnt)
+                    self.writer.add_scalar('train/kl_div', approx_kl_div.item(), self.actor_update_cnt)
+
+    def evaluate(self, num_episodes=5):
+        env = gym.make(Config.env_name)
+        rewards = []
+        for _ in range(num_episodes):
+            state, _ = env.reset()
+            total = 0
+            episode_len = 0
+            for _ in range(Config.max_episode_length):
+                with torch.no_grad():
+                    s = torch.FloatTensor(state).unsqueeze(0).to(Config.device)
+                    action, _, _ = self.policy.sample(s)
+                state, reward, term, truncated, _ = env.step(action.cpu().numpy().squeeze(0))
+                done = term or truncated
+                total += reward
+                episode_len += 1
+                if done:
+                    break
+            #print(f'eval episode reward:{total}, episode len:{episode_len}, term:{term}, trunc:{truncated}')
+            rewards.append(total)
+        return np.mean(rewards)
+
+    def train(self):
+        for epoch in tqdm(range(Config.max_iters), desc="Training"):
+
+            avg_returns = self.rollout()
+            self.writer.add_scalar("train/avg_returns", avg_returns, epoch)
+            self.update()
+
+            self.scheduler_policy.step()
+            self.scheduler_value.step()
+            Config.clip_ratio = (1.0 - epoch / float(Config.max_iters)) * Config.clip_ratio_initial
+            self.writer.add_scalar("train/clip_ratio", Config.clip_ratio, epoch)
+
+
+            current_lr = self.scheduler_policy.get_last_lr()[0]
+            self.writer.add_scalar("train/learning_rate", current_lr, epoch)
+            if (epoch + 1) % 10 == 0:
+                avg_ret = self.evaluate(3)
+                self.writer.add_scalar("eval/score", avg_ret, epoch)
+                print(f"[Iter {epoch}] Avg Return: {avg_ret:.2f}")
+                if (epoch + 1) % 100 == 0:
+                    filename = f'./checkpoints/ppo_bwhc_{epoch}_{avg_ret:.2f}.pth'
+                    torch.save(self.policy, filename)
+
+
+# ----------------------------
+# ✅ 主入口
+# ----------------------------
+if __name__ == "__main__":
+    agent = PPOAgent()
+    agent.train()
+```
+
