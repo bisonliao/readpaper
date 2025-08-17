@@ -32,6 +32,8 @@ bison：样本效率比RL还低，那就真的太低了。
 
 ### 2 Evolution Strategies
 
+可以看到，ES算法，一定程度上也输入Gradient-Base算法，因为它是通过计算参数的梯度并据此修改参数来实现的。只是说没有用后向传播这样的求导数的方式。不是一个完全Gradient-Free算法。
+
 ![image-20250815153701985](img/image-20250815153701985.png)
 
 ### 3 Smoothing in parameter space versus smoothing in action space
@@ -505,6 +507,485 @@ class ESTrainer:
     def train(self):
         print(f"Starting ES on {self.conf.env_id} with {self.conf.num_workers} workers, device={self.conf.device}")
         start_time = time.time()
+
+        for gen in range(1, self.conf.generations + 1):
+            jobs = self._ask() # # 生成一批候选解 (population)，即要评估的参数
+
+            # Dispatch to pool; each worker reads shared_theta and computes its fitness
+            worker_args = [
+                (self.shared_theta, self.obs_dim, self.act_dim, self.conf, seed, sign)
+                for (seed, sign) in jobs
+            ]
+
+
+            # list()使得阻塞等待所有worker完成扰动和评估工作
+            results = list(self.pool.imap_unordered(_call, worker_args))
+
+            avg_fit = float(np.mean([f for _, _, f in results]))
+            max_fit = float(np.max([f for _, _, f in results]))
+
+            writer.add_scalar('train/avg_fit', avg_fit, gen)
+            writer.add_scalar('train/max_fit', max_fit, gen)
+
+            # Update theta using reconstructed Gaussian directions
+            #  # 把评估结果告诉优化器，用来更新内部状态
+            self._tell_and_update(results)
+
+            if gen % self.conf.print_every == 0:
+                eval_score = self._evaluate_current(episodes=5)
+                elapsed = time.time() - start_time
+                print(
+                    f"Gen {gen:04d} | pop_avg={avg_fit:.1f} pop_max={max_fit:.1f} | eval={eval_score:.1f} | elapsed={elapsed/60:.1f}m"
+                )
+
+                writer.add_scalar('eval/eval_score', eval_score, gen)
+
+                # Early stop
+                if eval_score >= self.conf.target_score - 1e-6:
+                    print("Reached target score. Stopping.")
+                    break
+
+        # Save final policy parameters
+        self._save_policy()
+
+    def _save_policy(self):
+        # Load theta into policy and save state_dict
+        self.flat_helper.set_(self.policy, self.shared_theta.cpu())
+        torch.save(self.policy.state_dict(), self.conf.save_path)
+        print(f"Saved policy to: {self.conf.save_path}")
+
+
+# =============================
+# Main
+# =============================
+if __name__ == "__main__":
+    conf = Config()
+
+    # Example tweaks (optional):
+    # conf.population_size = 128
+    # conf.num_workers = 8
+    # conf.sigma = 0.03
+    # conf.lr = 0.02
+    # conf.device = "cpu"  # Use CPU if GPU contention across processes
+
+    trainer = ESTrainer(conf)
+    trainer.train()
+
+```
+
+#### 7.2 疯狂的赛车
+
+健康评价是距离出发点的距离。训练了4个多小时，1400多代。能走的比较远，从距离估算应该过了最后一个拐弯，前方就是终点了。进一步训练需要使用RL算法。
+
+![image-20250817170509130](img/image-20250817170509130.png)
+
+代码如下：
+
+```python
+"""
+Evolution Strategies (ES) for CartPole-v1
+- Policy: MLP (PyTorch). All parameters flattened; perturb/update in parameter space.
+- Fitness: average episode length over 5 episodes.
+- Parallelization: multiprocessing with common random numbers (seeds) — workers only return scalars.
+- CUDA support: inference and parameter tensors can run on CUDA if available (set Config.device).
+- Clean modular structure with comments for clarity.
+
+Tested with: Python 3.10+, gym==0.26+/gymnasium, PyTorch 2.x
+
+Usage (single file):
+    python es_cartpole.py
+
+Notes:
+- To keep communication light, each worker receives only a (seed, sign) tuple and reconstructs its
+  own perturbation using the shared base parameters and the agreed-upon RNG rule.
+- We use antithetic (mirrored) sampling and centered-rank fitness shaping.
+- If you run with many workers on a single GPU, consider setting device="cpu" for stability, since
+  Gym env steps are CPU-bound and small MLPs are cheap. CUDA is still supported for completeness.
+"""
+from __future__ import annotations
+
+import os
+import math
+import time
+import random
+import dataclasses
+from dataclasses import dataclass
+from importlib.metadata import Distribution
+from typing import Tuple, List, Iterable
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.multiprocessing as mp
+from torch.utils.tensorboard import SummaryWriter
+import datetime
+from racecar_env import RaceCarEnv
+
+# Try gym first; fall back to gymnasium if needed
+try:
+    import gym
+except Exception:  # pragma: no cover
+    import gymnasium as gym
+
+
+# 全局环境变量，每个进程会在initializer里创建一次
+_global_env = None
+
+def _init_worker():
+    """Pool worker initializer: create one RaceCarEnv per process"""
+    global _global_env
+    _global_env = RaceCarEnv()
+
+
+# =============================
+# Config & Utilities
+# =============================
+@dataclass
+class Config:
+    #env_id: str = "CartPole-v1"
+    seed: int = 42
+
+    # ES hyperparams
+    population_size: int = 64   # must be even for antithetic sampling
+    sigma: float = 0.02         # noise std for parameter perturbation
+    lr: float = 0.02            # learning rate for updating theta
+    weight_decay: float = 0.0   # L2 decay applied directly to theta update (optional)
+
+    # Optimizer for theta vector (Adam recommended)
+    use_adam: bool = True
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
+
+    # Evaluation settings
+    episodes_per_candidate: int = 5
+    max_steps_per_episode: int = 2000
+
+    # Parallelism
+    num_workers: int = max(1, os.cpu_count() // 2 )
+
+    # Device control
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype: torch.dtype = torch.float32
+
+    # Training loop
+    generations: int = 300
+    print_every: int = 10
+    target_score: float = 1000.0  # CartPole-v1 solves at 475+ typically; 500 is max
+
+    # Logging / saving
+    save_path: str = "es_racecar_policy.pt"
+
+    obs_dim:int = 17
+    act_dim:int = 1
+
+    def validate(self):
+        assert self.population_size % 2 == 0, "population_size must be even (for antithetic sampling)"
+        assert self.sigma > 0
+        assert self.episodes_per_candidate >= 1
+        assert self.num_workers >= 1
+
+
+# =============================
+# Policy: simple MLP for discrete actions
+# =============================
+class MLPPolicy(nn.Module):
+    def __init__(self, obs_dim: int, action_dim:int,  hidden_sizes: Tuple[int, int] = (128, 128)):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, h1), nn.Tanh(),
+            nn.Linear(h1, h2), nn.Tanh(),
+
+        )
+        self.mean = nn.Linear(h2, action_dim)
+        self.logstd = nn.Linear(h2, action_dim)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.net(x)
+        m = self.mean(x)
+        logstd = self.logstd(x)
+        logstd = torch.clamp(logstd, -10, 2)
+        std = torch.exp(logstd)
+
+        return m, std
+
+    @torch.no_grad()
+    def act(self, obs: np.ndarray, device: str = "cpu") -> float:
+        # obs: shape (obs_dim,)
+        x = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        mean, std = self.forward(x)
+        dist = torch.distributions.Normal(mean, std)
+        action = dist.rsample()
+        action = torch.tanh(action)
+        return action.squeeze(0).cpu().item()
+
+
+# =============================
+# Parameter flattening helpers
+# =============================
+class FlatParams:
+    """Helper to flatten/unflatten model parameters into a single 1D vector.
+    This allows ES to sample in parameter space easily.
+    """
+    def __init__(self, model: nn.Module):
+        self.shapes = [p.data.shape for p in model.parameters()]
+        self.sizes = [p.numel() for p in model.parameters()]
+        self.total = sum(self.sizes)
+
+    def get(self, model: nn.Module) -> torch.Tensor:
+        with torch.no_grad():
+            flats = [p.data.view(-1) for p in model.parameters()]
+            return torch.cat(flats, dim=0).clone()
+
+    def set_(self, model: nn.Module, flat: torch.Tensor):
+        with torch.no_grad():
+            assert flat.numel() == self.total
+            idx = 0
+            for p, sz in zip(model.parameters(), self.sizes):
+                p.data.copy_(flat[idx: idx + sz].view_as(p.data))
+                idx += sz
+
+
+# =============================
+# Centered rank shaping (robust fitness shaping)
+# =============================
+
+def centered_ranks(x: np.ndarray) -> np.ndarray:
+    """Compute centered ranks in [-0.5, 0.5]."""
+    ranks = np.argsort(np.argsort(x))
+    ranks = ranks.astype(np.float64)
+    ranks = ranks / (len(x) - 1) if len(x) > 1 else ranks
+    return ranks - 0.5
+
+
+# =============================
+# Worker: evaluate a single (seed, sign) candidate using shared base theta
+# =============================
+
+def _make_env(seed: int) -> gym.Env:
+    env = RaceCarEnv()
+    try:
+        env.reset(seed=seed)
+    except TypeError:
+        env.seed(seed)  # older gym
+    return env
+
+
+# imap_unordered over starmap by unpacking tuple in a small wrapper
+def _call(args):
+    return evaluate_candidate(*args)
+
+def evaluate_candidate(
+    shared_theta: torch.Tensor,
+    obs_dim: int,
+    act_dim: int,
+    conf: Config,
+    seed: int,
+    sign: int,
+) -> Tuple[int, int, float]:
+    """Worker function: given (seed, sign), reconstruct epsilon, build perturbed theta, evaluate.
+    Returns: (seed, sign, fitness)
+    """
+    assert sign in (-1, 1)
+    # 改成复用 _global_env，而不是每次都 _make_env()
+    global _global_env
+    env = _global_env
+
+    # Local RNGs: reproducible & independent
+    # - eps_rng generates perturbation epsilon
+    # - env_rng seeds env rollouts deterministically per candidate
+    eps_rng = np.random.RandomState(seed)
+    env_base_seed = (conf.seed * 1000003 + seed * 97) & 0x7FFFFFFF
+    env_seeds = [env_base_seed + i for i in range(conf.episodes_per_candidate)]
+
+    # Copy shared base params to local flat vector (CPU tensor -> numpy)
+    with torch.no_grad():
+        base = shared_theta.cpu().numpy().copy()
+
+    # Reconstruct epsilon with the *same* dimensionality
+    eps = eps_rng.randn(base.size).astype(np.float32)
+    perturbed = base + (conf.sigma * sign) * eps
+
+    # Build a lightweight policy and load params
+    policy = MLPPolicy(obs_dim, act_dim)
+    flat = torch.from_numpy(perturbed)
+    FlatParams(policy).set_(policy, flat)
+
+    device = conf.device
+    if device.startswith("cuda") and torch.cuda.is_available():
+        policy = policy.to(device)
+    policy.eval()
+
+    # Evaluate fitness = average episode length
+    total_steps = 0
+    longest_x = []
+    for ep_idx in range(conf.episodes_per_candidate):
+        obs, _ = env.reset()
+
+        ep_steps = 0
+        for _ in range(conf.max_steps_per_episode):
+            action = policy.act(obs, device=device)
+            # Handle both gym and gymnasium APIs
+            step_out = env.step(action)
+            if len(step_out) == 5:
+                obs, reward, terminated, truncated, info = step_out
+                done = terminated or truncated
+            else:
+                obs, reward, done, info = step_out
+            ep_steps += 1
+            if done:
+                longest_x.append( np.linalg.norm(info['position']) )
+                break
+        total_steps += ep_steps
+
+    fitness = np.mean(longest_x)
+    return (seed, sign, fitness)
+
+
+# =============================
+# ES Trainer
+# =============================
+class ESTrainer:
+    def __init__(self, conf: Config):
+        self.conf = conf
+        self.conf.validate()
+
+
+
+
+        self.obs_dim = Config.obs_dim
+        self.act_dim = Config.act_dim
+
+        # Model & flat params
+        self.policy = MLPPolicy(self.obs_dim, self.act_dim)
+        self.flat_helper = FlatParams(self.policy)
+
+        # Theta (flat) in shared memory so workers can read without pickling
+        theta = self.flat_helper.get(self.policy).to(conf.dtype)
+        self.shared_theta = theta.clone().detach()
+        # 让这个张量放到 PyTorch 的共享内存 (shared memory) 里，这样在多进程 (torch.multiprocessing) 环境中，子进程就能直接访问同一块内存，而不用通过 pickle/拷贝 的方式传输参数。
+        self.shared_theta.share_memory_()  # torch shared memory tensor
+
+
+        # Optional optimizer on theta
+        if conf.use_adam:
+            # We keep theta as nn.Parameter for optimizer compatibility
+            self.theta_param = nn.Parameter(self.shared_theta)
+            self.optimizer = torch.optim.Adam(
+                [self.theta_param], lr=conf.lr,
+                betas=(conf.adam_beta1, conf.adam_beta2), eps=conf.adam_eps,
+                weight_decay=conf.weight_decay,
+            )
+        else:
+            self.theta_param = None
+            self.optimizer = None
+
+        # Multiprocessing pool
+        mp.set_start_method("spawn", force=True)
+        self.pool = mp.Pool(processes=conf.num_workers, initializer=_init_worker)
+
+        # For reproducibility
+        random.seed(conf.seed)
+        np.random.seed(conf.seed)
+        torch.manual_seed(conf.seed)
+
+    def _ask(self) -> List[Tuple[int, int]]:
+        """Sample a set of (seed, sign) jobs for one generation with antithetic pairs."""
+        half = self.conf.population_size // 2
+        seeds = np.random.randint(0, 2**31 - 1, size=half, dtype=np.int64).tolist()
+        jobs: List[Tuple[int, int]] = []
+        for s in seeds:
+            jobs.append((int(s), +1))
+            jobs.append((int(s), -1))
+        return jobs
+
+    def _tell_and_update(self, results: List[Tuple[int, int, float]]):
+        """Reconstruct epsilons from seeds, compute ES gradient, and update theta."""
+        # results aligned arbitrarily; we will process all and rebuild eps table once
+        fitness = np.array([r[2] for r in results], dtype=np.float64)
+        shaped = centered_ranks(fitness)
+
+        # Map (seed, sign) -> shaped_fitness
+        # (seed, sign)重复出现问题不大，以重复项对应的最后一个fitness为value。map里的项会少一点，累加的g会偏小
+        utilities = {(int(seed), int(sign)): float(u) for (seed, sign, _), u in zip(results, shaped)}
+
+        # Reconstruct gradient estimate: g = sum_i u_i * sign_i * eps_i
+        # We'll accumulate in numpy then convert to torch tensor
+        dim = self.shared_theta.numel()
+        g = np.zeros(dim, dtype=np.float32)
+
+        # To avoid regenerating eps twice for antithetic pairs, iterate by seeds
+        # Build dict: seed -> {+1: u, -1: u} ，转变为以seed为key ，就能做到一个seed只计算一次扰动而不是两次
+        by_seed = {}
+        for (seed, sign), u in utilities.items():
+            by_seed.setdefault(seed, {})[sign] = u
+
+        for seed, sign_dict in by_seed.items():
+            eps_rng = np.random.RandomState(seed)
+            eps = eps_rng.randn(dim).astype(np.float32)
+            u_pos = float(sign_dict.get(+1, 0.0))
+            u_neg = float(sign_dict.get(-1, 0.0))
+            # Combined contribution from mirrored pair: (u_pos * +eps) + (u_neg * -eps)
+            g += (u_pos - u_neg) * eps
+
+        # Scale according to ES estimator
+        scale = 1.0 / (self.conf.population_size * self.conf.sigma)
+        g *= scale
+
+        g_tensor = torch.from_numpy(g).to(self.shared_theta.device, dtype=self.shared_theta.dtype)
+
+        if self.optimizer is not None:
+            # Adam step on theta_param
+            self.optimizer.zero_grad(set_to_none=True)
+            # Manually set grad on theta_param
+            self.theta_param.grad = -g_tensor.clone()  # ascent on reward -> minimize -reward
+            self.optimizer.step()
+            with torch.no_grad():
+                self.shared_theta.copy_(self.theta_param.data)
+        else:
+            with torch.no_grad():
+                if self.conf.weight_decay > 0.0:
+                    g_tensor.add_(self.conf.weight_decay * self.shared_theta)
+                self.shared_theta.add_(self.conf.lr * g_tensor)
+
+    def _evaluate_current(self, episodes: int = 10) -> float:
+        """Evaluate the unperturbed current policy for monitoring."""
+        # Load theta into local policy and run deterministic episodes
+        local = MLPPolicy(self.obs_dim, self.act_dim)
+        self.flat_helper.set_(local, self.shared_theta.cpu())
+        local.eval()
+        env = _make_env(self.conf.seed + 1000)
+
+        total = 0
+        longest_x = []
+        for i in range(episodes):
+            try:
+                obs, _ = env.reset()
+            except Exception:
+                obs = env.reset()
+            steps = 0
+            for _ in range(self.conf.max_steps_per_episode):
+                a = local.act(obs)
+                step_out = env.step(a)
+                if len(step_out) == 5:
+                    obs, r, terminated, truncated, info = step_out
+                    done = terminated or truncated
+                else:
+                    obs, r, done, info = step_out
+                steps += 1
+                if done:
+                    longest_x.append( np.linalg.norm(info['position']) )
+                    break
+            total += steps
+        env.close()
+        return np.mean(longest_x)
+
+    def train(self):
+        print(f"Starting ES with {self.conf.num_workers} workers, device={self.conf.device}")
+        start_time = time.time()
+        writer = SummaryWriter(log_dir=f'logs/es_racecar_{datetime.datetime.now().strftime("%y%m%d_%H%M%S")}')
 
         for gen in range(1, self.conf.generations + 1):
             jobs = self._ask() # # 生成一批候选解 (population)，即要评估的参数
