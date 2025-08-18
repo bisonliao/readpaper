@@ -32,7 +32,7 @@
 1. **第一代**：所有个体随机初始化。
 2. **评估**：每个个体跑环境，得到分数。
 3. **排序**：按照分数高低排序。
-4. **构造精英候选集：**
+4. **构造精英候选集：**种群中top 10的个体 外加上一代的精英
 5. **精英挑选**：从精英候选集里额外测 30 次，平均分最高的作为“精英”，它直接进入下一代。
 6. **父代选择**：取前 T 名作为父代。
 7. **生成后代**：从父代里随机挑一个，加上高斯噪声，生成新的个体。重复直到凑满 N−1 个。再加上精英，总共 N 个体，构成新一代。
@@ -193,6 +193,44 @@ GA_NS(N, T, σ, G, φ, BC, η, k, p):
 
 ```
 
-【思考】
+##### 【思考1】
 
 ![image-20250817203436013](img/image-20250817203436013.png)
+
+##### 【思考2】
+
+![image-20250818093529934](img/image-20250818093529934.png)
+
+### 4 Experiments
+
+#### 4.1 Atari
+
+![image-20250818084441264](img/image-20250818084441264.png)
+
+![image-20250818084902179](img/image-20250818084902179.png)
+
+#### 4.2 Image Hard Maze
+
+![image-20250818085452565](img/image-20250818085452565.png)
+
+#### 4.3 Humanoid Locomotion
+
+GA 确实成功进化出了能走路的 humanoid 机器人（说明 GA 可以完成任务）。
+
+但它的效率不佳：比起 ES，GA **用了 15 倍的计算时间**，成绩还稍微差一点。
+
+### 5 Discussion
+
+英文看不太懂，让AI帮我总结了一下，实际上中文我也没有太懂。
+
+<img src="img/image-20250818091828708.png" alt="image-20250818091828708" style="zoom:70%;" />
+
+### 6 Conclusion
+
+We documented that GAs are surprisingly competitive with popular algorithms for deep reinforcement learning problems, such as DQN, A3C, and ES, especially in the challenging Atari domain. 
+
+We also showed that interesting algorithms developed in the neuroevolution community can now immediately be tested with deep neural networks, by showing that a Deep GA-powered novelty search can solve a deceptive Atari-scale game. 
+
+我们的工作继续讲述“旧算法 + 新算力 = 新突破”的故事（这个故事开始于  反向传播+算力=CV的新突破），不禁要问：下一个应该被拿出来溜溜的古老算法是谁？
+
+### 7 bison的实验
