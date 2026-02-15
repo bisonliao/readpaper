@@ -87,3 +87,56 @@ FlashAttention 通过 **IO 感知设计**（分块 + 重计算 + 核融合），
 3. 更长的上下文建模能力（支持 64K 序列），带来模型质量提升与新能力
 
 该工作揭示了深度学习优化中被忽视的 **IO 瓶颈**，为高效 Transformer 设计提供了新范式。代码已开源：https://github.com/HazyResearch/flash-attention
+
+
+
+## 5 疑问
+
+算法复杂度分析中的一个关键概念：**"HBM 访问次数" 指的是访问的元素总数（字节数），而非“读写操作的次数”**。这是理解 FlashAttention 核心贡献的关键。
+
+### 为什么是 Ω(Nd + N²) 而非常数？
+
+从 Algorithm 0 看，确实只有 3 个主要步骤（对应您说的“8 次读写”），但每一步涉及的**数据量**随序列长度变化：
+
+```
+Algorithm 0 Standard Attention Implementation
+1: Load Q, K by blocks from HBM, compute S = QK^T, write S to HBM.
+   → 读 Q (N×d) + 读 K (N×d) + 写 S (N×N) = 2Nd + N² 个元素
+
+2: Read S from HBM, compute P = softmax(S), write P to HBM.
+   → 读 S (N×N) + 写 P (N×N) = 2N² 个元素
+
+3: Load P and V by blocks from HBM, compute O = PV, write O to HBM.
+   → 读 P (N×N) + 读 V (N×d) + 写 O (N×d) = N² + 2Nd 个元素
+```
+
+**总计 HBM 访问元素数**：
+```
+(2Nd + N²) + 2N² + (N² + 2Nd) = 4Nd + 4N² = Θ(Nd + N²)
+```
+
+### 关键点澄清
+
+| 概念             | 说明                                                         |
+| ---------------- | ------------------------------------------------------------ |
+| **操作次数**     | 固定（如 3 步计算），与 N 无关                               |
+| **访问元素总数** | 随 N 增长：Q/K/V 各 N×d，S/P 各 N×N → 总计 Θ(Nd + N²)        |
+| **主导项**       | 长序列场景下 N >> d，N² 项主导（如 N=4096, d=64 时，N²=16M, Nd=256K） |
+
+### 实证验证（论文 Figure 2 左图）
+
+GPT-2 (N=1024, d=64) 上的实际测量：
+- **标准注意力**：HBM 读写总量 **40.3 GB**
+- **FlashAttention**：HBM 读写总量 **4.4 GB**（减少约 9 倍）
+
+这与理论分析一致：标准实现需反复搬运 N×N 的注意力矩阵（~1M 元素），而 FlashAttention 通过分块（tiling）将其保留在快速的片上 SRAM 中，仅搬运 Q/K/V/O（各 ~64K 元素）。
+
+### 为什么这很重要？
+
+现代 GPU 的瓶颈是 **内存带宽** 而非计算能力：
+- A100 的 HBM 带宽：~1.5 TB/s
+- A100 的片上 SRAM 带宽：~19 TB/s（快 10+ 倍）
+
+即使 FlashAttention 因重计算增加了 FLOPs（75.2 GFLOPs vs 66.6），但因**大幅减少 HBM 访问**（4.4GB vs 40.3GB），实际运行更快（7.3ms vs 41.7ms）。
+
+> 💡 简言之：Ω(Nd + N²) 描述的是**数据搬运量**的渐近复杂度，而非操作步骤数。FlashAttention 的核心创新正是通过 IO 感知设计，将二次复杂度的数据搬运降至近线性。
