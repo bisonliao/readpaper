@@ -195,4 +195,4 @@ def update_actor(replay_buffer):
 
 ### 4、代码
 
-论文里给的官方代码链接失效了。
+论文里给的官方代码链接失效了。openreview上的[链接](https://openreview.net/attachment?id=GY6-6sTvGaf&name=supplementary_material)还能用
