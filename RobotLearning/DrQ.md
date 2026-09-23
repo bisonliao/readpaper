@@ -191,7 +191,7 @@ def update_actor(replay_buffer):
 
 ### 3、实验效果
 
-![image-20260917103457345](C:\GitHub\readpaper\RobotLearning\img\image-20260917103457345.png)
+![image-20260917103457345](img/image-20260917103457345.png)
 
 ### 4、代码
 

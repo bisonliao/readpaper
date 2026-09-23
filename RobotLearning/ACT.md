@@ -18,13 +18,13 @@ Robotics: Science and Systems (**RSS**) '2023, from  Stanford University  UC Ber
 
 Agent接收到一个观察，然后生成接下来的动作，并按顺序执行这些动作。
 
-![image-20260922125506504](C:\GitHub\readpaper\RobotLearning\img\image-20260922125506504.png)
+![image-20260922125506504](img/image-20260922125506504.png)
 
 ####  Action Chunking and Temporal Ensemble
 
 为了提高流畅性并避免在执行和观察之间出现离散切换，我们在每个时间步都查询策略。这会导致不同的动作片段相互重叠，并且在某个时间步可能会有多个预测动作。我们提出了一个时间集成方法来结合这些预测。我们的时间集成对这些预测做加权平均，采用指数加权方案。我们发现动作分块和时间集成对ACT的成功都很重要，这能产生精准流畅的动作。
 
-<img src="C:\GitHub\readpaper\RobotLearning\img\image-20260922131525442.png" alt="image-20260922131525442" style="zoom:67%;" />
+<img src="img/image-20260922131525442.png" alt="image-20260922131525442" style="zoom:67%;" />
 
 #### Modeling Human Data
 
