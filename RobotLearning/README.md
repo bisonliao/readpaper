@@ -12,7 +12,7 @@
 | DrQ v2          | 在 DrQ 基础上同时修改了 RL backbone、target return、图像增强、探索策略、关键超参数和底层实现。 | 离策略的online RL  | DDPG                                                        |
 | Implicit QL     | 离线 RL 若用标准 Q-learning 提升行为策略，就要对数据外动作外推 Q 值，容易因最大化偏差高估而选错动作。IQL 只在数据动作上计算 Q，用非对称平方损失学习其高 expectile 作为 \(V(s)\)，再用 \(r+ gamma * V(s')\) 进行多步更新，最后按优势加权模仿高价值动作。 | offline RL         | 是一个独立的离线 RL 算法                                    |
 | Conservative QL | 类似IQL面临的问题，CQL通过损失正则项，对数据外动作的 Q 值保持悲观，避免 Q 函数对未见动作过度乐观。 | offline RL         | SAC/DQN                                                     |
-|                 |                                                              |                    |                                                             |
+| MWM             | 在Dreamer的基础上，把视觉表示学习和潜在动力学模型的学习两部分解耦开来，获得比Dreamer更好的性能。 | Model-Based RL     | Dreamer                                                     |
 
 
 
