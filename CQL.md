@@ -2,6 +2,14 @@ Conservative Q-Learning for Offline Reinforcement Learning
 
 ### 1、Introduction
 
+一句话描述
+
+```
+离线 RL 若用标准 Q-learning 提升行为策略，就要对数据外动作外推 Q 值，容易因最大化偏差高估而选错动作。CQL对Q网络的损失函数引入一个正则项：CQL保守项，它会惩罚所有可能动作的Q值，防止高估，同时它会保护离线数据集内的动作，允许他们的Q值相对较高。
+```
+
+
+
 现有的离线强化学习（Offline RL）方法直接应用标准的 off-policy RL 算法会导致性能很差，主要是因为：
 
 - 会从分布外（out-of-distribution, OOD）动作上 bootstrap，带来错误的乐观估计（过高的 Q 值）。其他论文里叫extrapolation error，老生常谈的问题
