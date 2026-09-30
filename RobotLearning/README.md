@@ -19,6 +19,7 @@
 | MWM              | 在Dreamer的基础上，把视觉表示学习和潜在动力学模型的学习两部分解耦开来，获得比Dreamer更好的性能。 | Model-Based RL     | Dreamer                                                     |
 | RLPD             | RLPD 以 SAC 等在线 off-policy RL 为基础，在每个 batch 中从在线 replay buffer 和固定离线数据各采样 50% 的 transitions，通过 critic 中的 LayerNorm 抑制对数据分布外动作的灾难性 Q 值外推，通过提高 UTD ratio 让离线数据被更充分地 Bellman backup，并利用大规模 critic ensemble 与随机抽取少量 target critic 构造目标来正则化高频更新、降低过拟合，从而在保留在线探索能力的同时提高样本效率。。 | 离策略的online RL  | SAC                                                         |
 | Diffusion Policy | Diffusion Policy 是一种条件扩散式模仿学习方法：它以专家示范的真实动作序列为训练数据，将观测序列作为条件，把随机选取噪声等级 k后得到的带噪动作序列 与 k输入网络，预测所加入的噪声，并以预测噪声与真实噪声之间的 MSE 进行监督训练；推理时则从随机动作噪声出发，逐步去噪生成动作序列。 | imitation learning |                                                             |
+| Octo             | 一个开源的、通用的机器人操作、基于 Transformer 的策略，在来自 Open X-Embodiment 数据集的 80 万个episode上进行IL预训练。它支持灵活的任务和观察定义，并且可以快速微调以适应新的观察和动作空间。使用Octo初始化模型并在下游场景进行微调的时候，可以是IL，也可以是offline / online RL。 | imitation learning |                                                             |
 
 
 
