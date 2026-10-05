@@ -87,4 +87,6 @@ Transformer 产生“动作生成的条件表示”，扩散模型根据这个�
 
 ### 5 代码
 
-见[官方网站](https://octo-models.github.io/)
+见[官方网站](https://octo-models.github.io/)，但这里的代码是基于jax框架。
+
+另外有一个[基于pytorch的代码](https://github.com/emb-ai/octo-pytorch)。我在AI的帮助下加载hf上的预训练好的模型，用bc算法微调，可以把我定制化的pick_place任务的成功率做到85%

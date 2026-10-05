@@ -1,6 +1,6 @@
 Stabilizing Off-Policy Deep Reinforcement Learning from Pixels
 
-ICML'2022, from 伦敦国王大学、牛津大学
+ICML'2022, from 伦敦帝国大学、牛津大学
 
 ### 1 Introduction
 
