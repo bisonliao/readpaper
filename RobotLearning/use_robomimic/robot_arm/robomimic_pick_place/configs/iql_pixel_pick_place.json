@@ -30,7 +30,7 @@
             "enabled": true,
             "n": 100,
             "horizon": 150,
-            "rate": 20,
+            "rate": 10,
             "warmstart": 0,
             "terminate_on_success": true
         },
@@ -67,8 +67,8 @@
         },
         "goal_mode": null,
         "cuda": true,
-        "batch_size": 128,
-        "num_epochs": 100,
+        "batch_size": 64,
+        "num_epochs": 50,
         "seed": 1,
         "max_grad_norm": null
     },
