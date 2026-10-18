@@ -122,9 +122,10 @@ robot_arm/robomimic_pick_place/configs/bc_pixel_pick_place.json
 ```
 
 This file intentionally contains the complete BC configuration hierarchy from
-the Lift visual BC example: optimizer, losses, Gaussian and GMM distributions,
-VAE/RNN/Transformer placeholders, observation encoders, logging, checkpoint,
-and rollout settings.
+the custom `bc_pixel_pick_place.json` baseline: optimizer, losses, Gaussian and
+GMM distributions, VAE/RNN/Transformer placeholders, observation encoders,
+logging, checkpoint, and rollout settings. It keeps the custom PickPlace input
+and dataset settings unchanged.
 
 The custom-task values are:
 
@@ -138,7 +139,7 @@ The custom-task values are:
 | `rollout.horizon` | `150` | Matches the custom environment horizon. |
 | `hdf5_filter_key` | `train` | Uses the converter's episode split. |
 | `experiment.validate` | `true` | Evaluates the held-out `valid` split. |
-| `batch_size` | `8` | Conservative visual-training default. |
+| `batch_size` | `128` | Current plain-BC baseline; BC-RNN reduces this to `8` because it backpropagates through 10-step sequences. |
 
 The full Gaussian/GMM sections remain visible even though both are disabled.
 If deterministic BC underfits or the demonstrations contain genuinely
@@ -181,7 +182,52 @@ python robot_arm/robomimic_pick_place/launch_eval.py \
     --camera_names xy xz yz
 ```
 
-### 2.2 Implicit Q-Learning (IQL)
+### 2.2 BC-RNN
+
+Configuration:
+
+```text
+robot_arm/robomimic_pick_place/configs/bcrnn_pixel_pick_place.json
+```
+
+The BC-RNN configuration is derived from the custom
+`bc_pixel_pick_place.json` configuration, not from a Lift task configuration.
+Its only behavioral changes from the custom plain BC baseline are the
+following:
+
+| Setting | Value | Reason |
+| --- | --- | --- |
+| `train.seq_length` | `10` | Each training sample is a 10-step observation/action sequence. |
+| `algo.rnn.enabled` | `true` | Selects robomimic's recurrent BC policy. |
+| `algo.rnn.horizon` | `10` | Matches the dataset sequence length. |
+| `algo.rnn.hidden_dim` | `512` | Lower than the Lift image default to account for three camera streams. |
+| `algo.rnn.num_layers` | `2` | Two-layer LSTM. |
+| `algo.actor_layer_dims` | `[]` | The RNN output goes directly to the GMM action head. |
+| `algo.gmm.enabled` | `false` | Plain BC showed no gain from GMM; disabling it isolates the benefit of recurrent history and reduces memory. |
+| `batch_size` | `8` | Reduced from the custom BC baseline's `128` because 10-step visual backpropagation uses more memory. |
+
+The environment adapter does not need a change for BC-RNN. During training the
+dataset supplies 10-step sequences; during rollout robomimic's
+`RolloutPolicy` keeps the recurrent hidden state and resets it at each episode.
+The environment remains configured with `frame_stack=1`; temporal memory is
+provided by the RNN rather than by concatenating image channels.
+
+Smoke test:
+
+```bash
+MUJOCO_GL=egl \
+NUMBA_DISABLE_JIT=1 \
+MPLCONFIGDIR=/tmp/mpl \
+python robot_arm/robomimic_pick_place/launch_train.py \
+    --config robot_arm/robomimic_pick_place/configs/bcrnn_pixel_pick_place.json \
+    --dataset robot_arm/robomimic_pick_place/data/pick_place_expert.hdf5 \
+    --debug
+```
+
+Formal training and checkpoint evaluation use the same commands as the BC
+section with the BC-RNN configuration or resulting checkpoint.
+
+### 2.3 Implicit Q-Learning (IQL)
 
 Configuration:
 
@@ -239,7 +285,50 @@ python robot_arm/robomimic_pick_place/launch_train.py \
 Evaluation uses the same `launch_eval.py` command as BC. The checkpoint stores
 the algorithm, observation shapes, and custom environment metadata.
 
-### 2.3 Other robomimic algorithms
+### 2.4 TD3-BC
+
+Configuration:
+
+```text
+robot_arm/robomimic_pick_place/configs/td3bc_pixel_pick_place.json
+```
+
+The configuration keeps the complete TD3-BC hierarchy, including critic and
+actor optimizers, TD3 target settings, critic ensemble, target-action noise,
+actor update frequency, and the BC mixing coefficient `alpha`.
+
+The custom-task choices are:
+
+| Setting | Value | Reason |
+| --- | --- | --- |
+| `obs.low_dim` | `proprio` | Custom 26-dimensional proprio observation. |
+| `obs.rgb` | `xy_image`, `xz_image`, `yz_image` | Three custom camera views. |
+| `hdf5_load_next_obs` | `true` | TD3-BC needs successor observations for the Bellman target. |
+| `hdf5_normalize_obs` | `false` | RGB observations already use robomimic image preprocessing; global HDF5 normalization would mix image and proprio semantics. |
+| `batch_size` | `2` | Conservative because TD3-BC keeps actor, target actor, two critics, and two target critics with visual encoders. |
+| `rollout.horizon` | `150` | Matches the custom environment horizon. |
+| `critic.ensemble.n` | `2` | Standard TD3 twin-critic setup. |
+| `actor.update_freq` | `2` | Delayed actor update from TD3. |
+
+The converted HDF5 already contains every field TD3-BC needs, so no adapter or
+dataset change is required.
+
+Smoke test:
+
+```bash
+MUJOCO_GL=egl \
+NUMBA_DISABLE_JIT=1 \
+MPLCONFIGDIR=/tmp/mpl \
+python robot_arm/robomimic_pick_place/launch_train.py \
+    --config robot_arm/robomimic_pick_place/configs/td3bc_pixel_pick_place.json \
+    --dataset robot_arm/robomimic_pick_place/data/pick_place_expert.hdf5 \
+    --debug
+```
+
+Formal training uses the same command without `--debug`; evaluation uses
+`launch_eval.py` exactly as in the BC and IQL sections.
+
+### 2.5 Other robomimic algorithms
 
 BC and IQL are examples, not limits of the adapter. Other algorithms can reuse
 the same HDF5 dataset and environment launcher when their data requirements are
