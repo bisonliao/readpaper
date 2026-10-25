@@ -27,7 +27,7 @@ https://robomimic.github.io/docs/datasets/robomimic_v0.1.html#reproducing-result
 
 ### 发散讨论
 
-#### 是否可以继续用online RL微调
+#### 1、是否可以继续用online RL微调
 
 ```
 robomimic聚焦于IL/ offline RL算法，他们训练都不需要与环境交互。那么这些算法训练得到的agent，是否可以继续用online RL算法通过与环境交互进一步微调？ 如果可以，有下面的具体问题：robomimic提供的10个算法中，哪些可以无缝的直接转为online RL继续微调、转为哪个算法？ 哪些因为IL/offline RL训练得到的agent因为缺乏某种组件（例如Q网络、V网络没有）不能直接转online RL？这种情况下有没有可能补齐缺乏的组件而继续微调？会不会效果不好？
@@ -77,7 +77,7 @@ robomimic 离线训练
 | IQL              | actor、Q critic、target critic、V                        | 若转 SAC，需要 entropy temperature；没有 target actor | Online IQL / SAC-like                   | 中低     | 最适合做 offline-to-online 之一       |
 | TD3-BC           | actor、target actor、Q critic、target critic             | 基本没有核心网络缺口                                  | TD3                                     | 最低     | 最容易转成 online RL                  |
 
-offline-to-online方面比较有影响力的论文/工作：
+##### offline-to-online方面比较有影响力的论文/工作：
 
 | 工作                                                         | 论文链接                                                     | 核心观点                                                     | 主要 benchmark / 实验平台                                    | 与你想法的关系                                               |
 | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
@@ -92,3 +92,169 @@ offline-to-online方面比较有影响力的论文/工作：
 | Imitation Bootstrapped RL / IBRL（RSS 2024）                 | [RSS论文](https://www.roboticsproceedings.org/rss20/p056.html) · [arXiv](https://arxiv.org/abs/2311.02198) · [项目页](https://ibrl.hengyuanhu.com/) | 先用示范训练 IL policy，再让 IL policy 提供 online exploration action proposal 和 Q target bootstrap。它不是简单把 BC loss 当 regularizer，而是让高质量 IL 动作直接参与在线探索和价值目标。 | 6 个仿真任务、3 个真实机器人任务；包括 MetaWorld 和 robomimic 场景，项目页明确报告了 Square 等 robomimic 任务。[项目结果](https://ibrl.hengyuanhu.com/) | 这是与你的 BC/BC-RNN → online RL 想法最接近的工作之一。它说明只有 actor 的 IL policy 也可以通过 action proposal 帮助 online critic，而不必直接把 actor 改成 SAC actor。 |
 | RoboFuME: Robot Fine-Tuning Made Easy（2023/2024）           | [论文](https://arxiv.org/abs/2310.15145) · [IEEE页面](https://ieeexplore.ieee.org/document/10610421/) | 用多任务离线数据预训练策略，用 VLM 作为 reward classifier，进行 reset-free online fine-tuning，减少人工奖励标注、重置和干预。 | 5 个真实机器人操作任务：糖果清扫、折叠布、覆盖方块、锅盖和 pot pick-and-place；约 3 小时自主真实机器人经验。[论文摘要](https://arxiv.org/abs/2310.15145) | 它把 offline-to-online 推向真实机器人系统，说明除了网络组件和算法约束，reward、reset 和安全采样也是 O2O 的核心问题。 |
 
+#### 2、怎么理解不同离线数据来源对IL/offline RL的影响，是不是质量越高越好
+
+以 100 条不同水平的人类示范为例：
+
+| Dataset | BC Can | BC-RNN Can | BC Square | BC-RNN Square |
+| ------- | ------ | ---------- | --------- | ------------- |
+| Worse   | 56.7   | 92.0       | 22.0      | 39.3          |
+| Okay    | 72.0   | 95.3       | 27.3      | 45.3          |
+| Better  | 83.3   | 99.3       | 58.7      | 66.0          |
+
+在数据量相同的情况下，`Better > Okay > Worse` 基本成立。
+
+所以 robomimic 支持：
+
+> 更高质量示范通常更好。
+
+它发现的反常点是：加入额外的 Worse demonstrations 后，大部分方法会退化，但 BC-RNN 经常继续改善。
+
+例如 Square：
+
+| Dataset          | 数量 | BC-RNN success |
+| ---------------- | ---- | -------------- |
+| Better           | 100  | 66.0           |
+| Worse + Better   | 200  | 73.3           |
+| Okay + Better    | 200  | 74.0           |
+| Proficient Human | 200  | 84.0           |
+
+这说明：
+
+- `100 Better + 100 Worse` 优于 `100 Better`；
+- 但仍不如 `200 Proficient Human`。
+
+因此不能说“低质量优于高质量”。更准确的是：
+
+> 当高质量数据数量有限时，额外的低质量数据仍可能提供正价值；但等量的高质量数据通常更好。
+
+##### “低质量”本身也不是一个标量
+
+robomimic 的 `Worse` 主要表示操作者：
+
+- 动作更慢；
+- 轨迹更长；
+- 更容易出现无效移动和局部错误；
+- 操作策略更不一致。
+
+它们不一定都是失败轨迹。很多 `Worse` demonstrations 最终仍然成功，只是完成得不够漂亮。
+
+`Can-Paired` 才是真正包含同一初始状态下成功和失败轨迹的数据。
+
+因此至少要拆开：
+
+| 维度                      | “低质量”的可能含义                        |
+| ------------------------- | ----------------------------------------- |
+| Outcome quality           | 最终失败或 return 低                      |
+| Action efficiency         | 成功但路径长、动作抖动、绕路              |
+| Local action quality      | 某些时间步采取明显错误动作                |
+| Demonstrator consistency  | 相似状态下动作不一致                      |
+| Temporal coherence        | 延迟、停顿、反复修正                      |
+| Recovery content          | 是否包含出错后的纠正                      |
+| State coverage            | 是否访问 expert 没访问过的状态            |
+| Information compatibility | demonstrator 是否使用 policy 看不到的信息 |
+
+一条轨迹可以同时是：
+
+```
+低效率
++ 最终成功
++ 覆盖了有用的失败状态
++ 包含高价值 recovery
+```
+
+把它简单标为“low quality”会丢失最重要的信息。
+
+##### 低质量数据为什么可能有帮助
+
+###### 1. 扩大状态覆盖
+
+Expert 通常沿着狭窄的成功路径行动：
+
+```
+接近 → 抓取 → 搬运 → 放置
+```
+
+实际 policy 部署后会偏离这条路径。低质量 demonstrations 可能包含：
+
+```
+抓偏 → 调整 → 重新抓取 → 成功
+```
+
+这些状态对训练闭环 policy 很重要，因为它们告诉机器人偏离正常路径后怎么办。
+
+###### 2. 提供 recovery 行为
+
+单纯 expert data 经常只告诉 policy：
+
+> 正确的时候下一步怎么做。
+
+Recovery data 还能告诉它：
+
+> 已经做错的时候，怎样恢复。
+
+这对 IL 特别重要，因为 BC 的典型问题就是 covariate shift：训练时只见过正确状态，部署时一旦犯错就进入未见状态。
+
+###### 3. 增加任务和动作多样性
+
+不同操作者可能使用不同但都合理的策略。
+
+这可能帮助模型泛化，但也要求 policy 能建模 multimodality。普通 MSE BC 容易把两个合理动作平均成一个不合理动作；BC-RNN、GMM 或 Diffusion Policy 更有机会利用它。
+
+###### 4. 给 offline RL 提供价值对比
+
+理论上，包含好坏行为的数据可以告诉 critic：
+
+```
+这个状态下，动作 A 最终成功；
+动作 B 最终失败。
+```
+
+但需要同时满足：
+
+- reward 和 done 标注正确；
+- 相似状态下同时出现好动作和坏动作；
+- critic 能正确识别状态；
+- 数据覆盖足够；
+- 没有严重 partial observability。
+
+robomimic 的 Can-Paired 说明，当时的 BCQ/CQL 即使拿到这种数据也没能很好地利用。这说明算法失败，不代表失败数据没有信息。
+
+###### 5. 帮助视觉表示学习
+
+更多轨迹意味着更多物体位置、遮挡、视角和机械臂姿态。即使部分动作不理想，图像仍可以帮助 encoder 学到更广的视觉分布。
+
+##### 为什么 machine mixed-quality 容易被 offline RL 利用，而 human mixed-quality 不容易
+
+这是 robomimic 最值得深入的发现之一。
+
+| Machine-generated data                             | Human-generated data                             |
+| -------------------------------------------------- | ------------------------------------------------ |
+| 通常来自同一种 RL policy family 的不同 checkpoints | 来自不同人的策略、习惯和意图                     |
+| 状态和动作更接近 Markov 设定                       | 动作可能依赖过去操作和人的私有意图               |
+| 动作频率和控制延迟一致                             | 存在 teleoperation delay、停顿和修正             |
+| suboptimality 通常表现为 policy competence 不同    | 同时包含 competence、style、noise、multimodality |
+| reward 与生成 policy 的目标一致                    | 人可能使用 reward 没有表达的策略偏好             |
+| exploration 产生相对连续的 coverage                | 不同人的 coverage 可能割裂                       |
+
+所以不能简单地说：
+
+> Offline RL 能处理 mixed-quality machine data，因此也应该能处理 mixed-quality human data。
+
+这两种“mixed quality”并不是同一种数据分布。
+
+##### 行业内的相关研究
+
+| 核心问题                                              | 直接先例                                                     |
+| ----------------------------------------------------- | ------------------------------------------------------------ |
+| Human/machine、质量、规模对 IL/offline RL 的影响      | [What Matters in Learning from Offline Human Demonstrations for Robot Manipulation](https://arxiv.org/abs/2108.03298)（CoRL 2021） |
+| 数据质量与 state-action coverage 如何影响 offline RL  | [A Dataset Perspective on Offline Reinforcement Learning](https://arxiv.org/abs/2111.04714)（CoLLAs 2022） |
+| 什么条件下 offline RL 优于 BC                         | [When Should We Prefer Offline Reinforcement Learning Over Behavioral Cloning?](https://arxiv.org/abs/2204.05618)（ICLR 2022） |
+| IL 数据质量是多维的                                   | [Data Quality in Imitation Learning](https://arxiv.org/abs/2306.02437)（2023） |
+| 广覆盖数据可能比算法复杂度更重要                      | [Don't Change the Algorithm, Change the Data: Exploratory Data for Offline Reinforcement Learning](https://arxiv.org/abs/2201.13425)（ExORL，2022） |
+| 真实机器人数据来源对 BC/offline RL 的影响             | [Real World Offline Reinforcement Learning with Realistic Data Source](https://arxiv.org/abs/2210.06479)（ICRA 2023） |
+| Human play、scripted data、视觉和 stitching benchmark | [D5RL: Diverse Datasets for Data-Driven Deep Reinforcement Learning](https://arxiv.org/abs/2408.08441)（RLC 2024） |
+| Generated data 与 human data 的关系                   | [MimicGen: A Data Generation System for Scalable Robot Learning using Human Demonstrations](https://arxiv.org/abs/2310.17596)（CoRL 2023）；[Tether: Autonomous Functional Play with Correspondence-Driven Trajectory Warping](https://arxiv.org/abs/2603.03278)（ICLR 2026） |
+| 删除次优和冗余 demonstrations                         | [SCIZOR: A Self-Supervised Approach to Data Curation for Large-Scale Imitation Learning](https://arxiv.org/abs/2505.22626)（2025） |
+| Recovery-rich data collection                         | [Adversarial Data Collection: Human-Collaborative Perturbations for Efficient and Robust Robotic Imitation Learning](https://arxiv.org/abs/2503.11646)（2025） |
+| Privileged expert 不一定可模仿                        | [Robust Asymmetric Learning in POMDPs](https://proceedings.mlr.press/v139/warrington21a.html)（ICML 2021）；[Causal Imitation Learning with Unobserved Confounders](https://arxiv.org/abs/2208.06267)（2022） |
