@@ -3,7 +3,7 @@
 1. 复现lift/can/square等等经典任务的训练
 2. 使用robomimic这个现成的IL/RL库，完成自定义的环境/任务的训练
 
-### 关键tips
+### 一、关键tips
 
 #### 1、被验证过的超参数
 
@@ -25,7 +25,22 @@ https://robomimic.github.io/docs/datasets/robomimic_v0.1.html#reproducing-result
 
 这个太重要了。执行后生成了一堆配置文件，分门别类非常清晰。
 
-### 发散讨论
+#### 2、robomimic与其他几个“库”的联系和区别
+
+| 名称               | 它是什么                                                     | 主要作用                                                     | 与其他项目的关系                                             |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| **robosuite**      | 基于 MuJoCo 的机器人操作仿真环境。【仿真环境与任务】         | 提供机械臂、物体、相机、动力学和 Lift、Can、Square、Transport 等任务 | RoboTurk 可在其中采集示范；MimicGen 可在其中生成数据；robomimic 可用这些数据训练并回到环境 rollout |
+| **RoboTurk Pilot** | 使用 RoboTurk 遥操作平台众包采集的早期人类机器人示范数据集/实验。【人类遥操作采集工具】 | 研究如何从大量、不同水平的人类操作者示范中学习               | 数据通常在 robosuite 环境中采集；是 robomimic 人类示范研究的重要前身 |
+| **MoMaRT**         | 面向多任务、长时序机器人操作的离线数据集与 benchmark。【数据集/benchmark】 | 包含成功、失败及不同质量的机器人轨迹，用于研究长时序任务和 mixed-quality data | 可由 robomimic 加载训练；任务通常建立在 robosuite 生态上     |
+| **D4RL**           | 通用 offline RL 数据集与 benchmark 集合。【数据集/benchmark】 | 提供 MuJoCo locomotion、AntMaze、Adroit、Franka Kitchen 等固定离线数据 | 不是仿真器或训练库；robomimic 可支持其中部分机器人数据，但 D4RL 本身覆盖的领域更广 |
+| **MimicGen**       | 从少量人类示范自动生成大量新示范的数据生成系统。             | 将示范分段，并根据新物体位置变换、拼接和执行轨迹             | 常在 robosuite 中生成数据；生成的数据可交给 robomimic 的 BC、IQL 等算法训练 |
+| **robomimic**      | 机器人 imitation learning 和 offline RL 的数据、算法与评测框架 | 统一训练 BC、BC-RNN、Diffusion Policy、IQL、CQL、BCQ、TD3+BC 等算法 | 它消费 RoboTurk、MoMaRT、D4RL、MimicGen 等来源的数据，并可调用 robosuite 做 rollout 评估 |
+
+一句话记忆：
+
+> **robosuite 搭世界，RoboTurk 让人演示数据，MimicGen 扩数据，MoMaRT/D4RL 提供现成数据，robomimic 负责用数据训练策略。**
+
+### 二、发散讨论
 
 #### 1、是否可以继续用online RL微调
 
