@@ -62,9 +62,24 @@ AWAC 将两种机制结合起来：
 
 ![image-20261103104642529](img/image-20261103104642529.png)
 
+### 困惑
+
+#### 困惑1
+
+**Q**：以AWAC为例，我对于先offline rl或者先IL，然后 online rl继续微调的这种方式，两阶段之间为什么会有gap觉得很费解。毕竟像robomimic的实现或者机器人邻域的实践经验显示：即使只做offline RL或者IL通常也是足够的，说明前半段的offline RL/IL通常能训练一个不错的模型了，这个模型与环境交互通常是有还不错的表现，这时候再用常见的SAC等online RL算法再简单训练一下，应该会更有长进，如果online RL阶段不进反退，那通常是online RL的超参数不合适等低级错误。offline-to-online的GAP看起来不是一个需要研究的专门的挑战。大模型和CV模型，他们的微调通常是针对切换了任务场景的适配。我上面说的这种连任务场景都没有切换，为什么会有gap呢
+
+**A**：Offline-to-online 的困难不是“只要从离线切到在线，模型就会变差”：
+
+- **离线切在线并不必然存在 gap**：如果 actor、critic 都足够准确，且训练目标保持一致，继续在线训练理应能够改进。
+- **策略表现好，不代表 critic 能指导改进**：IL 通常没有 critic；离线 RL 的 critic 也可能高估数据未充分覆盖的动作，导致 SAC 把好策略改坏。
+- **任务不变，训练条件仍可能改变**：优化目标、探索方式和数据分布的变化，都可能引起性能下降。
+- **真正的挑战是有限交互下保住能力并继续提升**：但新方法应当与认真调优的 SAC 基线比较，不能把所有微调失败都归因于所谓的 gap。
+
+
+
 ### 代码
 
-官方代码在[这里](https://github.com/rail-berkeley/rlkit/tree/master/examples/awac)，特别值得注意的是它基于的[rlkit](https://github.com/rail-berkeley/rlkit)库。
+官方代码在[这里](https://github.com/rail-berkeley/rlkit/tree/master/examples/awac)，特别值得注意的是它基于的[rlkit](https://github.com/rail-berkeley/rlkit)库，虽然代码比较老依赖的库比较旧，但借助AI的帮助还是能够比较容易的跑起来，依赖的库也不多。
 
 | 维度         | rlkit                                     | SB3                          |
 | ------------ | ----------------------------------------- | ---------------------------- |
@@ -72,3 +87,5 @@ AWAC 将两种机制结合起来：
 | 扩展方式     | 经常直接修改 trainer、组装内部组件        | 更多围绕统一 API 和扩展接口  |
 | 强项         | 离策略 RL、离线到在线学习、机器人研究积累 | 文档、标准接口、常规使用体验 |
 | 当前使用成本 | 需要理解历史依赖和实验配置                | 通常更适合作为通用起点       |
+
+另外，该论文的团队的另外一个机器人相关的软件库，[serl](https://github.com/rail-berkeley/hil-serl)看起来不错，不过是基于jax的。
