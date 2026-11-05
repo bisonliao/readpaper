@@ -22,6 +22,7 @@
 | Octo             | 一个开源的、通用的机器人操作、基于 Transformer 的策略，在来自 Open X-Embodiment 数据集的 80 万个episode上进行IL预训练。它支持灵活的任务和观察定义，并且可以快速微调以适应新的观察和动作空间。使用Octo初始化模型并在下游场景进行微调的时候，可以是IL，也可以是offline / online RL。 | imitation learning   |                                                             |
 | OpenVLA          | OpenVLA 是一个拥有 7B 参数的开源视觉-语言-动作模型（VLA），在 Open X-Embodiment 数据集约 970k 个真实机器人操作轨迹上进行大规模行为克隆（IL/BC）训练；它支持多种机器人开箱即用，并可通过参数高效微调快速适应新的机器人场景。OpenVLA 的 checkpoint 和 PyTorch 训练流程均开源，模型可从 Hugging Face 下载并微调；微调既可以采用 IL/BC，也可以作为预训练策略进一步用于 Offline/Online RL。 | imitation learning   |                                                             |
 | AWAC             | AWAC 用离策略 TD 学习估计当前策略的 Q 值，再对经验池中的动作进行优势加权模仿，从而利用离线数据预训练，并通过在线交互持续改进策略。 | Offline-to-Online RL | SAC风格                                                     |
+| IBRL             | IBRL 先用离线示范数据训练并固定一个独立的模仿策略，再在在线 RL 训练中，让模仿策略与 RL 策略分别提出候选动作，由 critic 选择 Q 值较高者用于环境交互和 TD 目标计算，从而借助模仿策略加速探索与价值学习，并通过在线交互实现超越示范的策略改进。 | Offline-to-Online RL | SAC/TD3/DDPG                                                |
 
 
 
