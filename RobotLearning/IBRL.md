@@ -73,6 +73,13 @@ IBRL 将 IL 策略保留为一个独立、固定的动作提议者，再单独�
 
 <img src="img/image-20261105143138267.png" alt="image-20261105143138267" style="zoom:67%;" />
 
+阅读代码发现：
+
+1. IBRL 使用主经验池 `replay` 存储预加载的 demonstration 轨迹以及后续产生的在线轨迹，包括成功和失败轨迹；可选的 `bc_replay` 专门保存成功轨迹子集。默认没有创建`bc_replay`
+2. 训练开始前，IBRL 使用 demonstrations 预填主 `replay`，使随机初始化的 critic 在尚未获得在线成功时也能接触有效奖励信号。
+3. 当 `bc_replay` 存在且未被冻结时，在线 rollout 产生的成功轨迹也会加入 `bc_replay`；默认配置通常会冻结或不创建该 buffer。
+4. 当配置 `mix_rl_rate < 1` 时，训练 batch 分别从主 `replay` 和 `bc_replay` 采样并合并；默认 `mix_rl_rate=1`，只从包含 demonstration 和在线数据的主 `replay` 采样。
+
 ### Method
 
 <img src="img/image-20261105143708182.png" alt="image-20261105143708182" style="zoom:67%;" />
